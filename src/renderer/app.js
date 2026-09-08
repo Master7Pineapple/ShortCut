@@ -41,7 +41,10 @@ const state = {
   previewScale: 0.5,
   /** Id of the selected transition, or null. Transitions select separately from clips. */
   selTransition: null,
-  out: { w: 1080, h: 1920, fps: 30, quality: 'medium' },
+  /** `loudness` is the project-level target for the final mix - see AudioFX. Off by
+   *  default, so a project renders exactly as it did before the audio chain existed
+   *  until somebody asks for normalisation. */
+  out: { w: 1080, h: 1920, fps: 30, quality: 'medium', loudness: Object.assign({}, AudioFX.LOUD_DEFAULTS) },
 };
 
 let undoStack = [];
@@ -143,6 +146,77 @@ function dropMedia(clipId) {
   const el = mediaEls.get(clipId);
   if (el) { try { el.pause(); } catch (e) {} el.removeAttribute('src'); el.load(); }
   mediaEls.delete(clipId);
+  dropPreviewGain(clipId);
+}
+
+// ------------------------------------------------ the preview mix (WebAudio)
+
+/**
+ * A gain node per audio clip, so the preview can honour a level above 1.0.
+ *
+ * This is deliberately NOT a preview of the whole audio chain. The DSP - denoise, EQ,
+ * de-ess, compression, ducking, loudness - happens in ffmpeg at render time, and the
+ * inspector says so where the controls are. What the preview mirrors is level and mute,
+ * which is what you actually need while cutting: the balance between voice and music.
+ *
+ * Two traps this is shaped around:
+ *
+ * - `el.volume` is capped at 1, so a +6 dB gain effect could not be heard at all without
+ *   a gain node. With one, the element runs at 1 and the node carries the level.
+ * - Routing an element through a SUSPENDED AudioContext silences it outright, and a
+ *   context created before any user gesture starts suspended. So the node is only ever
+ *   attached once the context is actually running; until then the element's own volume
+ *   is used, clamped. That way the worst case is "a boost is quieter than it should be",
+ *   never "the preview went silent".
+ */
+const previewMix = { ctx: null, nodes: new Map() };
+
+function ensureAudioCtx() {
+  if (!previewMix.ctx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try { previewMix.ctx = new Ctx(); } catch (e) { previewMix.ctx = null; }
+  }
+  if (previewMix.ctx && previewMix.ctx.state === 'suspended') {
+    previewMix.ctx.resume().catch(() => {});
+  }
+  return previewMix.ctx;
+}
+
+function previewGainNode(clip, el) {
+  const ctx = previewMix.ctx;
+  // Attaching to a context that is not running would mute the element permanently -
+  // createMediaElementSource cannot be undone.
+  if (!ctx || ctx.state !== 'running') return null;
+  const have = previewMix.nodes.get(clip.id);
+  if (have) return have.el === el ? have : null;
+  try {
+    const src = ctx.createMediaElementSource(el);
+    const gain = ctx.createGain();
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    const node = { src, gain, el };
+    previewMix.nodes.set(clip.id, node);
+    return node;
+  } catch (e) {
+    return null;   // already routed, or the element is not eligible - fall back below
+  }
+}
+
+function dropPreviewGain(clipId) {
+  const n = previewMix.nodes.get(clipId);
+  if (!n) return;
+  try { n.src.disconnect(); n.gain.disconnect(); } catch (e) { /* already gone */ }
+  previewMix.nodes.delete(clipId);
+}
+
+/** Put a clip's audible level and mute state onto its element for this frame. */
+function applyPreviewMix(clip, el, trackMuted) {
+  const lin = AudioFX.previewGain(clip);
+  el.muted = !!trackMuted;
+  const node = previewGainNode(clip, el);
+  if (node) { node.gain.gain.value = lin; el.volume = 1; }
+  else el.volume = clamp(lin, 0, 1);
 }
 
 // =================================================== 3. import
@@ -1010,7 +1084,136 @@ function renderInspector() {
     TextUI.attachWheel(vol, volWheel);
     TextUI.attachWheel(volN, volWheel);
   }
+  if (c.kind === 'audio') box.appendChild(audioFxPanel(c));
   syncFramingControls();
+}
+
+/**
+ * The audio effect chain for the selected audio clip.
+ *
+ * Rows come from `TextUI.control` and the per-type schema in AudioFX, so every parameter
+ * here is a slider AND a typable box AND scroll-adjustable AND resettable without any of
+ * that being written twice. Adding an effect type is an entry in AudioFX.DEFS and nothing
+ * more - this panel builds itself from it.
+ *
+ * Structural edits (add, remove, reorder, enable) snapshot and rebuild here; parameter
+ * edits go through TextUI's own once-per-gesture snapshot.
+ */
+function audioFxPanel(clip) {
+  const el = TextUI.el;
+  const box = el('div', 'afx-box');
+  if (!Array.isArray(clip.afx)) clip.afx = [];
+  AudioFX.normalizeClip(clip);
+
+  const head = el('div', 'afx-head');
+  head.appendChild(el('b', null, 'Audio effects'));
+  head.appendChild(el('span', 'tc-hint', clip.afx.length ? clip.afx.length + ' in chain' : 'none'));
+  box.appendChild(head);
+
+  const note = el('div', 'tc-hint afx-note',
+    'Preview mirrors level and mute only. Noise reduction, EQ, de-ess, compression, ' +
+    'ducking and loudness are applied on render.');
+  box.appendChild(note);
+
+  // A structural change is one undo entry and a full rebuild.
+  const edit = (fn) => {
+    pushUndo();
+    fn();
+    markDirty();
+    renderAll();
+  };
+
+  // A clip's own track is not offered as a duck source: ducking to it would compress the
+  // clip against its own track-mates, which buildArgs() drops for the same reason.
+  const clipTrack = allClips().find((x) => x.clip === clip);
+  const audioTracks = state.tracks.filter(
+    (t) => t.type === 'audio' && !(clipTrack && t.id === clipTrack.track.id));
+
+  clip.afx.forEach((fx, i) => {
+    const d = AudioFX.DEFS[fx.type];
+    const row = el('div', 'afx-fx' + (fx.enabled === false ? ' off' : ''));
+
+    const bar = el('div', 'afx-fx-head');
+    const on = el('input');
+    on.type = 'checkbox';
+    on.checked = fx.enabled !== false;
+    on.title = 'Bypass this effect';
+    on.addEventListener('change', () => edit(() => { fx.enabled = on.checked; }));
+    bar.appendChild(on);
+    bar.appendChild(el('b', null, d.label));
+
+    const btns = el('div', 'afx-fx-btns');
+    const mk = (label, title, fn, disabled) => {
+      const b = el('button', 'mini', label);
+      b.title = title;
+      b.disabled = !!disabled;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+    };
+    mk('▲', 'Move earlier in the chain', () => edit(() => {
+      clip.afx.splice(i - 1, 0, clip.afx.splice(i, 1)[0]);
+    }), i === 0);
+    mk('▼', 'Move later in the chain', () => edit(() => {
+      clip.afx.splice(i + 1, 0, clip.afx.splice(i, 1)[0]);
+    }), i === clip.afx.length - 1);
+    mk('✕', 'Remove this effect', () => edit(() => { clip.afx.splice(i, 1); }));
+    bar.appendChild(btns);
+    row.appendChild(bar);
+
+    const body = el('div', 'afx-fx-body');
+    if (fx.type === 'duck') {
+      // The voice source is a whole track, not a clip: ducking follows the speaker for
+      // the length of the music, across every cut in the voice-over.
+      const sel = el('select');
+      const o0 = el('option');
+      o0.value = '';
+      o0.textContent = 'Choose a voice track...';
+      sel.appendChild(o0);
+      for (const t of audioTracks) {
+        const o = el('option');
+        o.value = t.id;
+        o.textContent = t.name;
+        sel.appendChild(o);
+      }
+      sel.value = fx.params.voiceTrack || '';
+      sel.addEventListener('change', () => edit(() => { fx.params.voiceTrack = sel.value; }));
+      const r = el('div', 'tc-row');
+      r.appendChild(el('label', 'tc-label', 'Voice track'));
+      r.appendChild(sel);
+      body.appendChild(r);
+      if (!fx.params.voiceTrack) {
+        body.appendChild(el('div', 'tc-hint',
+          'Without a voice track this effect does nothing.'));
+      }
+    }
+    for (const spec of d.schema) body.appendChild(TextUI.control(spec, fx, { params: d.params }));
+    row.appendChild(body);
+    box.appendChild(row);
+  });
+
+  const addRow = el('div', 'afx-add');
+  const add = el('select');
+  const a0 = el('option');
+  a0.value = '';
+  a0.textContent = 'Add an effect...';
+  add.appendChild(a0);
+  for (const type of AudioFX.TYPES) {
+    const o = el('option');
+    o.value = type;
+    o.textContent = AudioFX.DEFS[type].label;
+    add.appendChild(o);
+  }
+  add.addEventListener('change', () => {
+    if (!add.value) return;
+    const type = add.value;
+    edit(() => { clip.afx.push(AudioFX.create(type)); });
+  });
+  addRow.appendChild(add);
+  box.appendChild(addRow);
+
+  // A level change should be audible immediately rather than at the next seek.
+  box.addEventListener('input', () => syncMedia());
+  return box;
 }
 
 // ======================================= 5. timeline interaction
@@ -1667,10 +1870,7 @@ function syncMedia() {
 
     const target = clip.in + (state.playhead - clip.start);
     const m = mediaFor(clip);
-    if (clip.kind === 'audio') {
-      m.muted = track.muted;
-      m.volume = clamp(clip.volume, 0, 1);
-    }
+    if (clip.kind === 'audio') applyPreviewMix(clip, m, track.muted);
     // Never stack a seek on top of one still in flight - that kept readyState pinned low.
     if (state.playing) {
       if (!m.seeking && Math.abs(m.currentTime - target) > 0.3) m.currentTime = target;
@@ -1686,6 +1886,8 @@ let playT0 = 0, playHead0 = 0;
 
 function play() {
   if (state.playing) return;
+  // Pressing play is the user gesture the audio context is waiting for.
+  ensureAudioCtx();
   if (state.playhead >= projectDuration() - 0.01) state.playhead = 0;
   state.playing = true;
   playT0 = performance.now();
@@ -2008,6 +2210,23 @@ function selectAll() {
   renderLanes(); renderInspector();
 }
 
+/** Put the Loudness select back in step with `state.out.loudness`. */
+function syncLoudnessControl() {
+  const l = Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness);
+  const sel = $('#loudness');
+  if (!sel) return;
+  sel.value = l.enabled ? String(l.lufs) : 'off';
+  // A target the dropdown does not list (from a hand-edited .scut) must not silently
+  // read as "off" - show it rather than lying about it.
+  if (sel.value !== (l.enabled ? String(l.lufs) : 'off')) {
+    const o = document.createElement('option');
+    o.value = String(l.lufs);
+    o.textContent = l.lufs + ' LUFS';
+    sel.appendChild(o);
+    sel.value = String(l.lufs);
+  }
+}
+
 function newProject() {
   if (state.dirty && !confirm('Discard unsaved changes?')) return;
   for (const id of [...mediaEls.keys()]) dropMedia(id);
@@ -2017,6 +2236,8 @@ function newProject() {
   state.selTransition = null;
   state.inPoint = state.outPoint = null;
   state.filePath = null;
+  state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
+  syncLoudnessControl();
   undoStack = []; redoStack = [];
   markClean();
   renderAll();
@@ -2060,9 +2281,13 @@ async function openProject() {
   state.inPoint = d.inPoint == null ? null : d.inPoint;
   state.outPoint = d.outPoint == null ? null : d.outPoint;
   state.selTransition = null;
+  state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
     for (const tr of t.transitions) Trans.normalize(tr);
+    // Fill in effect parameters a project saved before they existed, and drop effect
+    // types this build does not know - the same job Trans.normalize does above.
+    for (const c of t.clips) AudioFX.normalizeClip(c);
   }
   preloadTransitionImages();
   state.selection.clear();
@@ -2071,6 +2296,7 @@ async function openProject() {
   $('#preset').value = state.out.w + 'x' + state.out.h;
   $('#quality').value = state.out.quality;
   $('#fps').value = String(state.out.fps);
+  syncLoudnessControl();
   resizeCanvas();
   markClean();
   renderAll();
@@ -2112,6 +2338,10 @@ function buildJob(outPath, range) {
         out: c.out - tailCut,
         panX: c.panX, panY: c.panY, zoom: c.zoom,
         volume: c.volume,
+        // The audio chain and the track it sits on. `trackId` is what a ducking effect
+        // names as its voice source, so buildArgs() needs it to find the sidechain feed.
+        trackId: t.id,
+        afx: c.afx && c.afx.length ? JSON.parse(JSON.stringify(c.afx)) : undefined,
         visible: (c.kind === 'video' || c.kind === 'text') && t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
       };
@@ -2151,6 +2381,7 @@ function buildJob(outPath, range) {
   return {
     width: state.out.w, height: state.out.h, fps: state.out.fps,
     quality: state.out.quality, outPath, clips,
+    loudness: Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness),
     duration: Math.max(0, r.to - r.from),
     rangeFrom: r.from, rangeTo: r.to,
   };
@@ -2615,6 +2846,9 @@ function setStatus(msg, cls) {
 
 window.api.onRenderProgress((d) => {
   if (!d.total) return;
+  // The loudness measurement pass reports a stage rather than a time: it is a whole
+  // decode of its own, and saying "0:00 / 0:30" through it looks like a stall.
+  if (d.stage) { $('#renderBar').style.width = '0%'; setStatus(d.stage + '...'); return; }
   $('#renderBar').style.width = clamp(d.time / d.total * 100, 0, 100) + '%';
   setStatus('Rendering... ' + fmtTc(d.time) + ' / ' + fmtTc(d.total));
 });
@@ -2745,6 +2979,17 @@ $('#preset').addEventListener('change', (e) => {
   resizeCanvas(); markDirty(); drawPreview();
 });
 $('#quality').addEventListener('change', (e) => { state.out.quality = e.target.value; markDirty(); });
+// Loudness is one project-level target for the finished mix, not a per-clip effect: it
+// has to see the whole amix to know how loud the video actually is.
+$('#loudness').addEventListener('change', (e) => {
+  const v = e.target.value;
+  state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness, {
+    enabled: v !== 'off',
+    lufs: v === 'off' ? (state.out.loudness || AudioFX.LOUD_DEFAULTS).lufs : Number(v),
+  });
+  markDirty();
+  refreshCacheBands(true);   // a different mix is a different render
+});
 $('#fps').addEventListener('change', (e) => { state.out.fps = Number(e.target.value); markDirty(); renderPlayhead(); });
 
 // ---- drag and drop -------------------------------------------------------

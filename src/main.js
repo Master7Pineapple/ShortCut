@@ -7,6 +7,9 @@ const crypto = require('crypto');
 
 const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
 const ffprobePath = require('ffprobe-static').path.replace('app.asar', 'app.asar.unpacked');
+// Shared with the renderer, which loads the same file as a <script> global. One
+// definition of what an audio effect means, so preview and render cannot drift apart.
+const AudioFX = require('./audiofx.js');
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ts']);
 const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma']);
@@ -741,20 +744,29 @@ const r3 = (n) => Math.round(n * 1e6) / 1e6;
  * timeline position, cropped/panned to the output aspect, then overlaid with `enable`.
  * Clips arrive already sorted bottom track -> top track, so later overlays win.
  *
- * Audio: each audible clip is trimmed, delayed to its position, then amixed.
+ * Audio: each audible clip is trimmed, run through its own effect chain (`clip.afx`),
+ * levelled, delayed to its position, optionally sidechained to a voice track, then amixed
+ * and - if the project asks for it - loudness-normalised. See buildAudioGraph() below.
+ *
+ * `opts.measureLoudness` builds the audio-only pass-one variant instead; it returns null
+ * when there is nothing to measure.
  */
-function buildArgs(job) {
+function buildArgs(job, opts) {
+  // The loudness measurement pass decodes audio only and throws the picture away - see
+  // measureLoudness(). Everything below that would build a video filter is skipped, so
+  // pass one costs an audio decode rather than a full composite.
+  const measure = !!(opts && opts.measureLoudness);
   const { width, height, fps, quality, outPath, clips, duration } = job;
   // Visual clips carry z-order: they arrive bottom track first, so later overlays win.
   // Text cards sit in the same chain as video, so a card on V2 lands above a clip on V1.
-  const vClips = clips.filter((c) => c.visible);
+  const vClips = measure ? [] : clips.filter((c) => c.visible);
   const aClips = clips.filter((c) => c.audible);
   const args = ['-y', '-hide_banner'];
 
   // One ffmpeg input per clip occurrence - simple, and lets one file appear many times.
   const inputs = [];
   for (const c of clips) {
-    if (c.visible || c.audible) inputs.push(c);
+    if (measure ? c.audible : (c.visible || c.audible)) inputs.push(c);
   }
   for (const c of inputs) {
     if (c.kind === 'text' || c.kind === 'trans') {
@@ -771,6 +783,121 @@ function buildArgs(job) {
   }
 
   const fc = [];
+
+  /**
+   * The audio graph, from the clips up to `[aout]`.
+   *
+   * Shared by the real render and the loudness measurement pass so pass one measures
+   * exactly the mix pass two normalises - a measurement of anything else is worse than
+   * no measurement at all.
+   *
+   * Order inside a clip is: trim -> position -> format -> the clip's own effect chain ->
+   * clip volume -> delay. A clip with an empty `afx` contributes nothing to that string,
+   * which is what keeps the argument list byte-identical to the pre-effects one.
+   *
+   * Returns false when there is nothing audible.
+   */
+  function buildAudioGraph(printLoudness) {
+    if (!aClips.length) return false;
+
+    // Every clip's current output label. Ducking and sidechain splits rewrite entries
+    // here rather than renumbering anything, so the final amix just reads them off.
+    const names = [];
+    aClips.forEach((c, i) => {
+      const idx = inputs.indexOf(c);
+      const dur = c.out - c.in;
+      const delay = Math.max(0, Math.round(c.start * 1000));
+      const parts = [
+        'atrim=start=' + r3(c.in) + ':duration=' + r3(dur),
+        'asetpts=PTS-STARTPTS',
+        'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo',
+      ]
+        .concat(AudioFX.chain(c.afx))
+        .concat([
+          'volume=' + r3(c.volume),
+          'adelay=' + delay + '|' + delay,
+        ]);
+      fc.push('[' + idx + ':a]' + parts.join(',') + '[a' + i + ']');
+      names.push('a' + i);
+    });
+
+    // ---- ducking -------------------------------------------------------
+    // A ducked clip is compressed by the level of a whole VOICE TRACK, so the voice has
+    // to reach two places at once: the mix, and the sidechain input. An ffmpeg filter
+    // output pad may only be consumed once, so each contributing voice stream is split
+    // explicitly - and the bus itself is split again when several clips duck to it.
+    const users = new Map();          // voice track id -> [index into aClips]
+    aClips.forEach((c, i) => {
+      const d = AudioFX.duckOf(c);
+      // A clip cannot duck to the track it lives on. Without this the effect would
+      // quietly pick up the clip's own TRACK-MATES as the sidechain source, which is
+      // not what anyone means by "duck under the voice" - it is just a clip being
+      // compressed by whatever happens to sit next to it. The inspector leaves the
+      // clip's own track out of the list for the same reason.
+      if (!d || d.params.voiceTrack === c.trackId) return;
+      const list = users.get(d.params.voiceTrack) || [];
+      list.push(i);
+      users.set(d.params.voiceTrack, list);
+    });
+
+    let busN = 0;
+    for (const [trackId, consumers] of users) {
+      // A clip never ducks to its own signal, and a track with nothing audible on it
+      // cannot be a sidechain source - in both cases the duck is simply dropped.
+      const feed = [];
+      aClips.forEach((c, i) => {
+        if (c.trackId !== trackId || consumers.indexOf(i) !== -1) return;
+        fc.push('[' + names[i] + ']asplit=2[' + names[i] + 'm][' + names[i] + 's]');
+        feed.push(names[i] + 's');
+        names[i] = names[i] + 'm';
+      });
+      if (!feed.length) continue;
+
+      const bus = 'duckbus' + (busN++);
+      if (feed.length === 1) fc.push('[' + feed[0] + ']anull[' + bus + ']');
+      else {
+        fc.push(feed.map((n) => '[' + n + ']').join('') +
+          'amix=inputs=' + feed.length + ':normalize=0:dropout_transition=0[' + bus + ']');
+      }
+
+      const taps = consumers.map((_, k) => bus + 'x' + k);
+      if (taps.length === 1) fc.push('[' + bus + ']anull[' + taps[0] + ']');
+      else fc.push('[' + bus + ']asplit=' + taps.length + taps.map((n) => '[' + n + ']').join(''));
+
+      consumers.forEach((i, k) => {
+        const d = AudioFX.duckOf(aClips[i]);
+        fc.push('[' + names[i] + '][' + taps[k] + ']' + AudioFX.duckFilter(d.params) + '[' + names[i] + 'd]');
+        names[i] = names[i] + 'd';
+      });
+    }
+
+    // ---- the mix -------------------------------------------------------
+    const ins = names.map((n) => '[' + n + ']').join('');
+    let mix = ins + 'amix=inputs=' + aClips.length + ':normalize=0:dropout_transition=0' +
+      ',atrim=duration=' + r3(duration);
+
+    const loud = job.loudness;
+    if (printLoudness) {
+      // Pass one: measure the finished mix and throw the samples away.
+      fc.push(mix + ',' + AudioFX.loudnormFilter(loud, null, true) + '[aout]');
+      return true;
+    }
+    if (loud && loud.enabled) {
+      // loudnorm runs its own resampler internally; put the rate back before the encoder
+      // so the output stays the 48 kHz the rest of the graph assumes.
+      mix += ',' + AudioFX.loudnormFilter(loud, loud.measured, false) + ',aresample=48000';
+    }
+    fc.push(mix + ',alimiter=limit=0.98[aout]');
+    return true;
+  }
+
+  if (measure) {
+    if (!buildAudioGraph(true)) return null;
+    args.push('-filter_complex', fc.join(';'));
+    args.push('-map', '[aout]', '-f', 'null', '-');
+    return args;
+  }
+
   fc.push('color=c=black:s=' + width + 'x' + height + ':r=' + fps + ':d=' + r3(duration) + '[base0]');
 
   let last = 'base0';
@@ -814,22 +941,9 @@ function buildArgs(job) {
   });
   fc.push('[' + last + ']trim=duration=' + r3(duration) + ',format=yuv420p[vout]');
 
-  if (aClips.length) {
-    aClips.forEach((c, i) => {
-      const idx = inputs.indexOf(c);
-      const dur = c.out - c.in;
-      const delay = Math.max(0, Math.round(c.start * 1000));
-      fc.push(
-        '[' + idx + ':a]atrim=start=' + r3(c.in) + ':duration=' + r3(dur) +
-        ',asetpts=PTS-STARTPTS' +
-        ',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo' +
-        ',volume=' + r3(c.volume) + ',adelay=' + delay + '|' + delay + '[a' + i + ']'
-      );
-    });
-    const ins = aClips.map((_, i) => '[a' + i + ']').join('');
-    fc.push(ins + 'amix=inputs=' + aClips.length + ':normalize=0:dropout_transition=0' +
-      ',atrim=duration=' + r3(duration) + ',alimiter=limit=0.98[aout]');
-  } else {
+  // buildAudioGraph() appends the whole mix to `fc`, ending at [aout]. Nothing audible
+  // means no graph at all, and the file gets a silent track so it still has audio.
+  if (!buildAudioGraph(false)) {
     args.push('-f', 'lavfi', '-t', String(r3(duration)), '-i', 'anullsrc=r=48000:cl=stereo');
   }
 
@@ -848,6 +962,53 @@ function buildArgs(job) {
   args.push('-c:a', 'aac', '-b:a', quality === 'draft' ? '96k' : '192k', '-ar', '48000');
   args.push('-movflags', '+faststart', '-t', String(r3(duration)), outPath);
   return args;
+}
+
+/**
+ * Loudness pass one: decode the mix, read what loudnorm measured, hand it back.
+ *
+ * Single-pass loudnorm works, but it is a dynamic estimator - it moves the gain as it
+ * goes and can pump on a mix whose level changes. Feeding pass two the real measurements
+ * turns it into one exact gain move, which is what "normalised to -14 LUFS" is supposed
+ * to mean. The cost is an extra audio-only decode, so a draft render skips it.
+ *
+ * Failure here is never fatal: no measurements simply means the render falls back to the
+ * single pass. It must not cost the export.
+ */
+function measureLoudness(job) {
+  let args;
+  try { args = buildArgs(job, { measureLoudness: true }); } catch (e) { return Promise.resolve(null); }
+  if (!args) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    const p = spawn(ffmpegPath, args, { windowsHide: true });
+    activeRender = p;                       // so Cancel can stop pass one too
+    let log = '';
+    p.stderr.on('data', (d) => {
+      log += d.toString();
+      if (log.length > 200000) log = log.slice(-100000);
+    });
+    p.on('error', () => { activeRender = null; resolve(null); });
+    p.on('close', () => {
+      const wasCancelled = activeRender === null;
+      activeRender = null;
+      if (wasCancelled) return resolve({ cancelled: true });
+      // loudnorm prints its JSON block last, after all the usual ffmpeg noise.
+      const open = log.lastIndexOf('{');
+      const close = log.lastIndexOf('}');
+      if (open === -1 || close < open) return resolve(null);
+      try {
+        const m = JSON.parse(log.slice(open, close + 1));
+        const nums = ['input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset'];
+        for (const k of nums) if (!isFinite(parseFloat(m[k]))) return resolve(null);
+        resolve({
+          input_i: parseFloat(m.input_i), input_tp: parseFloat(m.input_tp),
+          input_lra: parseFloat(m.input_lra), input_thresh: parseFloat(m.input_thresh),
+          target_offset: parseFloat(m.target_offset),
+        });
+      } catch (e) { resolve(null); }
+    });
+  });
 }
 
 ipcMain.handle('render:pickOutput', async (_e, defaultName) => {
@@ -884,6 +1045,19 @@ ipcMain.handle('render:start', async (_e, job) => {
       // A broken cache entry must never block a real render.
       try { fs.unlinkSync(cacheFile); } catch (err) { /* gone already */ }
     }
+  }
+
+  // Pass one, if the project asked for loudness normalisation. This happens AFTER the
+  // cache key was taken, deliberately: the measurements are derived from the job, not
+  // part of it, and putting them in the key would give the same content two keys - the
+  // renderer, which computes the same key for the cache bar, has never seen them.
+  if (job.loudness && job.loudness.enabled && !job.loudness.measured &&
+      job.quality !== 'draft' && (job.clips || []).some((c) => c.audible)) {
+    if (win) win.webContents.send('render:progress', { time: 0, total: job.duration, stage: 'Measuring loudness' });
+    const measured = await measureLoudness(job);
+    // Cancelling pass one cancels the render - not "carry on without measurements".
+    if (measured && measured.cancelled) return { ok: false, cancelled: true, error: 'Render cancelled.' };
+    if (measured) job.loudness = Object.assign({}, job.loudness, { measured });
   }
 
   let args;
@@ -969,6 +1143,19 @@ ipcMain.handle('debug:input', (_e, ev) => {
   if (!process.env.SHORTCUT_SMOKE || !win) return false;
   win.webContents.sendInputEvent(ev);
   return true;
+});
+
+/**
+ * Test-only: build a render job's ffmpeg arguments without running anything.
+ *
+ * buildArgs() lives in main and the smoke suites run in the renderer, so without this a
+ * test of the emitted filter graph would have to re-implement it - and a test that
+ * re-implements what it is testing proves nothing. tools/smoke-audiofx.js uses this.
+ */
+ipcMain.handle('debug:buildArgs', (_e, { job, opts }) => {
+  if (!process.env.SHORTCUT_SMOKE) return null;
+  try { return { ok: true, args: buildArgs(job, opts) }; }
+  catch (e) { return { ok: false, error: e.message }; }
 });
 
 /** Test-only: write a file, so a smoke script can make its own fixtures. */

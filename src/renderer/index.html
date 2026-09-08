@@ -125,6 +125,14 @@
                 <option value="60">60</option>
               </select>
             </label>
+            <label>Loudness
+              <select id="loudness" title="Normalise the finished mix to a target loudness (two-pass loudnorm)">
+                <option value="off" selected>Off - leave levels alone</option>
+                <option value="-14">-14 LUFS - social (default)</option>
+                <option value="-16">-16 LUFS - podcast</option>
+                <option value="-23">-23 LUFS - broadcast</option>
+              </select>
+            </label>
             <label>Range
               <select id="renderRange" title="Render the whole timeline, or just between the in/out marks">
                 <option value="all" selected>Whole project</option>
@@ -223,6 +231,7 @@
     </div>
   </div>
 
+  <script src="../audiofx.js"></script>
   <script src="text/model.js"></script>
   <script src="transitions.js"></script>
   <script src="waveform.js"></script>

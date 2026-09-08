@@ -443,3 +443,16 @@ select, input[type=number], input[type=text] {
   font-family: Consolas, monospace; font-size: 10px; color: var(--dim);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ---- the audio effect chain in the clip inspector ---------------------- */
+.afx-box { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.afx-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.afx-note { margin-bottom: 8px; line-height: 1.35; }
+.afx-fx { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; }
+.afx-fx.off { opacity: 0.5; }
+.afx-fx-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #14161b; }
+.afx-fx-head b { flex: 1; font-weight: 600; }
+.afx-fx-btns { display: flex; gap: 3px; }
+.afx-fx-body { padding: 6px; }
+.afx-add { margin-top: 4px; }
+.afx-add select { width: 100%; }

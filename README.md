@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are eleven suites:
+There are twelve suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -63,6 +63,12 @@ There are eleven suites:
   and not the user's folders, that the **viewer actually decodes it** instead of
   compositing, that the source clips fall silent underneath it, and that the span and its
   player are dropped the moment its content changes.
+- `tools/smoke-audiofx.js` — the per-clip audio chain: the filter string each effect
+  emits, the sidechain wiring for ducking (including that a duck to the clip's own track
+  is refused and that a lost voice track degrades rather than dangling a filter pad), both
+  loudness passes, the chain surviving a save/reload, one undo removing a whole chain, the
+  preview mix, and — the load-bearing one — that a clip with **no** effects still produces
+  a byte-identical argument list to the one `buildArgs()` emitted before any of it existed.
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -86,6 +92,12 @@ SHORTCUT_SMOKE=tools/smoke.js node_modules/.bin/electron .
 Because the script runs in the renderer's global scope, every top-level function in
 `app.js` (`importPaths`, `splitAtPlayhead`, `buildJob`, `state`, ...) is directly callable
 from it. That is the cheapest way to test a change without clicking through the UI.
+
+`buildArgs()` lives in the main process while the suites run in the renderer, so
+`window.api.buildArgs(job, opts)` bridges to it — it builds the argument list and runs
+nothing. Like `sendInput`, it only answers while `SHORTCUT_SMOKE` is set. A test that
+re-implemented the filter builder in order to check it would pass happily while the render
+emitted something else entirely.
 
 **Testing anything the user clicks or types needs REAL input.** A `MouseEvent` dispatched
 from a script is untrusted: it fires listeners but never performs the default action, so
@@ -157,7 +169,8 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
 ```js
 {
   app: 'shortcut', version: 1,
-  out: { w: 1080, h: 1920, fps: 30, quality: 'medium' },
+  out: { w: 1080, h: 1920, fps: 30, quality: 'medium',
+         loudness: { enabled, lufs, tp, lra } },   // the project's loudness target
   pxPerSec: 60,          // timeline zoom
   playhead: 0,
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
@@ -181,6 +194,7 @@ Clip = {
   panX, panY,            // 0..1 crop position within the source
   zoom,                  // 1 = the largest crop that fits the output aspect
   volume,                // 0..2
+  afx,                   // audio clips only - the effect chain, see the audio chain below
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
   card                   // text clips only - the whole card, see TextCard below
 }
@@ -222,8 +236,9 @@ timings and `visible` / `audible` flags. `buildArgs()` (main) turns that into a 
 - each visible video clip: `trim` → `setpts=PTS-STARTPTS+start/TB` → `crop` → `scale` →
   `fps`, then `overlay` onto the running base with `enable='between(t,start,end)'` and
   **`eof_action=repeat`** (see the note below);
-- each audible clip: `atrim` → `asetpts` → `volume` → `adelay`, then a single `amix`
-  and a limiter;
+- each audible clip: `atrim` → `asetpts` → `aformat` → **its own effect chain** →
+  `volume` → `adelay`, then a single `amix`, optional loudness normalisation, and a
+  limiter — see "The audio chain" below;
 - x264 with a preset/CRF pair chosen by the quality setting.
 
 Every clip occurrence becomes its own ffmpeg input, so the same file can appear many
@@ -247,6 +262,111 @@ by hand.
 
 Output presets are the four `<option>`s on `#preset` in `index.html`; quality presets are
 the `presets` map in `buildArgs()`. Both are one-line additions.
+
+### The audio chain
+
+Every audio clip carries an ordered effect chain in `clip.afx`:
+
+```js
+afx: [ { id, type, enabled, params: { ... } }, ... ]
+```
+
+Plain JSON and nothing else, because undo is `JSON.stringify` of the track list and the
+same shape is the `.scut` file. Six types, all defined in one place — `AudioFX.DEFS` in
+`src/audiofx.js`:
+
+| Type | Becomes | Notes |
+| --- | --- | --- |
+| `denoise` | `afftdn` | reduction and noise floor, both in dB |
+| `eq` | three `equalizer` bands | low / mid / high, each frequency + gain + Q |
+| `deesser` | `deesser` | intensity, max reduction, frequency |
+| `compressor` | `acompressor` | **UI in dB, filter in linear** — the conversion is in `DEFS` |
+| `gain` | `volume=<n>dB` | the one effect the preview honours exactly |
+| `duck` | `sidechaincompress` | two inputs, so it is wired up by `buildArgs()`, not by `chain()` |
+
+`src/audiofx.js` is loaded **twice** — as a `<script>` global in `index.html` (like
+`TextModel` and `Trans`) and as a CommonJS module by `main.js`. That is deliberate: the
+inspector, the preview mix and the ffmpeg filter string all read the same definition, so
+there is no second place for them to drift apart. Adding an effect type is one entry in
+`DEFS`, and the inspector builds its controls from that entry's `schema` through the same
+`TextUI.control` rows the text panel uses.
+
+Order in a clip's chain is order in the filter graph, and it matters — a compressor before
+a gain is not a compressor after one. The chain sits after `aformat` and before the clip's
+own `volume` and `adelay`, so clip volume is still the last word on level.
+
+**Everything here is opt-in.** A clip with an empty `afx` contributes nothing to the
+filter string, and `buildArgs()` emits a byte-identical argument list to the one it emitted
+before any of this existed. `tools/smoke-audiofx.js` asserts exactly that, and it is the
+assertion to keep working.
+
+#### Ducking
+
+`duck` names a **track**, not a clip: music ducks under the whole voice-over, across every
+cut in it. Because an ffmpeg filter output pad may only be consumed once, the voice cannot
+simply be read twice — `buildAudioGraph()` splits each contributing voice stream with
+`asplit`, mixes the halves into a `duckbusN`, splits *that* again if several clips duck to
+the same track, and feeds each ducked clip through `sidechaincompress`.
+
+`sidechaincompress` is not symmetric: it compresses its **first** input by the level of its
+second. Swapped, the music would gate the voice.
+
+Three ways a duck degrades rather than breaking the render, all tested:
+
+- a duck pointed at the clip's **own** track is dropped — otherwise it would compress the
+  clip against whatever happens to sit next to it, which is not what ducking means. The
+  inspector leaves the clip's own track out of the list for the same reason;
+- a duck pointed at a track with nothing audible on it (muted, or emptied) is dropped
+  rather than leaving a filter pad with no producer;
+- an effect type this build does not know is dropped by `AudioFX.normalizeClip()` on load.
+
+#### Loudness
+
+`state.out.loudness` is a project-level target for the finished mix — `{ enabled, lufs,
+tp, lra }`, the Loudness row in the render panel, applied as `loudnorm` to the final
+`amix`. It is **off by default**, so an existing project renders exactly as it did before.
+
+It is genuinely two-pass. Single-pass `loudnorm` is a dynamic estimator: it moves the gain
+as it goes and can pump on a mix whose level changes. So `render:start` runs
+`measureLoudness()` first — `buildArgs(job, { measureLoudness: true })`, which builds the
+same audio graph, decodes **no video**, and writes to `-f null -` with
+`print_format=json`. Those measurements go back into pass two along with `linear=true`,
+turning the result into one exact gain move. A draft render skips pass one; close enough,
+and it does not double the decode.
+
+Two things to keep straight:
+
+- pass one runs **after** the render cache key has been taken. The measurements are
+  derived from the job, not part of it — the renderer computes the same key for the cache
+  bar and has never seen them, so keying them would give identical content two keys.
+- `loudnorm` resamples internally, so `aresample=48000` goes after it to put the rate back
+  where the rest of the graph expects it.
+
+Failure in pass one is never fatal: no measurements simply means the single pass. It must
+not cost the export. Cancelling pass one, however, cancels the render.
+
+#### What the preview actually does
+
+The preview is **not** a DSP engine, and the inspector says so where the controls are.
+
+What it mirrors is level and mute — `AudioFX.previewGain()`, which is the clip's volume
+times every enabled `gain` effect. That is what you need while cutting: the balance
+between voice and music. Denoise, EQ, de-ess, compression, ducking and loudness are all
+applied at render time only.
+
+The level goes through a WebAudio gain node per clip, because `el.volume` is capped at 1
+and a +6 dB gain effect could not otherwise be heard at all. Two traps that shaped it:
+
+- routing an element through a **suspended** `AudioContext` silences it outright, and a
+  context created before any user gesture starts suspended. So the node is only attached
+  once the context is actually running (pressing play is the gesture that starts it);
+  until then the element's own clamped volume is used. Worst case is "a boost is quieter
+  than it should be", never "the preview went silent";
+- `createMediaElementSource` cannot be undone, so `dropMedia()` disconnects the node with
+  the element.
+
+This is the one place in the app where preview and render deliberately disagree, and it is
+the reason the panel carries a line of text saying so.
 
 ### Text cards
 
@@ -758,7 +878,7 @@ that, and `tools/smoke-text2.js` asserts the computed value.
 **Scroll to adjust.** `TextUI.attachWheel(el, {step, min, max, get, set})` puts wheel
 nudging on a control: one step per notch, `shift` for ten, `ctrl`/`alt` for a tenth. It is
 attached to both halves of every numeric row, to the keyframe value and time boxes, and
-(from `app.js`) to the framing and volume rows. It consumes the event so the panel does not
+(from `app.js`) to the framing and volume rows, and to every audio effect parameter. It consumes the event so the panel does not
 scroll out from under the pointer, rounds to whichever is finer - the increment or the
 precision already in the value - and coalesces a burst of notches into one undo entry.
 
@@ -773,7 +893,9 @@ exactly that.
 Every clip lazily gets its own `<video>`/`<audio>` element (`mediaFor()`, cached in
 `mediaEls`). The rAF `loop()` advances the playhead from a wall-clock origin, then
 `syncMedia()` plays/pauses/re-seeks each element that overlaps the playhead (re-seeking
-only when drift exceeds 0.3 s so playback is not constantly stuttering). The canvas draws
+only when drift exceeds 0.3 s so playback is not constantly stuttering) and puts each audio
+clip's level and mute onto it through `applyPreviewMix()` - see "The audio chain" for what
+the preview does and does not honour. The canvas draws
 only the topmost visible video clip — there is no compositing or blending, so a clip on
 V2 fully hides V1 beneath it.
 
@@ -875,6 +997,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
+| An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
@@ -885,7 +1008,12 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 
 ### Known limits
 
-- No video effects or speed changes.
+- No video effects or speed changes. **Audio** effects do exist — see "The audio chain".
+- The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
+  ducking, loudness) is applied on render. This is the one deliberate preview/render
+  disagreement in the app, and the inspector says so on screen.
+- Loudness normalisation is off by default. Turning it on adds an audio-only measurement
+  pass before the render (skipped on draft quality).
 - Text cards cover the still-image and shape needs; the timeline still holds no images
   (the QuickBin will keep them, and an object transition will use one, but nothing puts a
   still on a track).

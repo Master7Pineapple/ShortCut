@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('api', {
   saveResult: (saved) => ipcRenderer.invoke('app:saveResult', saved),
 
   sendInput: (ev) => ipcRenderer.invoke('debug:input', ev),   // test-only, see main.js
+  buildArgs: (job, opts) => ipcRenderer.invoke('debug:buildArgs', { job, opts }), // test-only
   writeTestFile: (file, data) => ipcRenderer.invoke('debug:writeFile', { file, data }),
   showItem: (p) => ipcRenderer.invoke('shell:showItem', p),
   setTitle: (t) => ipcRenderer.invoke('app:title', t),
