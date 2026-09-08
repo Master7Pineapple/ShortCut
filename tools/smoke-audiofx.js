@@ -337,13 +337,46 @@
     ok('an audio clip resolves to itself, not via a link',
       audioFxTarget(mate).clip === mate && audioFxTarget(mate).viaLink === null);
 
-    setSelection([vClip.id], false);
+    // Select it the way a CLICK does. The lane handler selects the whole link group, so a
+    // linked pair always arrives at the inspector as TWO clips - selecting the video id on
+    // its own is a state the UI cannot actually produce, and testing only that is what let
+    // "2 clips selected." ship in place of the whole inspector.
+    setSelection(linkGroup(vClip).map((c) => c.id), false);
+    ok('clicking a linked clip selects the pair, as the lane handler does',
+      selectedClips().length === 2, String(selectedClips().length));
     renderInspector();
+    const inspectorText = document.querySelector('#inspector').textContent;
+    ok('a linked pair is not treated as a multi-selection',
+      inspectorText.indexOf('clips selected') === -1, inspectorText.slice(0, 60));
+    ok('a linked pair still shows the clip inspector',
+      /Name|Track|Volume/.test(inspectorText));
+    ok('a linked pair shows the VIDEO half, which carries the framing and the name',
+      inspectorText.indexOf(vClip.name) !== -1 && /\d+x\d+ @/.test(inspectorText));
+
     const vPanel = document.querySelector('#inspector .afx-box');
-    ok('selecting the video half opens the audio effects panel', !!vPanel);
+    ok('selecting the linked pair opens the audio effects panel', !!vPanel);
     ok('the panel says which clip it is really editing',
       !!vPanel && /Editing the linked audio clip on A\d/.test(vPanel.textContent),
       vPanel ? (vPanel.querySelector('.afx-via') || {}).textContent : '');
+
+    // singleUnit() must not collapse a genuine multi-selection.
+    const unrelated = allClips().filter((x) => !x.clip.linkId).slice(0, 2);
+    if (unrelated.length === 2) {
+      setSelection(unrelated.map((x) => x.clip.id), false);
+      renderInspector();
+      ok('two unrelated clips are still reported as a multi-selection',
+        document.querySelector('#inspector').textContent.indexOf('2 clips selected') !== -1);
+    } else {
+      ok('two unrelated clips are still reported as a multi-selection (no fixture)', true);
+    }
+
+    // Selecting the video half alone still works, for anything that sets selection directly.
+    setSelection([vClip.id], false);
+    renderInspector();
+    ok('the video half selected on its own also opens the panel',
+      !!document.querySelector('#inspector .afx-box'));
+    setSelection(linkGroup(vClip).map((c) => c.id), false);
+    renderInspector();
 
     // And an edit made from there must land on the audio clip, not the video one.
     pushUndo();

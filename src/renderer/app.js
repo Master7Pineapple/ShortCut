@@ -1268,8 +1268,17 @@ function renderInspector() {
   if (typeof TextUI !== 'undefined') TextUI.refresh();
 
   if (!sel.length) { box.innerHTML = '<div class="empty">No clip selected.</div>'; return; }
-  if (sel.length > 1) { box.innerHTML = '<div class="empty">' + sel.length + ' clips selected.</div>'; return; }
-  const c = sel[0].clip;
+
+  // One link group is ONE thing, not a multi-selection.
+  //
+  // Clicking a clip selects its whole link group (see the lane mousedown handler), so an
+  // imported video with sound always arrives here as two clips - and treating that as a
+  // multi-selection meant the commonest selection in the app produced "2 clips selected."
+  // and no inspector at all: no framing, no volume, no audio effects. The pair is shown
+  // as the video clip, which is the half with a picture, framing and a name on it.
+  const row = singleUnit(sel);
+  if (!row) { box.innerHTML = '<div class="empty">' + sel.length + ' clips selected.</div>'; return; }
+  const c = row.clip;
   const isText = c.kind === 'text';
   const source = isText ? 'text card'
     : (c.srcW ? c.srcW + 'x' + c.srcH + ' @' + c.fps + 'fps' : 'audio');
@@ -1280,7 +1289,7 @@ function renderInspector() {
   box.innerHTML =
     '<div class="kv">' +
     '<b>Name</b><span title="' + escapeHtml(c.src || source) + '">' + escapeHtml(name) + '</span>' +
-    '<b>Track</b><span>' + sel[0].track.name + '</span>' +
+    '<b>Track</b><span>' + row.track.name + '</span>' +
     '<b>Source</b><span>' + source + '</span>' +
     '<b>Start</b><span>' + fmtTc(c.start) + '</span>' +
     '<b>Length</b><span>' + fmtTc(c.out - c.in) + '</span>' +
@@ -1318,6 +1327,21 @@ function renderInspector() {
   const fxTarget = audioFxTarget(c);
   if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   syncFramingControls();
+}
+
+/**
+ * The one clip a selection is really about, or null if it is a genuine multi-selection.
+ *
+ * A selection of several clips that all share one `linkId` is a single A/V pair, which is
+ * what clicking any linked clip produces. The video half is the one to show: it carries
+ * the framing, the source dimensions and the name. Its audio half is still reachable -
+ * audioFxTarget() walks the link to find it.
+ */
+function singleUnit(sel) {
+  if (sel.length === 1) return sel[0];
+  const id = sel[0].clip.linkId;
+  if (!id || !sel.every((x) => x.clip.linkId === id)) return null;
+  return sel.find((x) => x.clip.kind === 'video') || sel[0];
 }
 
 /**

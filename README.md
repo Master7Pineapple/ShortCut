@@ -363,6 +363,18 @@ When the panel opens through a link it says so — *"Editing the linked audio cl
 Quietly editing something other than the clip the user selected is the kind of thing that
 gets blamed on the app three weeks later.
 
+**A link group is ONE selection, not a multi-selection.** Clicking any clip selects its
+whole link group, so an imported video with sound *always* reaches `renderInspector()` as
+two clips. The old `sel.length > 1` bail-out therefore fired on the commonest selection in
+the app and replaced the entire inspector — framing, volume and audio effects alike — with
+"2 clips selected."; `singleUnit()` now collapses a shared-`linkId` selection to its video
+half, which is the one carrying the framing, the dimensions and the name.
+
+The lesson for tests: `setSelection([videoClip.id])` is a state the UI **cannot produce**.
+The suite asserted against it and passed while the feature was unreachable by mouse.
+`tools/smoke-audiofx.js` now selects through `linkGroup()` the way the lane handler does,
+and asserts the inspector is not showing the multi-selection message.
+
 #### The loudness meter
 
 The footer carries a live meter of the **preview mix**, next to the render panel. Two
