@@ -377,6 +377,95 @@ ipcMain.handle('wave:write', (_e, { path: p, peaks, duration }) => {
   } catch (e) { return false; }
 });
 
+// ------------------------------------------------------- silence detection
+
+/**
+ * Silence spans in a media file's audio, cached on disk by path + size + mtime.
+ *
+ * `silencedetect` is run ONCE per file at a permissive minimum duration (0.10s) and the
+ * raw spans are cached whole. The editor's own "silences longer than N" threshold and its
+ * pad are applied in the renderer, over the cached list - so dragging the threshold
+ * slider re-counts instantly instead of re-decoding the file. The noise floor DOES change
+ * what ffmpeg reports, so it is part of the cache key; the threshold and pad are not.
+ *
+ * Keyed on the file's stats rather than its content, exactly like the waveform cache, so
+ * a re-encoded file under the same name is re-analysed rather than served stale.
+ */
+const RAW_SILENCE_MIN = 0.10;
+
+const silenceDir = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'silence');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const silenceFile = (p, noise) =>
+  path.join(silenceDir(),
+    crypto.createHash('sha1').update(String(p) + '|' + noise).digest('hex') + '.json');
+
+ipcMain.handle('analyze:silence', async (_e, { path: p, noise }) => {
+  const db = Math.round(Number(noise) || -30);
+  const stamp = fileStamp(p);
+  if (!stamp) return { ok: false, error: 'File not found.' };
+
+  const cacheFile = silenceFile(p, db);
+  try {
+    const j = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    if (j.size === stamp.size && j.mtime === stamp.mtime && j.noise === db) {
+      return { ok: true, cached: true, noise: db, spans: j.spans, duration: j.duration, hasAudio: j.hasAudio };
+    }
+  } catch (e) { /* no usable cache entry - measure it */ }
+
+  const meta = await probe(p);
+  const duration = meta ? meta.duration : 0;
+  if (meta && !meta.hasAudio) {
+    const empty = { size: stamp.size, mtime: stamp.mtime, noise: db, spans: [], duration, hasAudio: false };
+    try { fs.writeFileSync(cacheFile, JSON.stringify(empty), 'utf8'); } catch (e) { /* cache is optional */ }
+    return { ok: true, cached: false, noise: db, spans: [], duration, hasAudio: false };
+  }
+
+  const spans = await new Promise((resolve) => {
+    const args = [
+      '-hide_banner', '-nostats', '-i', p, '-map', '0:a:0',
+      '-af', 'silencedetect=noise=' + db + 'dB:d=' + RAW_SILENCE_MIN,
+      '-f', 'null', '-',
+    ];
+    const proc = spawn(ffmpegPath, args, { windowsHide: true });
+    let log = '';
+    proc.stderr.on('data', (d) => {
+      log += d.toString();
+      if (log.length > 4000000) log = log.slice(-2000000);
+    });
+    proc.on('error', () => resolve(null));
+    proc.on('close', () => {
+      const out = [];
+      let open = null;
+      // silencedetect prints one `silence_start` line, then a matching `silence_end`.
+      for (const line of log.split(/\r?\n/)) {
+        let m = /silence_start:\s*(-?[\d.]+)/.exec(line);
+        if (m) { open = Math.max(0, parseFloat(m[1])); continue; }
+        m = /silence_end:\s*(-?[\d.]+)/.exec(line);
+        if (m && open != null) {
+          const end = parseFloat(m[1]);
+          if (isFinite(end) && end > open) out.push([r3(open), r3(end)]);
+          open = null;
+        }
+      }
+      // A file that ENDS in silence never gets its closing line. Closing it at the stream
+      // duration is what makes trailing dead air cuttable at all.
+      if (open != null && duration > open) out.push([r3(open), r3(duration)]);
+      resolve(out);
+    });
+  });
+
+  if (!spans) return { ok: false, error: 'ffmpeg could not read that file.' };
+  try {
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      size: stamp.size, mtime: stamp.mtime, noise: db, duration, hasAudio: true, spans,
+    }), 'utf8');
+  } catch (e) { /* an unwritable cache must never fail the analysis */ }
+  return { ok: true, cached: false, noise: db, spans, duration, hasAudio: true };
+});
+
 // ------------------------------------------------------------------ projects
 
 ipcMain.handle('project:save', async (_e, payload) => {

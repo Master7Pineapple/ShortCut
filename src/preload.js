@@ -23,6 +23,9 @@ contextBridge.exposeInMainWorld('api', {
   waveRead: (p) => ipcRenderer.invoke('wave:read', p),
   waveWrite: (p, peaks, duration) => ipcRenderer.invoke('wave:write', { path: p, peaks, duration }),
 
+  // Silence spans for Tighten, cached in main by path + size + mtime + noise floor.
+  analyzeSilence: (p, noise) => ipcRenderer.invoke('analyze:silence', { path: p, noise }),
+
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),
 

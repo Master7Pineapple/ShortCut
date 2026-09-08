@@ -45,6 +45,9 @@ const state = {
    *  default, so a project renders exactly as it did before the audio chain existed
    *  until somebody asks for normalisation. */
   out: { w: 1080, h: 1920, fps: 30, quality: 'medium', loudness: Object.assign({}, AudioFX.LOUD_DEFAULTS) },
+  /** Tighten's settings. Not timeline state: changing them snapshots no undo entry and
+   *  dirties nothing, it only changes what the next Tighten would remove. */
+  tighten: { threshold: 0.35, pad: 0.05, noise: -30 },
 };
 
 let undoStack = [];
@@ -1326,6 +1329,7 @@ function renderInspector() {
   }
   const fxTarget = audioFxTarget(c);
   if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
+  if (tightenAudioFor(c)) box.appendChild(tightenPanel());
   syncFramingControls();
 }
 
@@ -1363,6 +1367,95 @@ function audioFxTarget(clip) {
   if (!mate) return null;
   const row = allClips().find((x) => x.clip === mate);
   return { clip: mate, viaLink: row ? row.track.name : 'linked audio' };
+}
+
+/**
+ * The Tighten panel.
+ *
+ * Threshold, pad and noise floor, with a LIVE count of what would come out before
+ * anything is committed - the whole point of separating `tightenPlan()` from `tighten()`.
+ * The rows are `TextUI.control`, so each one is a slider AND a typable box AND
+ * scroll-adjustable AND resettable, but they pass their own hooks: these are settings,
+ * not timeline state, so moving a slider here snapshots no undo entry and dirties nothing.
+ */
+let tightenBusy = false;
+
+function tightenPanel() {
+  const el = TextUI.el;
+  const box = el('div', 'afx-box tighten-box');
+
+  const head = el('div', 'afx-head');
+  head.appendChild(el('b', null, 'Tighten'));
+  const count = el('span', 'tc-hint');
+  head.appendChild(count);
+  box.appendChild(head);
+
+  box.appendChild(el('div', 'tc-hint',
+    'Removes silences from the selection and ripples the cut through its link group, ' +
+    'so picture and sound stay together. One undo entry for the whole pass.'));
+
+  const status = el('div', 'tc-hint tighten-status');
+  const body = el('div', 'tc-body');
+  const bar = el('div', 'tc-btns tighten-bar');
+  const analyseBtn = el('button', 'mini', 'Analyse');
+  const runBtn = el('button', 'mini', 'Tighten');
+  analyseBtn.title = 'Measure the selection with ffmpeg silencedetect (cached per file)';
+  runBtn.title = 'Remove the silences shown above';
+
+  const paint = () => {
+    const plan = tightenPlan();
+    count.textContent = plan.pending ? 'not measured'
+      : plan.count ? plan.count + ' cut' + (plan.count === 1 ? '' : 's') : 'nothing to cut';
+    status.textContent = plan.pending
+      ? (tightenBusy ? 'Analysing...' : plan.pending + ' clip(s) still to measure.')
+      : plan.count
+        ? 'Would remove ' + plan.count + ' span(s), ' + plan.removed.toFixed(2) + 's of ' +
+          projectDuration().toFixed(2) + 's.'
+        : 'No silence over ' + tightenOpts().threshold.toFixed(2) + 's at this noise floor.';
+    runBtn.disabled = !plan.count;
+    analyseBtn.disabled = tightenBusy;
+  };
+
+  const hooks = { onEdit: () => {}, onEditEnd: () => {}, onChanged: paint };
+  const C = (spec) => TextUI.control(spec, state.tighten, TIGHTEN_DEFAULTS, hooks);
+  body.appendChild(C({
+    path: 'threshold', label: 'Silence over', type: 'range',
+    min: 0.05, max: 3, step: 0.01, unit: 's', digits: 2,
+  }));
+  body.appendChild(C({
+    path: 'pad', label: 'Keep either side', type: 'range',
+    min: 0, max: 0.5, step: 0.01, unit: 's', digits: 2,
+  }));
+  // The noise floor is what ffmpeg was asked, so changing it needs a fresh measurement.
+  const noiseRow = C({
+    path: 'noise', label: 'Noise floor', type: 'range',
+    min: -60, max: -10, step: 1, unit: 'dB', digits: 0,
+  });
+  body.appendChild(noiseRow);
+  box.appendChild(body);
+  box.appendChild(status);
+
+  const analyse = async () => {
+    if (tightenBusy) return;
+    tightenBusy = true;
+    paint();
+    const r = await analyzeTightenSelection();
+    tightenBusy = false;
+    if (r.failed) log('Could not analyse ' + r.failed + ' file(s) for silence.');
+    paint();
+  };
+
+  analyseBtn.addEventListener('click', analyse);
+  runBtn.addEventListener('click', () => { tighten(); });
+  bar.appendChild(analyseBtn);
+  bar.appendChild(runBtn);
+  box.appendChild(bar);
+
+  paint();
+  // Measuring is cheap after the first time (both caches answer from disk), so a panel
+  // that opens on an unmeasured clip just measures it rather than making the user ask.
+  if (tightenPlan().pending) analyse();
+  return box;
 }
 
 /**
@@ -2560,6 +2653,267 @@ function deleteSelected(ripple) {
   renderAll();
 }
 
+// ------------------------------------------------------------------ Tighten
+//
+// Silence removal. The detection is the easy half - ffmpeg's `silencedetect` does it in
+// the main process and the spans are cached per file. The half that matters is rippling
+// the cut through a link group without breaking A/V sync, and doing the whole pass as ONE
+// undo entry however many spans it removes.
+//
+// Three time bases meet here, and mixing them up is the bug this code exists to avoid:
+//   * SOURCE time   - what silencedetect reports, and what `clip.in`/`clip.out` are in.
+//   * CLIP time     - source time minus `clip.in`.
+//   * TIMELINE time - clip time plus `clip.start`. Everything removed is expressed here.
+
+const TIGHTEN_DEFAULTS = { threshold: 0.35, pad: 0.05, noise: -30 };
+
+/** The smallest span worth cutting once the pad has eaten into it. */
+const TIGHTEN_MIN_CUT = 0.02;
+
+/** Raw silence spans per source file, keyed `src|noise`. Mirrors the main-process cache. */
+const silenceCache = new Map();
+
+/**
+ * Step 3's hook: extra SOURCE-time spans to cut alongside the detected silences.
+ *
+ * Register a function `(audioClip, opts) => [[startSec, endSec], ...]` in the source
+ * file's own time base. Captions will feed filler words ("um", "uh", "like") in through
+ * here, so a filler cut and a silence cut are one ripple and one undo entry rather than
+ * two passes over the same timeline.
+ *
+ * Filler spans are NOT subject to the silence threshold - a filler word is short by
+ * definition - but they do get the same pad, so a cut never lands hard against speech.
+ */
+const tightenSpanSources = [];
+function registerTightenSpans(fn) {
+  if (typeof fn === 'function') tightenSpanSources.push(fn);
+  return fn;
+}
+function extraTightenSpans(clip, opts) {
+  const out = [];
+  for (const fn of tightenSpanSources) {
+    let spans = null;
+    // A broken provider must cost its own spans, never the whole Tighten pass.
+    try { spans = fn(clip, opts); } catch (e) { spans = null; }
+    if (!Array.isArray(spans)) continue;
+    for (const s of spans) {
+      if (Array.isArray(s) && isFinite(s[0]) && isFinite(s[1]) && s[1] > s[0]) out.push([s[0], s[1]]);
+    }
+  }
+  return out;
+}
+
+/** Sort and union a list of [start, end] spans. */
+function mergeSpans(spans) {
+  const list = spans.filter((s) => s && s[1] > s[0]).map((s) => [s[0], s[1]])
+    .sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const s of list) {
+    const last = out[out.length - 1];
+    if (last && s[0] <= last[1] + 1e-6) last[1] = Math.max(last[1], s[1]);
+    else out.push([s[0], s[1]]);
+  }
+  return out;
+}
+
+function tightenOpts() {
+  return Object.assign({}, TIGHTEN_DEFAULTS, state.tighten);
+}
+
+/**
+ * The audio clip a selection's silence should be read from.
+ *
+ * People click the video half - it is the one with a picture on it - so a video clip
+ * routes through its link group to the audio that came in with it, exactly as the audio
+ * effect chain does.
+ */
+function tightenAudioFor(clip) {
+  if (!clip || clip.kind === 'text') return null;
+  if (clip.kind === 'audio') return clip.src ? clip : null;
+  if (clip.kind !== 'video' || !clip.linkId) return null;
+  return linkGroup(clip).find((x) => x.kind === 'audio' && x.src) || null;
+}
+
+/** The selection as link groups: [{ clips, audio }], each group listed once. */
+function tightenUnits() {
+  const seen = new Set();
+  const units = [];
+  for (const { clip } of selectedClips()) {
+    const key = clip.linkId || clip.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    units.push({ clips: linkGroup(clip), audio: tightenAudioFor(clip) });
+  }
+  return units;
+}
+
+/** Cached spans for a source, or null if it has not been analysed at this noise floor. */
+function silenceFor(src, noise) {
+  return silenceCache.get(src + '|' + Math.round(noise)) || null;
+}
+
+/**
+ * Analyse every source the current selection needs, filling the renderer-side cache.
+ *
+ * Safe to call repeatedly: a file already in the cache costs nothing, and the main
+ * process serves a previous session's result from disk.
+ */
+async function analyzeTightenSelection() {
+  const opts = tightenOpts();
+  const noise = Math.round(opts.noise);
+  const srcs = new Set();
+  for (const u of tightenUnits()) if (u.audio && !silenceFor(u.audio.src, noise)) srcs.add(u.audio.src);
+  let failed = 0;
+  for (const src of srcs) {
+    let r = null;
+    try { r = await window.api.analyzeSilence(src, noise); } catch (e) { r = null; }
+    if (r && r.ok) silenceCache.set(src + '|' + noise, { spans: r.spans || [], duration: r.duration || 0 });
+    else failed++;
+  }
+  return { analysed: srcs.size - failed, failed };
+}
+
+/**
+ * What Tighten would remove, as merged TIMELINE spans. Pure: it reads the cache and the
+ * settings and mutates nothing, so the inspector can show a live count on every slider
+ * move without touching the project.
+ */
+function tightenPlan() {
+  const opts = tightenOpts();
+  const noise = Math.round(opts.noise);
+  const cutIds = new Set();
+  const raw = [];
+  let pending = 0;
+
+  for (const u of tightenUnits()) {
+    if (!u.audio) continue;
+    const a = u.audio;
+    const data = silenceFor(a.src, noise);
+    if (!data) { pending++; continue; }
+
+    const spans = [];
+    // The threshold is measured on the silence as DETECTED, before the pad eats into it.
+    for (const s of data.spans) if (s[1] - s[0] >= opts.threshold) spans.push(s);
+    for (const s of extraTightenSpans(a, opts)) spans.push(s);
+
+    for (const s of mergeSpans(spans)) {
+      // Only the part of a silence this clip actually uses can be cut.
+      const s0 = Math.max(s[0], a.in) + opts.pad;
+      const s1 = Math.min(s[1], a.out) - opts.pad;
+      if (s1 - s0 < TIGHTEN_MIN_CUT) continue;
+      raw.push([a.start + (s0 - a.in), a.start + (s1 - a.in)]);
+    }
+    for (const c of u.clips) cutIds.add(c.id);
+  }
+
+  const merged = mergeSpans(raw);
+  let removed = 0;
+  for (const s of merged) removed += s[1] - s[0];
+  return { spans: merged, cutIds, removed, count: merged.length, pending };
+}
+
+/**
+ * Remove one TIMELINE span and close the gap.
+ *
+ * `cutIds` is the set of clips the span may cut into - the selection's link groups.
+ * Everything else on an unlocked track only SHIFTS, and only if it starts after the span:
+ * a music bed or a second interview is not silent just because the voice-over is, and
+ * slicing it would be a surprise nobody asked for.
+ *
+ * Text clips are never cut either, whether or not they are in the group. Their `in` is
+ * always 0 and their length is `out` (see the data model), and cutting a card's animation
+ * in half is never the intent - they ride the ripple and keep their length.
+ *
+ * A locked track is left entirely alone, neither cut nor shifted, exactly as ripple
+ * delete already leaves it.
+ */
+function removeTimelineSpan(a, b, cutIds) {
+  const amount = b - a;
+  if (amount <= 0) return;
+  const E = 1e-6;
+  const relink = new Map();   // original linkId -> the id shared by this span's right halves
+  const dropped = [];
+
+  for (const track of state.tracks) {
+    if (track.locked) continue;
+    const kept = [];
+    for (const c of track.clips) {
+      const s = c.start, e = clipEnd(c);
+      const cuttable = cutIds.has(c.id) && c.kind !== 'text';
+
+      if (e <= a + E) { kept.push(c); continue; }                     // wholly before
+      if (s >= b - E) { c.start -= amount; kept.push(c); continue; }  // wholly after
+      if (!cuttable) { kept.push(c); continue; }                      // ours to move, not to cut
+
+      if (s >= a - E && e <= b + E) { dropped.push(c); continue; }    // wholly inside
+
+      if (s < a - E && e > b + E) {
+        // Straddles the span: keep the head where it is, and start a new clip at the tail.
+        const right = Object.assign({}, c, {
+          id: nextId(),
+          start: a,
+          in: c.in + (b - s),
+          out: c.out,
+        });
+        // Both halves of a cut pair must stay linked to their opposite numbers, or the
+        // next drag moves the picture without the sound.
+        if (c.linkId) {
+          if (!relink.has(c.linkId)) relink.set(c.linkId, nextId());
+          right.linkId = relink.get(c.linkId);
+        }
+        c.out = c.in + (a - s);
+        kept.push(c);
+        kept.push(right);
+      } else if (s < a - E) {
+        c.out = c.in + (a - s);                                       // trim the tail off
+        kept.push(c);
+      } else {
+        c.in += (b - s);                                              // trim the head off
+        c.start = a;
+        kept.push(c);
+      }
+    }
+    track.clips = kept;
+  }
+
+  for (const c of dropped) dropMedia(c.id);
+}
+
+/** Transitions whose clips the ripple removed are dropped rather than left dangling. */
+function pruneTransitions() {
+  const ids = new Set(allClips().map((x) => x.clip.id));
+  for (const t of state.tracks) {
+    if (!t.transitions) continue;
+    t.transitions = t.transitions.filter((tr) => ids.has(tr.aId) && ids.has(tr.bId));
+  }
+}
+
+/**
+ * Tighten: remove the planned spans and close the gaps.
+ *
+ * ONE pushUndo() for the whole pass, however many spans come out - what the user asked
+ * for is "tighten this", not "make ninety cuts". Spans are removed right to left so that
+ * each one's coordinates are still valid when its turn comes.
+ */
+function tighten() {
+  const plan = tightenPlan();
+  if (plan.pending) { log('Analyse the selection first (' + plan.pending + ' clip(s) not measured).'); return null; }
+  if (!plan.spans.length) { log('Nothing to tighten at this threshold.'); return null; }
+
+  pushUndo();
+  for (let i = plan.spans.length - 1; i >= 0; i--) {
+    removeTimelineSpan(plan.spans[i][0], plan.spans[i][1], plan.cutIds);
+  }
+  sortTracks();
+  pruneTransitions();
+  const live = new Set(allClips().map((x) => x.clip.id));
+  state.selection = new Set([...state.selection].filter((id) => live.has(id)));
+  markDirty();
+  renderAll();
+  log('Tightened: removed ' + plan.count + ' span(s), ' + plan.removed.toFixed(2) + 's.');
+  return plan;
+}
+
 function linkSelected() {
   const sel = selectedClips().map((x) => x.clip);
   if (sel.length < 2) { log('Select at least two clips to link.'); return; }
@@ -2630,6 +2984,7 @@ function newProject() {
   state.inPoint = state.outPoint = null;
   state.filePath = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
+  state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
   syncLoudnessControl();
   undoStack = []; redoStack = [];
   markClean();
@@ -2648,6 +3003,7 @@ function serialize() {
     playhead: state.playhead,
     inPoint: state.inPoint,
     outPoint: state.outPoint,
+    tighten: state.tighten,
     tracks: state.tracks,
   };
 }
@@ -2675,6 +3031,7 @@ async function openProject() {
   state.outPoint = d.outPoint == null ? null : d.outPoint;
   state.selTransition = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
+  state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
     for (const tr of t.transitions) Trans.normalize(tr);

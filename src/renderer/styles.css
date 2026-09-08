@@ -448,6 +448,8 @@ select, input[type=number], input[type=text] {
 .afx-box { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
 .afx-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
 .afx-note { margin-bottom: 8px; line-height: 1.35; }
+.tighten-status { margin-top: 6px; line-height: 1.35; }
+.tighten-bar { margin-top: 8px; }
 .afx-via { margin-bottom: 6px; color: #8fb8e8; opacity: 1; }
 .afx-fx { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; }
 .afx-fx.off { opacity: 0.5; }

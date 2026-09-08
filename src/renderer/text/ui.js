@@ -68,13 +68,18 @@ const TextUI = (() => {
       if (opts.min != null) v = Math.max(opts.min, v);
       if (opts.max != null) v = Math.min(opts.max, v);
       if (v === cur) return;
-      beginEdit();
+      (opts.onEdit || beginEdit)();
       opts.set(v);
       // One undo entry per burst of scrolling rather than one per notch.
       clearTimeout(idle);
-      idle = setTimeout(endEdit, 400);
+      idle = setTimeout(opts.onEditEnd || endEdit, 400);
     }, { passive: false });
   }
+
+  // Stable aliases so control() can shadow these names with a caller's own hooks.
+  function gBeginEdit() { beginEdit(); }
+  function gEndEdit() { endEdit(); }
+  function gChanged() { changed(); }
 
   /** Snapshot for undo at most once per drag/typing gesture. */
   function beginEdit() {
@@ -105,6 +110,14 @@ const TextUI = (() => {
    * typable number box beside them - every value in the app can be entered exactly.
    */
   function control(spec, obj, defaults, opts) {
+    // A caller editing something that is NOT timeline state - the Tighten panel's own
+    // threshold and pad, say - passes its own onEdit/onEditEnd/onChanged, so tweaking a
+    // setting neither snapshots undo nor marks the project dirty. Everything else keeps
+    // the text panel's behaviour exactly.
+    const beginEdit = (opts && opts.onEdit) || gBeginEdit;
+    const endEdit = (opts && opts.onEditEnd) || gEndEdit;
+    const changed = (opts && opts.onChanged) || gChanged;
+
     const row = el('div', 'tc-row');
     const lab = el('label', 'tc-label', spec.label + (spec.unit ? ' (' + spec.unit.trim() + ')' : ''));
     lab.title = spec.path;
@@ -155,6 +168,7 @@ const TextUI = (() => {
         step: spec.step, min: spec.min, max: spec.max,
         get: () => get(obj, spec.path),
         set: (v) => { set(obj, spec.path, v); setUI(v); changed(); },
+        onEdit: beginEdit, onEditEnd: endEdit,
       };
       attachWheel(range, wheelOpts);
       attachWheel(num, wheelOpts);

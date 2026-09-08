@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are thirteen suites:
+There are fourteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -69,6 +69,13 @@ There are thirteen suites:
   loudness passes, the chain surviving a save/reload, one undo removing a whole chain, the
   preview mix, and — the load-bearing one — that a clip with **no** effects still produces
   a byte-identical argument list to the one `buildArgs()` emitted before any of it existed.
+- `tools/smoke-tighten.js` — Tighten: the real `silencedetect` handler over a fixture
+  with two known silences (and its cache, including the noise floor being part of the
+  key), the threshold/pad maths, the cut list, that picture and sound come out of a
+  two-span cut in sync and still linked, that a clip outside the selection shifts but is
+  never sliced, that a locked track is untouched, that one undo restores the timeline
+  exactly, and that the settings sliders push no undo entry of their own. It needs
+  `silence1.mp4` in `%TEMP%\scut_test` (its header comment gives the ffmpeg command).
 - `tools/smoke-meter.js` — the loudness meter: the K-weighting coefficients against the
   published BS.1770 table, block loudness, the momentary/short-term windows, both gates on
   the integrated reading, and an end-to-end calibration that writes a 1 kHz tone, plays it
@@ -179,6 +186,7 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
          loudness: { enabled, lufs, tp, lra } },   // the project's loudness target
   pxPerSec: 60,          // timeline zoom
   playhead: 0,
+  tighten: { threshold, pad, noise },        // Tighten's settings - see below
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
 }
 ```
@@ -454,6 +462,98 @@ and a +6 dB gain effect could not otherwise be heard at all. Two traps that shap
 This is the one place in the app where preview and render deliberately disagree, and it is
 the reason the panel carries a line of text saying so - and the reason the loudness meter
 above reads the preview mix rather than claiming to predict the export.
+
+### Tighten (silence removal)
+
+Detect the silences in a clip's audio, throw them away, and close the gaps — the single
+biggest time sink in short-form editing. Detection is the easy half; the half this code
+exists for is rippling the cut through a link group so picture and sound stay together,
+and doing the whole pass as **one** undo entry however many cuts come out of it.
+
+**Three time bases meet here**, and confusing them is the bug the code is written to
+avoid:
+
+| Base | What it is |
+| --- | --- |
+| source | what `silencedetect` reports, and what `clip.in` / `clip.out` are in |
+| clip | source minus `clip.in` |
+| timeline | clip plus `clip.start` — everything removed is expressed in this one |
+
+#### Detection
+
+`analyze:silence` in `main.js` runs `silencedetect` over a source file and returns
+`[[start, end], ...]` in source time, cached in `userData/cache/silence` by
+path + size + mtime — the same rule as the waveform cache, so a re-encoded file under the
+same name is measured again rather than served stale.
+
+It is run **once per file at a permissive 0.10 s minimum**, and the whole raw list is
+cached. The editor's own "silences longer than N" threshold and its pad are applied in the
+renderer over that cached list, so dragging the threshold slider re-counts instantly
+instead of re-decoding. The **noise floor** does change what ffmpeg reports, so it *is*
+part of the cache key; the threshold and the pad are not.
+
+A file that ends in silence never gets its closing `silence_end` line, so an unterminated
+span is closed at the stream duration — otherwise trailing dead air, which is exactly what
+people want gone, would be the one thing that could not be cut.
+
+#### The plan, and the cut
+
+`tightenPlan()` is **pure**: it reads the cache and the settings, mutates nothing, and
+returns the merged timeline spans, the total, and how many clips are still unmeasured.
+That is what lets the inspector show a live count of what would be removed before anything
+is committed. `tighten()` is the half that mutates, and it is one `pushUndo()`.
+
+- The **threshold** is measured on the silence as detected, before the pad eats into it.
+- The **pad** is kept at each end, so a cut never lands hard against speech. A pad that
+  eats a whole silence simply drops it from the plan.
+- Spans are clipped to the part of the source the clip actually uses, then mapped to the
+  timeline, then merged. Overlapping spans from two clips are one cut.
+- Spans are removed **right to left**, so each one's coordinates are still valid when its
+  turn comes.
+
+What a span may cut is deliberately narrow — a ripple that sliced everything it crossed
+would be a surprise nobody asked for:
+
+| Clip | What happens |
+| --- | --- |
+| in the selection's link groups | cut, trimmed or split as the span requires |
+| any other clip on an unlocked track | shifts left if it starts after the span; never cut |
+| a text card | shifts only, whether or not it is selected |
+| anything on a **locked** track | untouched, neither cut nor shifted (as ripple delete already leaves it) |
+
+Text cards are exempt because their `in` is always 0 and their length is `out` (see the
+data model) — cutting a card's animation in half is never the intent.
+
+A clip that a span straddles becomes two, and **both halves keep their links**: each new
+right half is given a fresh `linkId` shared with the right halves of its partners in the
+same span, so the next drag moves the picture with its sound. `tools/smoke-tighten.js`
+asserts piece-for-piece sync after a two-span cut, and that one undo restores the timeline
+byte for byte.
+
+#### The panel
+
+Selecting a clip with audio — either half of a linked pair — puts a **Tighten** box under
+the audio chain: silence threshold, pad, noise floor, an Analyse button and a Tighten
+button, with a live line saying what would come out. A selection that has not been
+measured yet measures itself when the panel opens; measuring is cheap after the first
+time, since both caches answer from disk.
+
+The three settings live on `state.tighten`, not on clips: they are settings, not timeline
+state, so moving one snapshots no undo entry and does not dirty the project. They are
+saved in the `.scut` and default in for a project written before Tighten existed. The rows
+are `TextUI.control` like everything else, but they pass their own `onEdit`/`onChanged`
+hooks — which is what that override on `control()` is for.
+
+#### The filler-word hook (step 3)
+
+`registerTightenSpans(fn)` takes `(audioClip, opts) => [[start, end], ...]` in **source**
+time and its spans join the silences in the same plan. Transcription will feed filler
+words ("um", "uh", "like") in through it, so a filler cut and a silence cut are one ripple
+and one undo entry rather than two passes over the same timeline.
+
+Filler spans are **not** subject to the silence threshold — a filler word is short by
+definition — but they do get the same pad. A provider that throws costs its own spans and
+nothing else.
 
 ### Text cards
 
@@ -1092,6 +1192,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
+| A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
@@ -1104,6 +1205,9 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 
 ### Known limits
 
+- Tighten only cuts into the selection's own link groups. Other clips shift with the
+  ripple but are never sliced, text cards shift but are never cut, and a locked track is
+  left entirely alone — see "Tighten".
 - No video effects or speed changes. **Audio** effects do exist — see "The audio chain".
 - The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
   ducking, loudness) is applied on render. This is the one deliberate preview/render
