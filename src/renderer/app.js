@@ -48,6 +48,10 @@ const state = {
   /** Tighten's settings. Not timeline state: changing them snapshots no undo entry and
    *  dirties nothing, it only changes what the next Tighten would remove. */
   tighten: { threshold: 0.35, pad: 0.05, noise: -30 },
+  /** Caption settings - the look and the phrasing, not the words. Settings like
+   *  Tighten's: changing one snapshots no undo entry, it only changes what the next
+   *  Generate would produce. Saved in the .scut so a project keeps its caption style. */
+  captions: Object.assign({}, Captions.DEFAULTS),
 };
 
 let undoStack = [];
@@ -1296,6 +1300,7 @@ function renderInspector() {
   const box = $('#inspector');
   const sel = selectedClips();
   renderTransitionPanel();
+  renderCaptionsPanel();
 
   // A selected text card opens the editor drawer on the far right. The left column keeps
   // showing the normal clip inspector, so the preview area is never resized by it.
@@ -3101,6 +3106,434 @@ function tighten() {
   return plan;
 }
 
+// ==================================== 7b. transcription + captions
+
+/**
+ * Captions.
+ *
+ * A caption is an ORDINARY TEXT CARD - `kind:'text'` with a `card` on it, exactly like
+ * one typed by hand. That is the whole design: TextDraw is already the single source of
+ * truth for preview and export, so a generated caption is pixel-identical in the viewer
+ * and in the MP4 for free, and there is no second drawing path to keep in step.
+ *
+ * The pieces:
+ *
+ *   window.api.transcribeRun -> word timings in SOURCE time  (whisper.cpp, cached in main)
+ *   Captions.groupPhrases    -> 2-3 word phrases on word boundaries
+ *   Captions.phraseCard      -> a TextCard placed in the safe zone
+ *   generateCaptions()       -> one pushUndo() for the whole pass
+ *
+ * Word timings are in the SOURCE time base of the audio clip they came from - the same
+ * base `silencedetect` reports in, and for the same reason: they belong to the file, not
+ * to where the clip currently sits. `start + (word - clip.in)` is what puts them on the
+ * timeline, and it is the only place that conversion happens.
+ */
+
+const CAPTION_DEFAULTS = Captions.DEFAULTS;
+
+/** Word timings per source file, mirroring the on-disk cache in main. */
+const transcriptCache = new Map();
+
+function captionOpts() {
+  return Object.assign({}, CAPTION_DEFAULTS, state.captions);
+}
+
+/** The words for a source, or null if it has not been transcribed in this session. */
+function transcriptFor(src) {
+  return transcriptCache.get(src) || null;
+}
+
+/**
+ * Put a transcript on a source by hand - what "Import transcript" uses, and what the
+ * smoke suite uses so the whole caption pipeline is testable on a machine with no
+ * whisper.cpp on it.
+ */
+function setTranscript(src, words) {
+  const clean = Captions.cleanWords(words);
+  transcriptCache.set(src, clean);
+  return clean;
+}
+
+/** The selection as link groups with the audio clip each one's words come from. */
+function captionUnits() {
+  return tightenUnits();
+}
+
+/**
+ * Transcribe every source the selection needs. Cheap after the first time: main serves
+ * a previous session's words from disk.
+ *
+ * Nothing here throws. A missing binary, a missing model or no network all come back as
+ * a `reason` and a message that ends up in the panel and the log - the editor keeps
+ * working, it simply has no words yet.
+ */
+async function transcribeSelection(opts) {
+  const force = !!(opts && opts.force);
+  const model = (opts && opts.model) || state.captions.model;
+  const srcs = new Set();
+  for (const u of captionUnits()) {
+    if (u.audio && (force || !transcriptFor(u.audio.src))) srcs.add(u.audio.src);
+  }
+  let done = 0, failed = 0, last = null;
+  for (const src of srcs) {
+    let r = null;
+    try { r = await window.api.transcribeRun({ path: src, model, force }); } catch (e) { r = null; }
+    if (r && r.ok) { setTranscript(src, r.words); done++; }
+    else { failed++; last = r || { error: 'Transcription failed.' }; }
+  }
+  return { done, failed, error: last && last.error, reason: last && last.reason, sources: srcs.size };
+}
+
+/**
+ * The caption track: one video track marked `captions: true`, kept at the top so
+ * captions sit above the footage.
+ *
+ * The flag is a plain boolean on the track, so it serialises with everything else and a
+ * regenerate can find its own previous output without guessing from the track name.
+ */
+function captionTrack(create) {
+  let t = state.tracks.find((x) => x.type === 'video' && x.captions);
+  if (t || create === false) return t || null;
+  t = makeTrack('video', state.tracks.filter((x) => x.type === 'video').length + 1);
+  t.name = 'CAP';
+  t.captions = true;
+  state.tracks.unshift(t);
+  return t;
+}
+
+/**
+ * The phrases for one audio clip, as timeline-time entries.
+ *
+ * Only the part of the source the clip actually uses is captioned, and a phrase that
+ * straddles the clip's in or out point is clipped to it rather than dropped - the words
+ * inside the clip were still said inside it.
+ */
+function captionPhrasesFor(clip, opts) {
+  const words = transcriptFor(clip.src);
+  if (!words || !words.length) return [];
+  const o = opts || captionOpts();
+  const inside = words.filter((w) => w.end > clip.in + 1e-6 && w.start < clip.out - 1e-6);
+  const out = [];
+  for (const p of Captions.groupPhrases(inside, o)) {
+    const s = Math.max(p.start, clip.in);
+    const e = Math.min(p.end, clip.out);
+    if (e - s < 0.05) continue;
+    out.push({
+      phrase: p,
+      start: clip.start + (s - clip.in),
+      end: clip.start + (e - clip.in),
+    });
+  }
+  return out;
+}
+
+/** Caption clips this app generated, optionally only those from a given set of sources. */
+function generatedCaptionClips(srcs) {
+  const out = [];
+  for (const track of state.tracks) {
+    for (const c of track.clips) {
+      if (!c.captions || !c.captions.gen) continue;
+      if (srcs && !srcs.has(c.captions.src)) continue;
+      out.push({ track, clip: c });
+    }
+  }
+  return out;
+}
+
+/**
+ * Generate caption cards for the selection. ONE pushUndo() for the whole pass.
+ *
+ * Regenerating REPLACES this generator's own previous output for the same sources and
+ * leaves everything else alone - a hand-made card on the caption track survives, because
+ * only clips carrying `captions.gen` are swept. Doubling the captions every time someone
+ * nudges the font size is the failure mode this avoids.
+ */
+function generateCaptions() {
+  const o = captionOpts();
+  const units = captionUnits().filter((u) => u.audio && transcriptFor(u.audio.src));
+  if (!units.length) { log('No transcript for the selection yet - press Transcribe first.'); return null; }
+
+  const srcs = new Set(units.map((u) => u.audio.src));
+  const plan = [];
+  for (const u of units) {
+    for (const p of captionPhrasesFor(u.audio, o)) plan.push(Object.assign({ src: u.audio.src }, p));
+  }
+  if (!plan.length) { log('The transcript has no words inside the selected clips.'); return null; }
+
+  pushUndo();
+  const old = generatedCaptionClips(srcs);
+  for (const { track, clip } of old) {
+    track.clips = track.clips.filter((c) => c !== clip);
+    dropMedia(clip.id);
+  }
+
+  const track = captionTrack(true);
+  const base = TextModel.defaultCard('');
+  const made = [];
+  for (const p of plan) {
+    const clip = {
+      id: nextId(),
+      src: null,
+      name: 'Caption',
+      kind: 'text',
+      start: p.start,
+      in: 0,
+      out: Math.max(0.05, p.end - p.start),
+      mediaDuration: 3600,
+      srcW: 0, srcH: 0, fps: 0,
+      panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
+      linkId: null,
+      card: Captions.phraseCard(base, p.phrase, o),
+      // The tag is what makes a regenerate replace instead of double, and it is plain
+      // JSON like everything else on a clip. It names the source these
+      // words came from, so regenerating ONE clip's captions sweeps away nobody else's.
+      captions: { gen: true, src: p.src },
+    };
+    made.push(clip);
+    track.clips.push(clip);
+  }
+
+  sortTracks();
+  markDirty();
+  renderAll();
+  log('Captions: ' + made.length + ' card(s) from ' + srcs.size + ' source(s)' +
+      (old.length ? ', replacing ' + old.length + ' previous card(s).' : '.'));
+  return { made: made.length, replaced: old.length, clips: made };
+}
+
+/** Remove this generator's caption cards. One undo entry, or none if there are none. */
+function clearCaptions(all) {
+  const srcs = all ? null : new Set(captionUnits().filter((u) => u.audio).map((u) => u.audio.src));
+  const doomed = generatedCaptionClips(srcs);
+  if (!doomed.length) { log('No generated captions to remove.'); return 0; }
+  pushUndo();
+  for (const { track, clip } of doomed) {
+    track.clips = track.clips.filter((c) => c !== clip);
+    dropMedia(clip.id);
+  }
+  const live = new Set(allClips().map((x) => x.clip.id));
+  state.selection = new Set([...state.selection].filter((id) => live.has(id)));
+  markDirty();
+  renderAll();
+  log('Removed ' + doomed.length + ' caption card(s).');
+  return doomed.length;
+}
+
+/**
+ * Step 2's filler-word hook, wired up.
+ *
+ * Tighten asks every registered provider for extra SOURCE-time spans and merges them
+ * with the silences, so a filler cut and a silence cut are ONE ripple and ONE undo entry.
+ * Off by default (`cutFillers`), because deciding on the user's behalf that every "like"
+ * is a mistake is not a decision an editor gets to make silently.
+ */
+registerTightenSpans((clip) => {
+  const o = captionOpts();
+  if (!o.cutFillers || !clip || !clip.src) return [];
+  const words = transcriptFor(clip.src);
+  if (!words || !words.length) return [];
+  return Captions.fillerSpans(words, o);
+});
+
+/**
+ * The Captions panel.
+ *
+ * Its rows are `TextUI.control` like every other panel in the app - slider AND typable
+ * box AND scroll-nudge AND reset - but, exactly as the Tighten panel does, they pass
+ * their own hooks: these are project SETTINGS, not timeline state, so moving one
+ * snapshots no undo entry. Only Generate and Clear touch the timeline, and each is one
+ * undo entry.
+ */
+let capBusy = false;
+let capStatusMsg = '';
+let capPanelPaint = null;
+let capWhisper = null;   // { bin, models } from the main process, fetched once
+
+function captionsPanelBody() {
+  const el = TextUI.el;
+  const box = el('div', 'afx-box cap-box');
+  const o = captionOpts();
+
+  const head = el('div', 'afx-head');
+  head.appendChild(el('b', null, 'Transcript'));
+  const count = el('span', 'tc-hint');
+  head.appendChild(count);
+  box.appendChild(head);
+
+  const status = el('div', 'tc-hint cap-status');
+  const bar = el('div', 'tc-btns cap-bar');
+  const runBtn = el('button', 'mini', 'Transcribe');
+  const impBtn = el('button', 'mini', 'Import...');
+  const genBtn = el('button', 'mini primary', 'Generate captions');
+  const clrBtn = el('button', 'mini', 'Clear');
+  runBtn.title = 'Transcribe the selected clips with whisper.cpp (cached per file)';
+  impBtn.title = 'Load a transcript you already have: whisper JSON, SRT or VTT';
+  genBtn.title = 'Make caption cards from the transcript - one undo entry';
+  clrBtn.title = 'Remove the caption cards this generator made';
+
+  const paint = () => {
+    const u2 = captionUnits().filter((x) => x.audio);
+    const have = u2.filter((x) => transcriptFor(x.audio.src)).length;
+    count.textContent = !u2.length ? 'no audio selected'
+      : have === u2.length ? have + ' transcribed' : have + ' of ' + u2.length + ' transcribed';
+    const words = u2.reduce((n, x) => n + ((transcriptFor(x.audio.src) || []).length), 0);
+    let phrases = 0;
+    for (const x of u2) phrases += captionPhrasesFor(x.audio, captionOpts()).length;
+    status.textContent = capStatusMsg || (!u2.length
+      ? 'Select a clip with sound to caption it.'
+      : have
+        ? words + ' words -> ' + phrases + ' caption card(s) at these settings.'
+        : (capWhisper && !capWhisper.bin
+          ? 'whisper.cpp not found. Put whisper-cli.exe in ' + (capWhisper.whisperDir || 'userData/whisper') +
+            ', or set SHORTCUT_WHISPER - or import a transcript.'
+          : 'Not transcribed yet.'));
+    runBtn.disabled = capBusy || !u2.length;
+    impBtn.disabled = capBusy || !u2.length;
+    genBtn.disabled = capBusy || !phrases;
+    clrBtn.disabled = capBusy || !generatedCaptionClips(null).length;
+  };
+  capPanelPaint = paint;
+
+  const hooks = {
+    onEdit: () => {}, onEditEnd: () => {}, onChanged: paint,
+    rebuild: () => renderCaptionsPanel(),
+  };
+  const C = (spec) => TextUI.control(spec, state.captions, CAPTION_DEFAULTS, hooks);
+
+  box.appendChild(status);
+  bar.appendChild(runBtn); bar.appendChild(impBtn);
+  bar.appendChild(genBtn); bar.appendChild(clrBtn);
+  box.appendChild(bar);
+
+  // ---- phrasing
+  box.appendChild(TextUI.section('capPhrase', 'Phrasing', (body) => {
+    body.appendChild(C({
+      path: 'maxWords', label: 'Words per card', type: 'range',
+      min: 1, max: 8, step: 1, digits: 0,
+    }));
+    body.appendChild(C({
+      path: 'maxDur', label: 'Max on screen', type: 'range',
+      min: 0.4, max: 5, step: 0.05, unit: 's', digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'maxGap', label: 'Break on a pause of', type: 'range',
+      min: 0.05, max: 2, step: 0.01, unit: 's', digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'minDur', label: 'Hold at least', type: 'range',
+      min: 0.05, max: 1.5, step: 0.01, unit: 's', digits: 2,
+    }));
+  }));
+
+  // ---- placement
+  box.appendChild(TextUI.section('capPlace', 'Safe zone', (body) => {
+    body.appendChild(el('div', 'tc-hint',
+      'Captions are centred in this band, as fractions of the frame height. The default ' +
+      'keeps them clear of the platform UI along the bottom of the screen.'));
+    body.appendChild(C({
+      path: 'zoneTop', label: 'Zone top', type: 'range', min: 0, max: 1, step: 0.01, digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'zoneBottom', label: 'Zone bottom', type: 'range', min: 0, max: 1, step: 0.01, digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'maxWidth', label: 'Wrap width', type: 'range', min: 0.3, max: 1, step: 0.01, digits: 2,
+    }));
+  }));
+
+  // ---- look
+  box.appendChild(TextUI.section('capLook', 'Look', (body) => {
+    const fonts = (TextUI.fonts && TextUI.fonts.length) ? TextUI.fonts : [o.fontFamily];
+    body.appendChild(C({ path: 'fontFamily', label: 'Font', type: 'select', options: fonts }));
+    body.appendChild(C({
+      path: 'fontSize', label: 'Size', type: 'range', min: 30, max: 220, step: 1, unit: 'px', digits: 0,
+    }));
+    body.appendChild(C({ path: 'color', label: 'Colour', type: 'color' }));
+    body.appendChild(C({ path: 'uppercase', label: 'Uppercase', type: 'check' }));
+    body.appendChild(C({ path: 'popIn', label: 'Pop each word in', type: 'check' }));
+    body.appendChild(C({
+      path: 'popDur', label: 'Pop over', type: 'range', min: 0.05, max: 1, step: 0.01, unit: 's', digits: 2,
+    }));
+  }));
+
+  // ---- keywords
+  box.appendChild(TextUI.section('capKeys', 'Keyword highlight', (body) => {
+    body.appendChild(el('div', 'tc-hint',
+      'Words listed here are painted in the highlight colour wherever they appear. ' +
+      'The override is per word on the card, so it survives a save and can be edited by hand.'));
+    body.appendChild(C({ path: 'highlight', label: 'Highlight', type: 'color' }));
+    body.appendChild(C({ path: 'keywords', label: 'Keywords', type: 'area' }));
+  }));
+
+  // ---- fillers
+  box.appendChild(TextUI.section('capFill', 'Filler words', (body) => {
+    body.appendChild(el('div', 'tc-hint',
+      'With this on, Tighten cuts these words as well as the silences - one ripple, one ' +
+      'undo entry. They are not subject to the silence threshold (a filler word is short ' +
+      'by definition) but they do get the same pad.'));
+    body.appendChild(C({ path: 'cutFillers', label: 'Cut fillers with Tighten', type: 'check' }));
+    body.appendChild(C({ path: 'fillers', label: 'Fillers', type: 'area' }));
+  }));
+
+  // ---- engine
+  box.appendChild(TextUI.section('capEngine', 'Engine', (body) => {
+    body.appendChild(el('div', 'tc-hint',
+      'whisper.cpp, run on the audio and cached per file. The model downloads on first ' +
+      'use; the binary does not - see the README.'));
+    body.appendChild(C({
+      path: 'model', label: 'Model', type: 'select',
+      options: ['tiny.en', 'base.en', 'small.en', 'medium.en', 'large-v3-turbo'],
+    }));
+  }));
+
+  const busy = (msg) => { capBusy = !!msg; capStatusMsg = msg || ''; paint(); };
+
+  runBtn.addEventListener('click', async () => {
+    if (capBusy) return;
+    busy('Transcribing...');
+    const r = await transcribeSelection({});
+    busy('');
+    if (r.failed) { capStatusMsg = r.error || 'Transcription failed.'; log('Transcribe: ' + capStatusMsg); }
+    else if (r.done) log('Transcribed ' + r.done + ' source(s).');
+    paint();
+  });
+
+  impBtn.addEventListener('click', async () => {
+    if (capBusy) return;
+    let r = null;
+    try { r = await window.api.transcribeImport(); } catch (e) { r = null; }
+    if (!r || r.canceled) return;
+    if (!r.ok) { capStatusMsg = r.error || 'Could not read that transcript.'; paint(); return; }
+    const targets = captionUnits().filter((u) => u.audio);
+    for (const u of targets) setTranscript(u.audio.src, r.words);
+    capStatusMsg = '';
+    log('Imported ' + r.words.length + ' word timings from ' + r.filePath + '.');
+    paint();
+  });
+
+  genBtn.addEventListener('click', () => { generateCaptions(); paint(); });
+  clrBtn.addEventListener('click', () => { clearCaptions(false); paint(); });
+
+  paint();
+  return box;
+}
+
+/** Rebuild the Captions panel. Called from renderInspector, like every other panel. */
+function renderCaptionsPanel() {
+  const host = $('#capPanel');
+  if (!host) return;
+  host.innerHTML = '';
+  capPanelPaint = null;
+  // The count is on the HEAD, so it still reports while the panel is collapsed.
+  const meta = $('#capMeta');
+  if (meta) {
+    const n = generatedCaptionClips(null).length;
+    meta.textContent = n ? n + ' card' + (n === 1 ? '' : 's') : '';
+  }
+  if (host.hidden) return;
+  host.appendChild(captionsPanelBody());
+}
+
 function linkSelected() {
   const sel = selectedClips().map((x) => x.clip);
   if (sel.length < 2) { log('Select at least two clips to link.'); return; }
@@ -3172,6 +3605,8 @@ function newProject() {
   state.filePath = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
+  state.captions = Object.assign({}, Captions.DEFAULTS);
+  transcriptCache.clear();
   syncLoudnessControl();
   undoStack = []; redoStack = [];
   markClean();
@@ -3191,6 +3626,7 @@ function serialize() {
     inPoint: state.inPoint,
     outPoint: state.outPoint,
     tighten: state.tighten,
+    captions: state.captions,
     tracks: state.tracks,
   };
 }
@@ -3219,6 +3655,8 @@ async function openProject() {
   state.selTransition = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
+  state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
+  transcriptCache.clear();
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
     for (const tr of t.transitions) Trans.normalize(tr);
@@ -3834,6 +4272,37 @@ $('#btnBinNewFolder').addEventListener('click', () => {
 $('#btnBinUse').addEventListener('click', () => QuickBin.useSelection());
 $('#btnBinRemove').addEventListener('click', () => QuickBin.removeSelection());
 $('#btnBinCollapse').addEventListener('click', toggleBin);
+
+$('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
+
+/** Show / hide the Captions panel. Collapsed it costs nothing: it builds no rows. */
+function toggleCaptions(show) {
+  const hide = show == null ? !$('#capPanel').hidden : !show;
+  $('#capPanel').hidden = hide;
+  $('#btnCapCollapse').textContent = hide ? '+' : '−';
+  renderCaptionsPanel();
+}
+
+// Transcription reports over its own channel, the way the render bar does. It only ever
+// writes into the panel's status line - a slow model must never touch the timeline.
+window.api.onTranscribeProgress((d) => {
+  if (!d) return;
+  if (d.phase === 'download') {
+    const pct = d.total ? Math.round(d.got / d.total * 100) : 0;
+    capStatusMsg = 'Downloading the ' + d.model + ' model... ' + pct + '%';
+  } else if (d.phase === 'extract') capStatusMsg = 'Extracting audio...';
+  else if (d.phase === 'transcribe') {
+    capStatusMsg = 'Transcribing' + (d.percent != null ? ' ' + d.percent + '%' : '') + '...';
+  } else if (d.phase === 'done') capStatusMsg = '';
+  if (capPanelPaint) capPanelPaint();
+});
+
+// The panel says whether whisper.cpp is actually there, rather than only finding out
+// when somebody presses Transcribe.
+window.api.transcribeState().then((st) => {
+  capWhisper = st;
+  if (capPanelPaint) capPanelPaint();
+}).catch(() => {});
 
 function toggleBin(show) {
   const hide = show == null ? !$('#quickBin').hidden : !show;

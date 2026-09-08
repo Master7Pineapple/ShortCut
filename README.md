@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are fifteen suites:
+There are sixteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -88,6 +88,17 @@ There are fifteen suites:
   through the real audio graph and checks the reading against a loudness predicted from
   the filters' frequency response (it *skips*, rather than fails, on a machine with no
   audio device).
+- `tools/smoke-captions.js` — transcription and captions: the whisper JSON parser
+  (sub-word tokens merged into words, special tokens dropped, a token-less segment spread
+  across its span) and the SRT/VTT reader, phrase grouping against the word cap, the
+  duration cap, a pause and a sentence ending, that every boundary is a word boundary and
+  no two captions are on screen at once, safe-zone placement, keyword highlighting all the
+  way down to the item `TextDraw.measure()` paints, generating onto the timeline (source →
+  timeline mapping, words outside the clip left out, one undo entry, regenerating
+  replacing rather than doubling, a hand-made card surviving it, and the cards
+  serialising and reloading intact), the filler-word hook joining Tighten's own plan, and
+  that a missing file fails cleanly. It needs **no fixture and no whisper.cpp**: the
+  transcript goes in through `setTranscript()`, the same door "Import transcript" uses.
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -162,6 +173,8 @@ src/renderer/text/ui.js     text cards: the editor panel
 src/renderer/transitions.js transitions: every pixel of all three types (preview AND export)
 src/renderer/waveform.js  audio peaks: decode once per file, draw a slice per clip
 src/renderer/quickbin.js  the QuickBin: a media library kept in userData, not in the project
+src/captions.js           transcripts and captions: parsing, phrasing, placement, fillers
+                          (loaded twice, like audiofx.js - see "Transcription and captions")
 ```
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
@@ -198,6 +211,7 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
   pxPerSec: 60,          // timeline zoom
   playhead: 0,
   tighten: { threshold, pad, noise },        // Tighten's settings - see below
+  captions: { ... },                         // caption settings - see "Captions" below
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
 }
 ```
@@ -221,7 +235,8 @@ Clip = {
   volume,                // 0..2
   afx,                   // audio clips only - the effect chain, see the audio chain below
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
-  card                   // text clips only - the whole card, see TextCard below
+  card,                  // text clips only - the whole card, see TextCard below
+  captions               // generated captions only - { gen: true, src } - see below
 }
 ```
 
@@ -564,16 +579,148 @@ saved in the `.scut` and default in for a project written before Tighten existed
 are `TextUI.control` like everything else, but they pass their own `onEdit`/`onChanged`
 hooks — which is what that override on `control()` is for.
 
-#### The filler-word hook (step 3)
+#### The filler-word hook
 
 `registerTightenSpans(fn)` takes `(audioClip, opts) => [[start, end], ...]` in **source**
-time and its spans join the silences in the same plan. Transcription will feed filler
-words ("um", "uh", "like") in through it, so a filler cut and a silence cut are one ripple
-and one undo entry rather than two passes over the same timeline.
+time and its spans join the silences in the same plan, so a filler cut and a silence cut
+are one ripple and one undo entry rather than two passes over the same timeline.
+
+**It is wired up.** Captions register a provider that returns the filler words found in
+the clip's transcript (see "Transcription and captions"), gated on the `cutFillers`
+setting, which is **off by default** - deciding on the user's behalf that every "like" is
+a mistake is not a call an editor gets to make silently.
 
 Filler spans are **not** subject to the silence threshold — a filler word is short by
 definition — but they do get the same pad. A provider that throws costs its own spans and
 nothing else.
+
+### Transcription and captions
+
+Captions are the highest-visibility thing in the app and they cost almost nothing here,
+because **a caption is an ordinary text card**. `kind: 'text'`, a `card` on the clip, drawn
+by `TextDraw` - the same path a hand-typed card takes. There is no caption renderer, no
+caption overlay and no second drawing path, which is why preview and export agree about
+them for free and why they bake, cache, undo and serialise like everything else.
+
+The pipeline is four steps and each one is separately testable:
+
+```
+window.api.transcribeRun  ->  words in SOURCE time   (whisper.cpp, cached in main)
+Captions.groupPhrases     ->  2-3 word phrases, always on word boundaries
+Captions.phraseCard       ->  a TextCard placed in the safe zone
+generateCaptions()        ->  text clips on the caption track, ONE undo entry
+```
+
+`src/captions.js` is loaded **twice** - a `<script>` global `Captions` in `index.html` and
+a CommonJS module in `main.js` - for the same reason `audiofx.js` is: main parses whisper's
+output and the renderer parses imported transcripts, and one definition of "a word" is the
+only way those two cannot drift. It is pure: no DOM, no canvas, no ffmpeg, no filesystem.
+
+#### Why whisper.cpp and not onnxruntime-node
+
+The alternative was Whisper exported to ONNX under `onnxruntime-node`. Three things ruled
+it out, and the third is decisive:
+
+- it is not one model but two (encoder and decoder) plus a search loop, a tokenizer and a
+  mel front-end, all of which would have to be written and maintained here in JS;
+- `onnxruntime-node` is a native module, so it needs an `asarUnpack` entry and a
+  per-platform rebuild — exactly the packaging cost this app has so far paid only for
+  ffmpeg;
+- **word-level timestamps do not fall out of the model.** Whisper produces them by aligning
+  cross-attention with dynamic time warping. whisper.cpp already implements that and prints
+  it in `--output-json-full`; re-deriving it in JS *is* the feature, and getting it subtly
+  wrong makes every caption subtly late.
+
+whisper.cpp is one self-contained executable that reads a WAV and writes JSON.
+
+**The model is downloaded; the binary is not.** The model is one file over plain HTTPS,
+identical on every platform, so `transcribe:run` fetches it into `userData/models` on first
+use with a progress line. The binary is a per-platform archive with per-build GPU variants,
+and quietly downloading and then *executing* one is not something an editor should do
+behind the user's back. Put `whisper-cli.exe` in `userData/whisper`, or point
+`SHORTCUT_WHISPER` at it; until then the panel says so, and **Import transcript...** still
+works.
+
+Every failure degrades to a message with a `reason` on it — `no-binary`, `no-model`,
+`no-audio`, `missing` or `failed` — and never to a broken editor or a broken render. Being
+offline costs you the transcript and nothing else.
+
+#### The transcript cache
+
+`userData/cache/transcript`, keyed by path + **model**, with size and mtime checked inside
+the entry — the same rule the waveform and silence caches follow, so a re-encoded file
+under the same name is transcribed again rather than served stale. The model is in the key
+because a bigger model produces different words for the same audio.
+
+#### Parsing
+
+`Captions.parseWhisper()` reads `--output-json-full`. Tokens are sub-word pieces with their
+own offsets in **milliseconds**: a word begins at a token whose text starts with a space
+and swallows every continuation token after it, taking the lowest token confidence of the
+lot. Special tokens are dropped — and note they are `[_BEG_]`, `[_TT_170]`, `[_EOT_]`, so
+only *some* end in an underscore. A pattern that assumed a trailing `_` let a timestamp
+token ride along on the end of the last real word of every segment; there is a test for it.
+
+A plain `--output-json` has no tokens at all. Rather than refuse it, the segment's words are
+spread across its span in proportion to their length and marked low-confidence. SRT and VTT
+come in the same way, which makes a `--max-len 1` file word-exact for free.
+
+#### Phrasing, and the safe zone
+
+`groupPhrases()` breaks on whichever comes first: the word cap (3), the duration cap, a
+pause longer than `maxGap`, or a sentence ending. **Every boundary is a word boundary** — a
+phrase is a run of whole words and nothing is ever split. `start` and `end` are the words'
+own timings, so a caption is up exactly while it is being said; `minDur` only ever extends
+the tail, and never past the next phrase's start, because two captions on screen at once is
+the one thing that always looks broken.
+
+The **safe zone** is a band, in fractions of the frame height, that a caption is centred in
+(0.60–0.86 by default). Its bottom clears the platform UI — the rail and caption text that
+TikTok, Reels and Shorts all paint over the bottom of the frame. Both edges are settings,
+and a zone dragged inside out is normalised rather than obeyed.
+
+#### Keyword highlight
+
+`card.highlight = { color, words: [index] }` overrides the fill of individual words, by
+index in reading order across the card. It is plain JSON on the card, so it saves, undoes
+and can be edited by hand afterwards.
+
+One thing to know before touching `TextDraw.measure()`: **a card with no highlight still
+paints a whole line in one `fillText`**, exactly as it always did. Splitting a line into
+words means placing each one at its own measured offset, which loses the kerning between
+them — so only a highlighted card pays that cost. The word index is counted for *every*
+unit including the invisible ones, because an out-of-window unit still occupies its place
+in the word order and skipping it would shift every highlight after it by one.
+
+The pop-in is not a new animation either: it is the **existing typewriter layer** with
+`unit: 'word'` and `effect: 'pop'`. Captions animate through exactly the code a hand-made
+card animates through.
+
+#### Generating
+
+Cards land on a video track flagged `captions: true`, kept at the top so they sit above the
+footage. Word timings are in the **source** time base of the audio clip they came from —
+the same base `silencedetect` reports in, and for the same reason: they belong to the file,
+not to where the clip currently sits. `clip.start + (word - clip.in)` is the only place that
+conversion happens, and words outside the clip's in/out are simply not captioned.
+
+The whole pass is **one** `pushUndo()`. Regenerating **replaces this generator's own
+previous output for the same sources** and nothing else: only clips carrying
+`captions.gen` are swept, so a card someone typed onto the caption track by hand survives,
+and nudging the font size does not double every caption in the project.
+
+#### The panel
+
+`#capPanel` in the inspector column, **collapsed by default** — the column already carries
+the bin, framing, the clip, the transition and the text card, and captioning is an
+occasional pass rather than a per-clip control. The head keeps showing the card count while
+it is shut.
+
+Its rows are `TextUI.control` like everything else (slider *and* typable box *and* wheel
+nudge *and* reset), and — exactly as the Tighten panel does — they pass their own hooks:
+these are project settings, not timeline state, so moving one snapshots no undo entry and
+dirties nothing. Only **Generate** and **Clear** touch the timeline, and each is one undo
+entry.
 
 ### Text cards
 
@@ -586,7 +733,8 @@ TextCard = {
   style: { ... },        // TextModel.defaultStyle() - font, fill, shadow, glow, blur, ...
   animEnabled,           // master switch (the A shortcut)
   anims: [ AnimLayer ],  // combinable animation layers
-  keys: { opacity: [Key], x: [], y: [], scale: [], rotate: [] }
+  keys: { opacity: [Key], x: [], y: [], scale: [], rotate: [] },
+  highlight              // optional per-word colour override: { color, words: [index] }
 }
 
 AnimLayer = {
@@ -1247,6 +1395,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
+| A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
+| A transcript format | a parser in `src/captions.js` and a branch in `parseTranscript()` — everything downstream takes `[{w, start, end, conf}]` |
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
@@ -1273,6 +1423,11 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   the authority.
 - Loudness normalisation is off by default. Turning it on adds an audio-only measurement
   pass before the render (skipped on draft quality).
+- Transcription needs a whisper.cpp binary the app does not ship (the **model** downloads
+  itself; the binary does not — see "Transcription and captions"). Without one, captions
+  still work from an imported transcript.
+- Captions are generated for the **selected** clips, from their linked audio, and land on
+  one caption track. Regenerating replaces only the cards this generator made.
 - Text cards cover the still-image and shape needs; the timeline still holds no images
   (the QuickBin will keep them, and an object transition will use one, but nothing puts a
   still on a track).

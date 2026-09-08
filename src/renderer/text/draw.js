@@ -60,6 +60,20 @@ const TextDraw = (() => {
     return String(text).slice(0, Math.ceil(String(text).length * reveal));
   }
 
+  /**
+   * The per-word colour override, or null.
+   *
+   * `card.highlight = { color, words: [i, ...] }` names words by their index in the
+   * card's own text, counted in reading order across every line - which is the order the
+   * captions generator produced them in. It is plain JSON on the card like everything
+   * else, so it serialises, undoes and presets for free.
+   */
+  function highlightOf(card) {
+    const h = card && card.highlight;
+    if (!h || !h.color || !Array.isArray(h.words) || !h.words.length) return null;
+    return { color: h.color, words: new Set(h.words.map(Number)) };
+  }
+
   /** Split a line into typewriter units, keeping whitespace so positions stay right. */
   function splitUnits(line, unit) {
     if (unit === 'word') return line.split(/(\s+)/).filter((s) => s.length);
@@ -198,12 +212,43 @@ const TextDraw = (() => {
     const lineY = (i) => block.y + lineH * i + lineH / 2;
 
     const tws = typewriterStates(card, t, dur);
+    const hi = highlightOf(card);
     const items = [];
 
+    // Word index in reading order across the whole card - what `card.highlight.words`
+    // indexes into. `nextWord` is called once per unit, in order, by both paths below.
+    let wordN = 0, inWord = false;
+    const nextWord = (unit, isWord) => {
+      if (!unit.trim().length) { inWord = false; return -1; }
+      if (isWord) return wordN++;
+      if (!inWord) { inWord = true; wordN++; }
+      return wordN - 1;
+    };
+    const paintOf = (wi) => (hi && wi >= 0 && hi.words.has(wi) ? hi.color : null);
+
     if (!tws.length) {
+      // With no highlight a line is ONE fillText, exactly as it always was: splitting it
+      // into words would place each one by its own measured offset and lose the kerning
+      // between them. A highlighted card has to be per-word, so it pays that cost.
       lines.forEach((l, i) => {
         if (!l.length) return;
-        items.push({ text: l, x: lineX(i), y: lineY(i), w: widths[i], alpha: 1, dx: 0, dy: 0, scale: 1 });
+        if (!hi) {
+          items.push({ text: l, x: lineX(i), y: lineY(i), w: widths[i], alpha: 1, dx: 0, dy: 0, scale: 1 });
+          return;
+        }
+        const x0 = lineX(i), y = lineY(i);
+        let prefix = '';
+        for (const u of splitUnits(l, 'word')) {
+          const ux = x0 + ctx.measureText(prefix).width;
+          prefix += u;
+          const wi = nextWord(u, true);
+          if (wi < 0) continue;
+          items.push({
+            text: u, x: ux, y, w: ctx.measureText(u).width,
+            alpha: 1, dx: 0, dy: 0, scale: 1, wordIndex: wi, paint: paintOf(wi),
+          });
+        }
+        inWord = false;
       });
     } else {
       // Layers share one set of units, so the first layer decides letters vs words.
@@ -216,6 +261,7 @@ const TextDraw = (() => {
       const unitPx = st.fontSize * scale;
       let k = 0;
 
+      const byWord = tws[0].unit === 'word';
       perLine.forEach((us, i) => {
         const x0 = lineX(i);
         const y = lineY(i);
@@ -223,15 +269,21 @@ const TextDraw = (() => {
         for (const u of us) {
           const ux = x0 + ctx.measureText(prefix).width;
           prefix += u;
-          if (!u.trim().length) continue; // whitespace occupies space but paints nothing
+          // A word index is taken for EVERY unit, including the invisible ones: an
+          // out-of-window unit still occupies its place in the word order, so skipping
+          // it here would shift every highlight after it by one.
+          const wi = nextWord(u, byWord);
+          if (wi < 0) continue;                 // whitespace: it spaces, it paints nothing
           const t2 = combineUnit(tws, k, total, unitPx);
           k++;
           if (t2.alpha <= 0.001) continue;
           items.push({
             text: u, x: ux, y, w: ctx.measureText(u).width,
             alpha: t2.alpha, dx: t2.dx, dy: t2.dy, scale: t2.scale,
+            wordIndex: wi, paint: paintOf(wi),
           });
         }
+        inWord = false;
       });
     }
     ctx.restore();
@@ -365,7 +417,10 @@ const TextDraw = (() => {
       ctx.fillStyle = paintStyle;
       const passes = Math.max(1, Math.round(st.glow.intensity * glowAmt));
       for (let p = 0; p < passes; p++) {
-        forEachItem(ctx, items, alpha, (it) => ctx.fillText(it.text, it.x, it.y));
+        forEachItem(ctx, items, alpha, (it) => {
+          ctx.fillStyle = it.paint || paintStyle;
+          ctx.fillText(it.text, it.x, it.y);
+        });
       }
       ctx.restore();
     }
@@ -379,7 +434,10 @@ const TextDraw = (() => {
       ctx.shadowOffsetX = Math.cos(rad) * st.shadow.distance * scale;
       ctx.shadowOffsetY = Math.sin(rad) * st.shadow.distance * scale;
       ctx.fillStyle = paintStyle;
-      forEachItem(ctx, items, alpha, (it) => ctx.fillText(it.text, it.x, it.y));
+      forEachItem(ctx, items, alpha, (it) => {
+        ctx.fillStyle = it.paint || paintStyle;
+        ctx.fillText(it.text, it.x, it.y);
+      });
       ctx.restore();
     }
 
@@ -394,9 +452,13 @@ const TextDraw = (() => {
     }
     ctx.fillStyle = paintStyle;
     forEachItem(ctx, items, alpha, (it) => {
-      ctx.fillStyle = paintStyle;
+      // A highlighted word overrides the card's fill and nothing else - the stroke, the
+      // shadow and the glow colour are the card's, so a keyword reads as the same text
+      // in a different ink rather than as a second, differently-dressed card.
+      const paint = it.paint || paintStyle;
+      ctx.fillStyle = paint;
       ctx.fillText(it.text, it.x, it.y);
-      if (st.underline || st.strikethrough) decorations(ctx, st, it, scale, paintStyle);
+      if (st.underline || st.strikethrough) decorations(ctx, st, it, scale, paint);
     });
 
     ctx.restore();

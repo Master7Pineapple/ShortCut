@@ -26,6 +26,14 @@ contextBridge.exposeInMainWorld('api', {
   // Silence spans for Tighten, cached in main by path + size + mtime + noise floor.
   analyzeSilence: (p, noise) => ipcRenderer.invoke('analyze:silence', { path: p, noise }),
 
+  // Speech to text with word-level timings (whisper.cpp), cached in main by
+  // path + size + mtime + model. Everything degrades to `{ ok:false, reason, error }`.
+  transcribeRun: (opts) => ipcRenderer.invoke('transcribe:run', opts),
+  transcribeState: () => ipcRenderer.invoke('transcribe:state'),
+  transcribeCancel: () => ipcRenderer.invoke('transcribe:cancel'),
+  transcribeImport: () => ipcRenderer.invoke('transcribe:import'),
+  onTranscribeProgress: (cb) => ipcRenderer.on('transcribe:progress', (_e, d) => cb(d)),
+
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),
 

@@ -220,6 +220,16 @@
       </div>
 
 
+      <div class="panel-head" id="capPanelHead">
+        <span class="title">Captions</span>
+        <span id="capMeta" class="tc-meta"></span>
+        <button id="btnCapCollapse" class="mini" title="Show / hide the captions panel">+</button>
+      </div>
+      <!-- Collapsed by default: the inspector column already carries the bin, framing,
+           the clip, the transition and the text card, and captioning is an occasional
+           pass rather than a per-clip control. -->
+      <div id="capPanel" hidden></div>
+
       <div class="panel-head" id="transPanelHead" hidden>
         <span class="title">Transition</span>
         <span id="transMeta" class="tc-meta"></span>
@@ -247,6 +257,7 @@
   </div>
 
   <script src="../audiofx.js"></script>
+  <script src="../captions.js"></script>
   <script src="meter.js"></script>
   <script src="text/model.js"></script>
   <script src="transitions.js"></script>

@@ -466,6 +466,306 @@ ipcMain.handle('analyze:silence', async (_e, { path: p, noise }) => {
   return { ok: true, cached: false, noise: db, spans, duration, hasAudio: true };
 });
 
+/// ------------------------------------------------------------- transcription
+
+/**
+ * Speech to text, with WORD-level timings, cached on disk.
+ *
+ * WHY whisper.cpp AND NOT onnxruntime-node
+ * ----------------------------------------
+ * The other candidate was Whisper exported to ONNX and run through onnxruntime-node.
+ * Three things ruled it out, and the third is decisive:
+ *
+ *  - it is not one model but two (encoder and decoder) plus a greedy/beam search loop, a
+ *    tokenizer and a mel front-end, all of which would have to be written and maintained
+ *    here in JS;
+ *  - onnxruntime-node is a native module, so it needs an `asarUnpack` entry and a
+ *    per-platform rebuild - exactly the packaging cost this app has so far paid only for
+ *    ffmpeg;
+ *  - word-level timestamps do not fall out of the model. Whisper emits them by aligning
+ *    cross-attention with dynamic time warping, which whisper.cpp already implements and
+ *    prints in `--output-json-full`. Re-deriving that in JS is the whole feature, and
+ *    getting it subtly wrong makes every caption subtly late.
+ *
+ * whisper.cpp is one self-contained executable that reads a WAV and writes the JSON this
+ * file parses. The trade is that the binary is not bundled - see `whisperBin()`.
+ *
+ * WHAT IS AND IS NOT DOWNLOADED
+ * The MODEL is fetched on first use into `userData/models` with progress: it is one file
+ * over plain HTTPS, identical on every platform. The BINARY is not - it is a
+ * per-platform archive with per-build GPU variants, and quietly downloading and then
+ * executing one is not something an editor should do behind the user's back. Point
+ * SHORTCUT_WHISPER at it, or drop it in `userData/whisper`, and the panel says so while
+ * it is missing. Every failure here degrades to a message, never to a broken render.
+ */
+const Captions = require('./captions.js');
+
+const WHISPER_MODELS = {
+  'tiny.en': { size: 77691713 },
+  'base.en': { size: 147964211 },
+  'small.en': { size: 487601967 },
+  'medium.en': { size: 1533763059 },
+  'large-v3-turbo': { size: 1624555275 },
+};
+const DEFAULT_MODEL = 'base.en';
+const MODEL_HOST = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/';
+
+const modelsDir = () => {
+  const dir = path.join(app.getPath('userData'), 'models');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const modelFile = (name) => path.join(modelsDir(), 'ggml-' + name + '.bin');
+
+/** The whisper.cpp executable, or null. Env first, then userData, then PATH. */
+function whisperBin() {
+  const exe = process.platform === 'win32' ? '.exe' : '';
+  const cands = [];
+  if (process.env.SHORTCUT_WHISPER) cands.push(process.env.SHORTCUT_WHISPER);
+  const dir = path.join(app.getPath('userData'), 'whisper');
+  for (const n of ['whisper-cli', 'whisper', 'main']) cands.push(path.join(dir, n + exe));
+  for (const c of cands) {
+    try { if (fs.statSync(c).isFile()) return c; } catch (e) { /* try the next one */ }
+  }
+  // Last resort: something already on PATH. spawn() resolves it, so hand back the name.
+  for (const n of ['whisper-cli', 'whisper']) {
+    const found = (process.env.PATH || '').split(path.delimiter).some((d) => {
+      try { return fs.statSync(path.join(d, n + exe)).isFile(); } catch (e) { return false; }
+    });
+    if (found) return n + exe;
+  }
+  return null;
+}
+
+const transcriptDir = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'transcript');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+/**
+ * Cache path for a transcript. Keyed by path and MODEL, because a bigger model produces
+ * different words for the same audio; size and mtime are checked inside the file, the
+ * same rule the waveform and silence caches follow, so a re-encoded file under the same
+ * name is transcribed again rather than served stale.
+ */
+const transcriptFile = (p, model) =>
+  path.join(transcriptDir(),
+    crypto.createHash('sha1').update(String(p) + '|' + model).digest('hex') + '.json');
+
+function readTranscriptCache(p, model) {
+  const stamp = fileStamp(p);
+  if (!stamp) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(transcriptFile(p, model), 'utf8'));
+    if (j.size !== stamp.size || j.mtime !== stamp.mtime || j.model !== model) return null;
+    return j;
+  } catch (e) { return null; }
+}
+
+function writeTranscriptCache(p, model, words, language) {
+  const stamp = fileStamp(p);
+  if (!stamp) return;
+  try {
+    fs.writeFileSync(transcriptFile(p, model), JSON.stringify({
+      size: stamp.size, mtime: stamp.mtime, model, language: language || '', words,
+    }), 'utf8');
+  } catch (e) { /* an unwritable cache must never fail the transcription */ }
+}
+
+const sendTrProgress = (d) => {
+  try { if (win && !win.isDestroyed()) win.webContents.send('transcribe:progress', d); } catch (e) {}
+};
+
+let modelDownload = null;     // the in-flight request, so Cancel can abort it
+let activeTranscribe = null;  // the running whisper.cpp process
+
+/** Fetch a ggml model, following HuggingFace's redirect, reporting bytes as they land. */
+function downloadModel(name) {
+  const https = require('https');
+  const dest = modelFile(name);
+  const tmp = dest + '.part';
+  const expected = (WHISPER_MODELS[name] || {}).size || 0;
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; modelDownload = null; resolve(r); } };
+    const get = (url, depth) => {
+      if (depth > 5) return finish({ ok: false, error: 'Too many redirects fetching the model.' });
+      const req = https.get(url, { headers: { 'User-Agent': 'ShortCut' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          return get(new URL(res.headers.location, url).toString(), depth + 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return finish({ ok: false, error: 'Model download failed (HTTP ' + res.statusCode + ').' });
+        }
+        const total = Number(res.headers['content-length']) || expected;
+        let got = 0;
+        const out = fs.createWriteStream(tmp);
+        res.on('data', (c) => {
+          got += c.length;
+          sendTrProgress({ phase: 'download', model: name, got, total });
+        });
+        res.pipe(out);
+        out.on('error', () => finish({ ok: false, error: 'Could not write the model file.' }));
+        out.on('finish', () => out.close(() => {
+          // Renamed only once the whole file is there: a half-written model that looks
+          // present is worse than one that is plainly missing.
+          try { fs.renameSync(tmp, dest); } catch (e) {
+            return finish({ ok: false, error: 'Could not save the model.' });
+          }
+          finish({ ok: true, path: dest });
+        }));
+      });
+      modelDownload = req;
+      req.on('error', (e) => {
+        try { fs.unlinkSync(tmp); } catch (e2) {}
+        finish({ ok: false, error: 'Offline, or the model host is unreachable (' + e.code + ').' });
+      });
+    };
+    get(MODEL_HOST + 'ggml-' + name + '.bin', 0);
+  });
+}
+
+/** Decode any source to the 16 kHz mono WAV whisper.cpp wants. */
+function extractWav(src, dest) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, [
+      '-y', '-hide_banner', '-nostats', '-i', src,
+      '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', dest,
+    ], { windowsHide: true });
+    proc.on('error', () => resolve(false));
+    proc.on('close', (code) => resolve(code === 0));
+  });
+}
+
+ipcMain.handle('transcribe:state', () => {
+  const bin = whisperBin();
+  const models = Object.keys(WHISPER_MODELS).filter((m) => {
+    try { return fs.statSync(modelFile(m)).size > 1000000; } catch (e) { return false; }
+  });
+  return {
+    bin, models, all: Object.keys(WHISPER_MODELS), defaultModel: DEFAULT_MODEL,
+    dir: modelsDir(), whisperDir: path.join(app.getPath('userData'), 'whisper'),
+  };
+});
+
+ipcMain.handle('transcribe:cancel', () => {
+  if (modelDownload) { try { modelDownload.destroy(); } catch (e) {} }
+  if (activeTranscribe) { try { activeTranscribe.kill(); } catch (e) {} }
+  return true;
+});
+
+/**
+ * Transcribe one file. Answers `{ ok, cached, words, language }`, or `{ ok: false,
+ * error, reason }` - it never throws, and never leaves the caller guessing which half is
+ * missing: `reason` is 'missing', 'no-binary', 'no-model', 'no-audio' or 'failed'.
+ */
+ipcMain.handle('transcribe:run', async (_e, { path: p, model, language, force }) => {
+  const name = WHISPER_MODELS[model] ? model : DEFAULT_MODEL;
+  const stamp = fileStamp(p);
+  if (!stamp) return { ok: false, error: 'File not found.', reason: 'missing' };
+
+  if (!force) {
+    const hit = readTranscriptCache(p, name);
+    if (hit) return { ok: true, cached: true, model: name, words: hit.words, language: hit.language };
+  }
+
+  const bin = whisperBin();
+  if (!bin) {
+    return {
+      ok: false, reason: 'no-binary',
+      error: 'whisper.cpp was not found. Put whisper-cli.exe in ' +
+             path.join(app.getPath('userData'), 'whisper') + ', or set SHORTCUT_WHISPER.',
+    };
+  }
+
+  const mf = modelFile(name);
+  let have = false;
+  try { have = fs.statSync(mf).size > 1000000; } catch (e) { have = false; }
+  if (!have) {
+    sendTrProgress({ phase: 'download', model: name, got: 0, total: (WHISPER_MODELS[name] || {}).size || 0 });
+    const d = await downloadModel(name);
+    if (!d.ok) return { ok: false, reason: 'no-model', error: d.error };
+  }
+
+  const meta = await probe(p);
+  if (meta && !meta.hasAudio) return { ok: false, reason: 'no-audio', error: 'That file has no audio track.' };
+
+  const scratch = fs.mkdtempSync(path.join(app.getPath('temp'), 'scut-stt-'));
+  const wav = path.join(scratch, 'a.wav');
+  try {
+    sendTrProgress({ phase: 'extract', model: name });
+    if (!await extractWav(p, wav)) {
+      return { ok: false, reason: 'failed', error: 'ffmpeg could not extract the audio.' };
+    }
+
+    sendTrProgress({ phase: 'transcribe', model: name, duration: meta ? meta.duration : 0 });
+    const outBase = path.join(scratch, 'out');
+    const args = ['-m', mf, '-f', wav, '--output-json-full', '--output-file', outBase, '-nt', '-pp'];
+    if (language) args.push('-l', language);
+
+    const code = await new Promise((resolve) => {
+      const proc = spawn(bin, args, { windowsHide: true });
+      activeTranscribe = proc;
+      let log = '';
+      // whisper.cpp prints progress with -pp. Scraping it is the same trick the render
+      // bar uses on ffmpeg's `time=`.
+      const onData = (d) => {
+        const s = d.toString();
+        log += s;
+        if (log.length > 200000) log = log.slice(-100000);
+        const m = /progress\s*=\s*(\d+)%/.exec(s);
+        if (m) sendTrProgress({ phase: 'transcribe', model: name, percent: Number(m[1]) });
+      };
+      proc.stderr.on('data', onData);
+      proc.stdout.on('data', onData);
+      proc.on('error', () => resolve(-1));
+      proc.on('close', (c) => resolve(c));
+    });
+    activeTranscribe = null;
+    if (code !== 0) {
+      return {
+        ok: false,
+        reason: code === -1 ? 'no-binary' : 'failed',
+        error: code === -1 ? 'whisper.cpp could not be started.' : 'whisper.cpp exited with ' + code + '.',
+      };
+    }
+
+    let doc = null;
+    for (const cand of [outBase + '.json', outBase + '.wav.json', wav + '.json']) {
+      try { doc = JSON.parse(fs.readFileSync(cand, 'utf8')); break; } catch (e) { /* next candidate */ }
+    }
+    if (!doc) return { ok: false, reason: 'failed', error: 'whisper.cpp wrote no JSON.' };
+
+    const words = Captions.parseWhisper(doc);
+    const lang = (doc.result && doc.result.language) || language || '';
+    if (words.length) writeTranscriptCache(p, name, words, lang);
+    sendTrProgress({ phase: 'done', model: name, words: words.length });
+    return { ok: true, cached: false, model: name, words, language: lang };
+  } finally {
+    activeTranscribe = null;
+    try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+/** Open a transcript the user already has: whisper JSON, a word array, SRT or VTT. */
+ipcMain.handle('transcribe:import', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import a transcript',
+    filters: [{ name: 'Transcripts', extensions: ['json', 'srt', 'vtt', 'txt'] }],
+    properties: ['openFile'],
+  });
+  if (r.canceled || !r.filePaths.length) return { canceled: true };
+  try {
+    const words = Captions.parseTranscript(fs.readFileSync(r.filePaths[0], 'utf8'));
+    return { ok: true, filePath: r.filePaths[0], words };
+  } catch (e) {
+    return { ok: false, error: 'Could not read that transcript: ' + e.message };
+  }
+});
+
 // ------------------------------------------------------------------ projects
 
 ipcMain.handle('project:save', async (_e, payload) => {
