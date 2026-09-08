@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twelve suites:
+There are thirteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -69,6 +69,12 @@ There are twelve suites:
   loudness passes, the chain surviving a save/reload, one undo removing a whole chain, the
   preview mix, and — the load-bearing one — that a clip with **no** effects still produces
   a byte-identical argument list to the one `buildArgs()` emitted before any of it existed.
+- `tools/smoke-meter.js` — the loudness meter: the K-weighting coefficients against the
+  published BS.1770 table, block loudness, the momentary/short-term windows, both gates on
+  the integrated reading, and an end-to-end calibration that writes a 1 kHz tone, plays it
+  through the real audio graph and checks the reading against a loudness predicted from
+  the filters' frequency response (it *skips*, rather than fails, on a machine with no
+  audio device).
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -345,6 +351,74 @@ Two things to keep straight:
 Failure in pass one is never fatal: no measurements simply means the single pass. It must
 not cost the export. Cancelling pass one, however, cancels the render.
 
+#### Editing the chain from the video half
+
+Importing a file with sound makes two clips, and the one people click is the **video**
+one — it is the half with a picture on it. So `audioFxTarget()` resolves a selection to
+the clip an audio chain belongs to: an audio clip is itself, a video clip with a `linkId`
+is its linked audio clip, and anything else (a text card, an unlinked video clip) has no
+chain to edit and gets no panel.
+
+When the panel opens through a link it says so — *"Editing the linked audio clip on A1"*.
+Quietly editing something other than the clip the user selected is the kind of thing that
+gets blamed on the app three weeks later.
+
+#### The loudness meter
+
+The footer carries a live meter of the **preview mix**, next to the render panel. Two
+scales, because they answer different questions and routinely disagree — a heavily
+compressed mix can sit 3 dB off clipping and still be 6 LU under target:
+
+- **PK** — sample peak in dBFS, with a 2 s hold mark that turns red at 0.
+- **LUFS** — short-term loudness, with three signs on it: a ▼ at the project's loudness
+  target, a green band for ±1 LU either side of it, a thin white line for momentary, and a
+  gold line for **integrated** — the number the render is actually judged on.
+
+`M`, `S`, `I` and `Peak` are printed under the bars. `Reset` restarts the integrated
+reading; it is a *programme* measurement, so it means "start the programme again".
+
+The maths is ITU-R BS.1770-4 / EBU R 128 and lives in `src/renderer/meter.js` as `Meter`.
+It is deliberately pure — no `AudioContext`, no canvas, no DOM — because that is what
+makes it testable without playing a sample. The split across three files is the point:
+
+| File | Job |
+| --- | --- |
+| `meter.js` | the maths: K-weighting coefficients, block loudness, the windows, the gates |
+| `meter-worklet.js` | on the audio thread: sum of squares and peak, per 100 ms block |
+| `app.js` | the plumbing (`startMeter`) and the drawing (`drawMeter`) |
+
+The signal path, and every part of it matters:
+
+```
+clip gains -> master -> destination            (what you hear)
+                    -> K-weight IIR x2 -> worklet input 0   (loudness)
+                    -> worklet input 1                      (peak)
+```
+
+Three things that are easy to get wrong here:
+
+- **Loudness is measured K-weighted, peak is not.** The weighting curve is not flat, so a
+  peak read off the weighted signal is several dB out. Hence two worklet inputs.
+- **The coefficients are derived, not copied.** BS.1770 tabulates them for 48 kHz only;
+  `kWeighting()` computes them from the analog prototype so any sample rate works, and
+  48 kHz reproduces the published table exactly — `tools/smoke-meter.js` asserts that.
+- **Integrated is doubly gated**, and the order matters: drop everything under -70 LUFS
+  (absolute), take the mean of what is left, then drop everything more than 10 LU under
+  *that* (relative). The result is the loudness of the mean **energy** of the survivors,
+  not the mean of the loudness values, which is a different and wrong number. Skipping
+  the gates is what makes a meter read several LU low on anything with a quiet passage
+  in it.
+
+Measured against ffmpeg's own `ebur128` on the same tone, this meter agrees to within
+0.01 LU, and `smoke-meter.js` keeps it honest by predicting the reading from the filters'
+frequency response and playing a generated tone through the real graph.
+
+The meter is metering the **preview**, which mirrors level and mute but not the DSP — so
+it tells you what the mix balance is doing, not what `loudnorm` will finally deliver. The
+render's own two-pass measurement is the authority on that. Everything about it is
+best-effort: an AudioWorklet that will not load costs the meter and nothing else, because
+`master -> destination` is wired up before any of it runs.
+
 #### What the preview actually does
 
 The preview is **not** a DSP engine, and the inspector says so where the controls are.
@@ -366,7 +440,8 @@ and a +6 dB gain effect could not otherwise be heard at all. Two traps that shap
   the element.
 
 This is the one place in the app where preview and render deliberately disagree, and it is
-the reason the panel carries a line of text saying so.
+the reason the panel carries a line of text saying so - and the reason the loudness meter
+above reads the preview mix rather than claiming to predict the export.
 
 ### Text cards
 
@@ -844,11 +919,19 @@ back through `app:saveResult`; a cancelled save leaves the window open.
 
 ### Presets
 
-Three flavours, split by `TextModel.extractPreset(kind, card)`: `style` (look only),
-`anim` (layers + curves + keyframes), and `full` (both, plus the text). Each can be saved
+Five kinds share one library (`PRESET_KINDS` in `main.js`): three text flavours, split by
+`TextModel.extractPreset(kind, card)` — `style` (look only), `anim` (layers + curves +
+keyframes), and `full` (both, plus the text) — plus `trans` for transitions and `audiofx`
+for a whole audio chain. Each can be saved
 to a named library under `app.getPath('userData')/presets/<kind>/` or exported/imported as
 a `.json` file. `TextModel.applyPreset` merges a preset into a card and takes
 `{ keepText: true }` so applying a style or animation preset does not clobber the wording.
+
+Every kind follows the same rule: a preset carries what is portable and drops what is not.
+A text preset drops the wording when asked, a transition preset drops the clip ids, and an
+audio preset drops a duck's `voiceTrack` — a track id means nothing in another project, so
+an applied duck comes back needing a voice track chosen, and the log says so rather than
+silently ducking to nothing.
 
 **`window.prompt()` does not exist in Electron.** It returns nothing and silently does
 nothing, which is why saving a preset appeared to work and then never showed up in the
@@ -998,6 +1081,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
+| A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
@@ -1012,6 +1096,9 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
   ducking, loudness) is applied on render. This is the one deliberate preview/render
   disagreement in the app, and the inspector says so on screen.
+- The loudness meter reads the PREVIEW mix, which has no DSP on it, so it is a guide to
+  balance rather than a prediction of the export. The render's own two-pass measurement is
+  the authority.
 - Loudness normalisation is off by default. Turning it on adds an audio-only measurement
   pass before the render (skipped on draft quality).
 - Text cards cover the still-image and shape needs; the timeline still holds no images

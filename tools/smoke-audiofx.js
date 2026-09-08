@@ -323,8 +323,144 @@
     undo();
     setSelection([vTrack.clips[0].id], false);
     renderInspector();
-    ok('a video clip gets no audio effects panel',
+
+    // ============================================ 8. reaching the chain from the video half
+    // Selecting the VIDEO clip is what people actually do, so the panel has to open from
+    // there and edit the linked audio clip - while saying which clip it is editing.
+    const vClip = allClips().find((x) => x.clip.kind === 'video' && x.clip.linkId).clip;
+    const mate = linkGroup(vClip).find((c) => c.kind === 'audio');
+    ok('the fixture has a linked A/V pair to test with', !!mate && mate.id !== vClip.id);
+
+    const target = audioFxTarget(vClip);
+    ok('a linked video clip resolves to its audio clip',
+      !!target && target.clip === mate, target ? target.clip.kind : 'null');
+    ok('an audio clip resolves to itself, not via a link',
+      audioFxTarget(mate).clip === mate && audioFxTarget(mate).viaLink === null);
+
+    setSelection([vClip.id], false);
+    renderInspector();
+    const vPanel = document.querySelector('#inspector .afx-box');
+    ok('selecting the video half opens the audio effects panel', !!vPanel);
+    ok('the panel says which clip it is really editing',
+      !!vPanel && /Editing the linked audio clip on A\d/.test(vPanel.textContent),
+      vPanel ? (vPanel.querySelector('.afx-via') || {}).textContent : '');
+
+    // And an edit made from there must land on the audio clip, not the video one.
+    pushUndo();
+    const beforeLinked = JSON.stringify(state.tracks);
+    audioFxTarget(vClip).clip.afx = [mk('gain', { db: 2 })];
+    markDirty();
+    ok('an effect added from the video half lands on the audio clip',
+      mate.afx.length === 1 && !vClip.afx);
+    const linkedArgs = fcOf((await argsFor(buildJob('C:\\out.mp4'))).args);
+    ok('and it reaches the render through the audio chain',
+      linkedArgs.indexOf('volume=2dB') !== -1, linkedArgs.split(';').find((x) => x.indexOf('2dB') !== -1) || '');
+    undo();
+    ok('one undo takes it back off', JSON.stringify(state.tracks) === beforeLinked);
+
+    // A video clip with no linked audio has nothing to put effects on.
+    const lone = allClips().find((x) => x.clip.kind === 'video').clip;
+    const savedLink = lone.linkId;
+    lone.linkId = null;
+    ok('an unlinked video clip has no audio chain to edit', audioFxTarget(lone) === null);
+    setSelection([lone.id], false);
+    renderInspector();
+    ok('and it gets no audio effects panel',
       !document.querySelector('#inspector .afx-box'));
+    lone.linkId = savedLink;
+
+    // A text card never has one either.
+    ok('a text card has no audio chain', audioFxTarget({ kind: 'text' }) === null);
+
+    // ============================================ 9. chain presets
+    const liveM = allClips().find((x) => x.clip.id === music.id).clip;
+    liveM.afx = [mk('denoise', { nr: 18 }), mk('compressor', { ratio: 6 }),
+                 mk('duck', { voiceTrack: 'some-track-id' })];
+
+    const preset = AudioFX.extractPreset(liveM.afx);
+    ok('a preset carries every effect in order',
+      preset.afx.length === 3 && preset.afx[0].type === 'denoise' &&
+      preset.afx[1].type === 'compressor' && preset.afx[2].type === 'duck');
+    ok('a preset carries the parameters',
+      preset.afx[0].params.nr === 18 && preset.afx[1].params.ratio === 6);
+    // A track id means nothing in another project - the same rule the transition presets
+    // live by about which cut they sit on.
+    ok('a preset does NOT carry the duck voice track',
+      preset.afx[2].params.voiceTrack === '', String(preset.afx[2].params.voiceTrack));
+    ok('a preset carries no clip identity at all',
+      JSON.stringify(preset).indexOf(liveM.id) === -1 &&
+      preset.afx.every((f) => f.id === undefined));
+    ok('a preset is plain JSON', JSON.stringify(preset) === JSON.stringify(JSON.parse(JSON.stringify(preset))));
+
+    // ---- applying ---------------------------------------------------------
+    const other = allClips().find((x) => x.clip.kind === 'audio' && x.clip.id !== liveM.id).clip;
+    other.afx = [mk('gain', { db: 9 })];
+    AudioFX.applyPreset(other, JSON.parse(JSON.stringify(preset)));
+    ok('applying a preset replaces the chain rather than appending to it',
+      other.afx.length === 3 && other.afx[0].type === 'denoise');
+    ok('applied effects get fresh ids',
+      other.afx.every((f) => !!f.id) &&
+      other.afx.every((f) => liveM.afx.every((g) => g.id !== f.id)));
+    ok('applied parameters match the preset',
+      other.afx[0].params.nr === 18 && other.afx[1].params.ratio === 6);
+    ok('an applied duck comes back needing a voice track',
+      other.afx[2].params.voiceTrack === '');
+    // ...and therefore emits nothing until one is chosen, rather than half-wiring itself.
+    ok('a duck with no voice track emits no sidechain',
+      fcOf((await argsFor(buildJob('C:\\out.mp4'))).args).indexOf('sidechaincompress') === -1);
+
+    const roundTrip = AudioFX.extractPreset(other.afx);
+    ok('extract -> apply -> extract is stable',
+      JSON.stringify(roundTrip) === JSON.stringify(preset));
+
+    // A preset written by a later build must stay usable in an earlier one.
+    const fromFuture = { app: 'shortcut', kind: 'audiofx', afx: [
+      { type: 'denoise', enabled: true, params: { nr: 5 } },
+      { type: 'quantum-reverb', enabled: true, params: {} },
+    ] };
+    AudioFX.applyPreset(other, fromFuture);
+    ok('an unknown effect type in a preset is dropped, not kept as dead weight',
+      other.afx.length === 1 && other.afx[0].type === 'denoise');
+    ok('and the known effect still gets its missing params filled in',
+      other.afx[0].params.nf === -25 && other.afx[0].params.nr === 5);
+
+    const empty = AudioFX.extractPreset([]);
+    ok('an empty chain extracts to an empty preset rather than throwing',
+      empty.afx.length === 0 && empty.kind === 'audiofx');
+    AudioFX.applyPreset(other, { afx: [] });
+    ok('applying an empty preset clears the chain', other.afx.length === 0);
+    AudioFX.applyPreset(other, {});
+    ok('applying a malformed preset clears rather than throws', other.afx.length === 0);
+
+    // ---- the preset bar in the panel --------------------------------------
+    setSelection([liveM.id], false);
+    renderInspector();
+    const bar = document.querySelector('#inspector .afx-box .tc-preset-box');
+    ok('the panel has a preset bar', !!bar);
+    ok('the bar offers save, delete, export and import',
+      !!bar && ['Save', 'Delete', 'Export', 'Import'].every((t) =>
+        [...bar.querySelectorAll('button')].some((b) => b.textContent === t)),
+      bar ? [...bar.querySelectorAll('button')].map((b) => b.textContent).join(',') : '');
+    ok('the bar says a preset does not carry the voice track',
+      !!bar && /never the voice track/.test(bar.textContent));
+
+    // ---- the library round trip, through the real preset store ------------
+    const NAME = '__smoke audio chain__';
+    liveM.afx = [mk('eq', { midG: 5 }), mk('gain', { db: -2 })];
+    await window.api.savePreset('audiofx', NAME, AudioFX.extractPreset(liveM.afx));
+    const listed = await window.api.listPresets();
+    ok('audiofx is a real preset kind in the library',
+      !!listed.audiofx && listed.audiofx.indexOf(NAME) !== -1,
+      Object.keys(listed).join(','));
+    const loaded = await window.api.loadPreset('audiofx', NAME);
+    ok('a saved chain reads back intact',
+      !!loaded && loaded.afx.length === 2 && loaded.afx[0].params.midG === 5);
+    AudioFX.applyPreset(other, loaded);
+    ok('and applies to another clip', other.afx.length === 2 && other.afx[1].params.db === -2);
+    await window.api.deletePreset('audiofx', NAME);
+    const after2 = await window.api.listPresets();
+    ok('and the smoke run leaves the library as it found it',
+      !after2.audiofx || after2.audiofx.indexOf(NAME) === -1);
 
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';

@@ -177,7 +177,7 @@ select, input[type=number], input[type=text] {
 
 /* ----------------------------------------------------------------- bottom */
 #bottom { display: flex; border-top: 1px solid var(--line); background: var(--panel); height: 168px; }
-#renderPanel { flex: 0 0 62%; display: flex; flex-direction: column; }
+#renderPanel { flex: 0 0 46%; display: flex; flex-direction: column; }
 .render-grid { display: flex; gap: 6px 8px; align-items: end; padding: 8px 10px; flex-wrap: wrap; }
 #renderPanel { overflow-y: auto; }
 .render-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--dim); }
@@ -448,6 +448,7 @@ select, input[type=number], input[type=text] {
 .afx-box { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
 .afx-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
 .afx-note { margin-bottom: 8px; line-height: 1.35; }
+.afx-via { margin-bottom: 6px; color: #8fb8e8; opacity: 1; }
 .afx-fx { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; }
 .afx-fx.off { opacity: 0.5; }
 .afx-fx-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #14161b; }
@@ -456,3 +457,24 @@ select, input[type=number], input[type=text] {
 .afx-fx-body { padding: 6px; }
 .afx-add { margin-top: 4px; }
 .afx-add select { width: 100%; }
+
+/* ---- the loudness meter ------------------------------------------------ */
+#meterPanel {
+  flex: 0 0 220px; display: flex; flex-direction: column;
+  border-left: 1px solid var(--line); background: var(--panel);
+  padding-bottom: 6px; overflow: hidden;
+}
+#meterPanel .panel-head { display: flex; align-items: center; justify-content: space-between; }
+#meterCanvas { width: calc(100% - 16px); height: 104px; margin: 6px 8px 4px; display: block; }
+#meterReadout {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px;
+  margin: 0 8px; font-size: 11px; color: var(--dim);
+}
+#meterReadout b { color: var(--dim); font-weight: 600; }
+#meterReadout i {
+  font-style: normal; color: #e8ebf0; float: right;
+  font-variant-numeric: tabular-nums;
+}
+#meterReadout i.over { color: #ff6b5e; }
+#meterReadout i.on { color: #6fdc8c; }
+#meterNote { margin: 6px 8px 0; }

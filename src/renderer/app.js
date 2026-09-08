@@ -169,7 +169,16 @@ function dropMedia(clipId) {
  *   is used, clamped. That way the worst case is "a boost is quieter than it should be",
  *   never "the preview went silent".
  */
-const previewMix = { ctx: null, nodes: new Map() };
+const previewMix = {
+  ctx: null,
+  nodes: new Map(),
+  /** Every clip gain lands here, so the meter sees the mix rather than one clip. */
+  master: null,
+  /** The metering session (Meter.Session) and its worklet node, once it is running. */
+  session: null,
+  meterNode: null,
+  meterState: 'off',   // off | starting | on | unavailable
+};
 
 function ensureAudioCtx() {
   if (!previewMix.ctx) {
@@ -177,10 +186,231 @@ function ensureAudioCtx() {
     if (!Ctx) return null;
     try { previewMix.ctx = new Ctx(); } catch (e) { previewMix.ctx = null; }
   }
-  if (previewMix.ctx && previewMix.ctx.state === 'suspended') {
-    previewMix.ctx.resume().catch(() => {});
+  const ctx = previewMix.ctx;
+  if (!ctx) return null;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  if (!previewMix.master) {
+    previewMix.master = ctx.createGain();
+    previewMix.master.connect(ctx.destination);
+    startMeter();
   }
-  return previewMix.ctx;
+  return ctx;
+}
+
+/**
+ * Hang the loudness meter off the master bus.
+ *
+ * The signal splits in two here, and the split is the point: the meter's loudness input
+ * is K-WEIGHTED (two IIR stages straight out of BS.1770, via Meter.kWeighting) because
+ * LUFS is defined on weighted energy, while its peak input is the raw mix, because a peak
+ * read off the weighted signal would be several dB out - the weighting curve is not flat.
+ *
+ * Everything here is best-effort. An AudioWorklet that will not load costs the meter and
+ * nothing else: the mix still reaches the speakers through master -> destination, which
+ * is wired up before any of this runs.
+ */
+function startMeter() {
+  const ctx = previewMix.ctx;
+  if (!ctx || previewMix.meterState !== 'off') return;
+  if (typeof Meter === 'undefined' || !ctx.audioWorklet || !ctx.createIIRFilter) {
+    previewMix.meterState = 'unavailable';
+    return;
+  }
+  previewMix.meterState = 'starting';
+  ctx.audioWorklet.addModule('meter-worklet.js').then(() => {
+    const [s1, s2] = Meter.kWeighting(ctx.sampleRate);
+    const k1 = ctx.createIIRFilter(Float64Array.from(s1.b), Float64Array.from(s1.a));
+    const k2 = ctx.createIIRFilter(Float64Array.from(s2.b), Float64Array.from(s2.a));
+    const node = new AudioWorkletNode(ctx, 'shortcut-meter', {
+      numberOfInputs: 2,
+      numberOfOutputs: 0,
+      processorOptions: { blockMs: Meter.BLOCK_MS },
+    });
+    previewMix.session = new Meter.Session();
+    node.port.onmessage = (e) => {
+      const d = e.data;
+      if (d && d.ms) previewMix.session.push(d.ms, d.peak);
+    };
+    previewMix.master.connect(k1);
+    k1.connect(k2);
+    k2.connect(node, 0, 0);
+    previewMix.master.connect(node, 0, 1);
+    previewMix.meterNode = node;
+    previewMix.meterState = 'on';
+  }).catch(() => {
+    previewMix.meterState = 'unavailable';
+    log('Loudness meter unavailable (the audio worklet did not load); playback is unaffected.');
+  });
+}
+
+/** Forget the integrated reading and start the programme again. */
+function resetMeter() {
+  if (previewMix.session) previewMix.session.reset();
+  meterPeakHold = { v: -Infinity, at: 0 };
+}
+
+// The peak bar falls back slowly instead of snapping, so a transient is actually visible.
+let meterPeakHold = { v: -Infinity, at: 0 };
+let meterFall = -Infinity;
+
+const METER_FLOOR = -60;   // dBFS / LUFS bottom of the scale
+const METER_TOP = 0;
+
+/**
+ * Draw the loudness meter.
+ *
+ * Two scales in one panel, which is the whole reason it is worth drawing rather than
+ * printing numbers: the top bar is sample peak in dBFS (are you clipping?) and the bottom
+ * bar is short-term loudness in LUFS (are you at the target?). They are NOT the same
+ * question and they routinely disagree - a heavily compressed mix can sit 3 dB from
+ * clipping and still be 6 LU under target.
+ *
+ * The signs on the loudness bar:
+ *   ▼ target   - the project's loudness target, from the render panel
+ *   |          - integrated so far, the number the render will actually be normalised to
+ *   ░          - the ±1 LU tolerance band around the target
+ *
+ * Called from loop(), which re-arms in a finally - a fault here costs a frame, never the
+ * session.
+ */
+function drawMeter() {
+  const cv = $('#meterCanvas');
+  if (!cv) return;
+  // Match the backing store to the CSS box once, so the bars are not blurry.
+  const rect = cv.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(80, Math.round(rect.width * dpr));
+  const h = Math.max(40, Math.round(rect.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, w, h);
+  g.save();
+  g.scale(dpr, dpr);
+  const W = w / dpr, H = h / dpr;
+
+  const s = previewMix.session;
+  const x0 = 26, x1 = W - 6;
+  const span = x1 - x0;
+  const at = (db) => x0 + span * (clamp(db, METER_FLOOR, METER_TOP) - METER_FLOOR) / (METER_TOP - METER_FLOOR);
+
+  const peakDb = s ? s.peakDb() : -Infinity;
+  const shortDb = s ? s.shortTerm() : -Infinity;
+  const intDb = s ? s.integrated() : -Infinity;
+  const momDb = s ? s.momentary() : -Infinity;
+
+  // Peak falls at ~20 dB/s so the bar reads as a level, not a strobe.
+  const now = performance.now();
+  if (peakDb > meterFall) meterFall = peakDb;
+  else if (isFinite(meterFall)) meterFall = Math.max(peakDb, meterFall - 0.35);
+  if (peakDb > meterPeakHold.v || now - meterPeakHold.at > 2000) {
+    meterPeakHold = { v: peakDb, at: now };
+  }
+
+  const label = (text, y) => {
+    g.fillStyle = '#7d8694';
+    g.font = '9px system-ui, sans-serif';
+    g.textAlign = 'left';
+    g.fillText(text, 2, y);
+  };
+
+  // ---- scale ticks ----------------------------------------------------
+  g.strokeStyle = 'rgba(255,255,255,.10)';
+  g.fillStyle = '#5d6673';
+  g.font = '8px system-ui, sans-serif';
+  g.textAlign = 'center';
+  g.lineWidth = 1;
+  // Every 10 dB gets a rule; only every 20 gets a number, because the panel is narrow
+  // and overlapping labels read as a smear rather than a scale.
+  for (const db of [-60, -50, -40, -30, -20, -10, -6, -3, 0]) {
+    const x = Math.round(at(db)) + 0.5;
+    g.beginPath();
+    g.moveTo(x, 12);
+    g.lineTo(x, H - 14);
+    g.stroke();
+  }
+  for (const db of [-60, -40, -20, -6, 0]) {
+    g.fillText(String(db), Math.round(at(db)), H - 4);
+  }
+
+  // ---- peak bar -------------------------------------------------------
+  const peakY = 16, barH = 14;
+  label('PK', peakY + 11);
+  g.fillStyle = 'rgba(255,255,255,.05)';
+  g.fillRect(x0, peakY, span, barH);
+  if (isFinite(meterFall)) {
+    const grad = g.createLinearGradient(x0, 0, x1, 0);
+    grad.addColorStop(0, '#3f7fd6');
+    grad.addColorStop(0.72, '#4fc27a');
+    grad.addColorStop(0.9, '#e0c341');
+    grad.addColorStop(1, '#ff5e4d');
+    g.fillStyle = grad;
+    g.fillRect(x0, peakY, Math.max(0, at(meterFall) - x0), barH);
+  }
+  // The hold mark, and the one sign that matters most: over 0 dBFS is clipping.
+  if (isFinite(meterPeakHold.v)) {
+    g.fillStyle = meterPeakHold.v >= -0.1 ? '#ff5e4d' : '#dfe4ea';
+    g.fillRect(Math.round(at(meterPeakHold.v)) - 1, peakY, 2, barH);
+  }
+
+  // ---- loudness bar ---------------------------------------------------
+  const loudY = peakY + barH + 12;
+  label('LUFS', loudY + 11);
+  const target = Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness).lufs;
+
+  // The tolerance band, drawn under everything as a sign of "close enough".
+  g.fillStyle = 'rgba(111,220,140,.14)';
+  g.fillRect(at(target - 1), loudY, Math.max(1, at(target + 1) - at(target - 1)), barH);
+  g.fillStyle = 'rgba(255,255,255,.05)';
+  g.fillRect(x0, loudY, span, barH);
+  g.fillStyle = 'rgba(111,220,140,.16)';
+  g.fillRect(at(target - 1), loudY, Math.max(1, at(target + 1) - at(target - 1)), barH);
+
+  if (isFinite(shortDb)) {
+    g.fillStyle = Math.abs(shortDb - target) <= 1 ? '#6fdc8c' : '#5a8fd8';
+    g.fillRect(x0, loudY, Math.max(0, at(shortDb) - x0), barH);
+  }
+  if (isFinite(momDb)) {           // momentary rides on top as a thin line
+    g.fillStyle = 'rgba(255,255,255,.5)';
+    g.fillRect(Math.round(at(momDb)) - 1, loudY, 2, barH);
+  }
+  if (isFinite(intDb)) {           // integrated: the number the render is judged on
+    g.fillStyle = '#ffd166';
+    g.fillRect(Math.round(at(intDb)), loudY - 3, 2, barH + 6);
+  }
+
+  // The target sign itself.
+  const tx = at(target);
+  g.fillStyle = '#e8ebf0';
+  g.beginPath();
+  g.moveTo(tx - 4, loudY - 8);
+  g.lineTo(tx + 4, loudY - 8);
+  g.lineTo(tx, loudY - 2);
+  g.closePath();
+  g.fill();
+
+  g.restore();
+
+  // ---- the numbers ----------------------------------------------------
+  const fmt = (v) => (isFinite(v) ? v.toFixed(1) : '-');
+  const set = (id, v, cls) => {
+    const n = $(id);
+    if (!n) return;
+    n.textContent = fmt(v);
+    n.className = cls || '';
+  };
+  set('#mM', momDb);
+  set('#mS', shortDb);
+  set('#mI', intDb, isFinite(intDb) && Math.abs(intDb - target) <= 1 ? 'on' : '');
+  set('#mPk', meterPeakHold.v, isFinite(meterPeakHold.v) && meterPeakHold.v >= -0.1 ? 'over' : '');
+
+  const note = $('#meterNote');
+  if (note) {
+    note.textContent =
+      previewMix.meterState === 'unavailable' ? 'Meter unavailable; playback is unaffected.'
+        : previewMix.meterState !== 'on' ? 'Play to meter the preview mix.'
+          : 'Preview mix, K-weighted (BS.1770). Target ' + target + ' LUFS.';
+  }
 }
 
 function previewGainNode(clip, el) {
@@ -194,7 +424,8 @@ function previewGainNode(clip, el) {
     const src = ctx.createMediaElementSource(el);
     const gain = ctx.createGain();
     src.connect(gain);
-    gain.connect(ctx.destination);
+    // Into the master bus, not straight to the speakers, so the meter reads the mix.
+    gain.connect(previewMix.master || ctx.destination);
     const node = { src, gain, el };
     previewMix.nodes.set(clip.id, node);
     return node;
@@ -1084,8 +1315,30 @@ function renderInspector() {
     TextUI.attachWheel(vol, volWheel);
     TextUI.attachWheel(volN, volWheel);
   }
-  if (c.kind === 'audio') box.appendChild(audioFxPanel(c));
+  const fxTarget = audioFxTarget(c);
+  if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   syncFramingControls();
+}
+
+/**
+ * Which clip an audio chain edited from this selection belongs to.
+ *
+ * Selecting a video clip is what people actually do - the video half is the one with the
+ * picture on it, and importing a file with sound puts the audio on a separate track and
+ * a separate lane. Routing through the link group means the audio chain is reachable
+ * from either half of a linked pair instead of only from the one nobody clicks.
+ *
+ * Returns null for a text card, or a video clip with no linked audio - there is nothing
+ * to put effects on.
+ */
+function audioFxTarget(clip) {
+  if (!clip || clip.kind === 'text') return null;
+  if (clip.kind === 'audio') return { clip, viaLink: null };
+  if (clip.kind !== 'video' || !clip.linkId) return null;
+  const mate = linkGroup(clip).find((x) => x.kind === 'audio');
+  if (!mate) return null;
+  const row = allClips().find((x) => x.clip === mate);
+  return { clip: mate, viaLink: row ? row.track.name : 'linked audio' };
 }
 
 /**
@@ -1099,7 +1352,7 @@ function renderInspector() {
  * Structural edits (add, remove, reorder, enable) snapshot and rebuild here; parameter
  * edits go through TextUI's own once-per-gesture snapshot.
  */
-function audioFxPanel(clip) {
+function audioFxPanel(clip, viaLink) {
   const el = TextUI.el;
   const box = el('div', 'afx-box');
   if (!Array.isArray(clip.afx)) clip.afx = [];
@@ -1109,6 +1362,13 @@ function audioFxPanel(clip) {
   head.appendChild(el('b', null, 'Audio effects'));
   head.appendChild(el('span', 'tc-hint', clip.afx.length ? clip.afx.length + ' in chain' : 'none'));
   box.appendChild(head);
+
+  if (viaLink) {
+    // Say which clip is being edited. Silently editing something other than the clip the
+    // user selected is exactly the kind of thing that gets blamed on the app later.
+    box.appendChild(el('div', 'tc-hint afx-via',
+      'Editing the linked audio clip on ' + viaLink + '.'));
+  }
 
   const note = el('div', 'tc-hint afx-note',
     'Preview mirrors level and mute only. Noise reduction, EQ, de-ess, compression, ' +
@@ -1211,8 +1471,116 @@ function audioFxPanel(clip) {
   addRow.appendChild(add);
   box.appendChild(addRow);
 
+  box.appendChild(audioFxPresetBar(clip));
+
   // A level change should be audible immediately rather than at the next seek.
   box.addEventListener('input', () => syncMedia());
+  return box;
+}
+
+/** Names of the saved audio-chain presets, refreshed from the library in the background. */
+let audioPresetNames = [];
+
+async function refreshAudioPresets(rebuild) {
+  try {
+    const all = await window.api.listPresets();
+    audioPresetNames = (all && all.audiofx) || [];
+  } catch (e) { audioPresetNames = []; }
+  if (rebuild) renderInspector();
+}
+
+/**
+ * Save / load / share a whole audio chain, in the same preset library as the text and
+ * transition presets - one `audiofx` kind alongside `style`, `anim`, `full` and `trans`.
+ *
+ * A preset is the CHAIN, not the clip: applying one replaces whatever chain was there,
+ * as one undo entry. A duck's voice track is not carried, because a track id means
+ * nothing in another project - see AudioFX.extractPreset().
+ */
+function audioFxPresetBar(clip) {
+  const el = TextUI.el;
+  const box = el('div', 'tc-preset-box');
+
+  const head = el('div', 'tc-preset-head');
+  head.appendChild(el('b', null, 'Chain presets'));
+  head.appendChild(el('span', 'tc-hint', audioPresetNames.length + ' saved'));
+  box.appendChild(head);
+
+  const sel = el('select', 'tc-preset-sel');
+  const o0 = el('option');
+  o0.value = '';
+  o0.textContent = audioPresetNames.length ? 'Choose a saved chain...' : 'Nothing saved yet';
+  sel.appendChild(o0);
+  for (const n of audioPresetNames) {
+    const o = el('option'); o.value = n; o.textContent = n; sel.appendChild(o);
+  }
+  const apply = (data, what) => {
+    pushUndo();
+    const applied = AudioFX.applyPreset(clip, data);
+    markDirty();
+    renderAll();
+    const ducks = applied.filter((f) => f.type === 'duck').length;
+    log('Applied audio chain "' + what + '" (' + applied.length + ' effect(s)).' +
+      (ducks ? ' Choose a voice track for the ducking.' : ''));
+  };
+  sel.addEventListener('change', async () => {
+    if (!sel.value) return;
+    const data = await window.api.loadPreset('audiofx', sel.value);
+    if (!data) { log('Could not read that audio preset.'); return; }
+    apply(data, sel.value);
+  });
+  box.appendChild(sel);
+
+  const saveRow = el('div', 'tc-preset-save');
+  const nameInput = el('input', 'tc-preset-input');
+  nameInput.type = 'text';
+  nameInput.placeholder = 'Save as...';
+  // window.prompt does not exist in Electron, hence the inline field - see the README.
+  nameInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') doSave();
+  });
+  const doSave = async () => {
+    if (!clip.afx.length) { log('Add an effect before saving a chain preset.'); return; }
+    const name = nameInput.value.trim() || ('Audio chain ' + (audioPresetNames.length + 1));
+    const data = AudioFX.extractPreset(clip.afx);
+    data.name = name;
+    nameInput.value = '';
+    await window.api.savePreset('audiofx', name, data);
+    await refreshAudioPresets(true);
+    log('Saved audio chain preset "' + name + '".');
+  };
+  const save = el('button', 'mini', 'Save');
+  save.addEventListener('click', doSave);
+  saveRow.appendChild(nameInput);
+  saveRow.appendChild(save);
+  box.appendChild(saveRow);
+
+  const acts = el('div', 'tc-preset-acts');
+  const del = el('button', 'mini', 'Delete');
+  del.addEventListener('click', async () => {
+    if (!sel.value) { log('Pick a saved audio preset above first.'); return; }
+    await window.api.deletePreset('audiofx', sel.value);
+    await refreshAudioPresets(true);
+  });
+  const exp = el('button', 'mini', 'Export');
+  exp.addEventListener('click', async () => {
+    if (!clip.afx.length) { log('Add an effect before exporting a chain.'); return; }
+    const data = AudioFX.extractPreset(clip.afx);
+    data.name = nameInput.value.trim() || 'Audio chain';
+    await window.api.exportPreset('audiofx', data);
+  });
+  const imp = el('button', 'mini', 'Import');
+  imp.addEventListener('click', async () => {
+    const data = await window.api.importPreset('audiofx');
+    if (!data) return;
+    apply(data, data.name || 'imported');
+  });
+  acts.appendChild(del); acts.appendChild(exp); acts.appendChild(imp);
+  box.appendChild(acts);
+  box.appendChild(el('div', 'tc-hint',
+    'A preset carries the effects, their order and every parameter - but never the voice ' +
+    'track a duck points at, which only means something inside one project.'));
   return box;
 }
 
@@ -1943,6 +2311,7 @@ function loop() {
       scrollPlayheadIntoView();
     }
     drawPreview();
+    drawMeter();
   } catch (e) {
     // Reported once per distinct fault, so a persistent one does not flood the log at
     // 60fps but a new one is never swallowed.
@@ -2759,6 +3128,7 @@ async function doPreviewRender(opts) {
       (encodeMs / 1000).toFixed(1) + 's)');
     await refreshCacheBands(true);
 refreshTransPresets(false);
+refreshAudioPresets(false);
     refreshCacheInfo();
     seek(range.from);
   } else {
@@ -2981,6 +3351,7 @@ $('#preset').addEventListener('change', (e) => {
 $('#quality').addEventListener('change', (e) => { state.out.quality = e.target.value; markDirty(); });
 // Loudness is one project-level target for the finished mix, not a per-clip effect: it
 // has to see the whole amix to know how loud the video actually is.
+$('#btnMeterReset').addEventListener('click', () => { resetMeter(); log('Loudness meter reset.'); });
 $('#loudness').addEventListener('change', (e) => {
   const v = e.target.value;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness, {

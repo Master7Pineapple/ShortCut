@@ -216,6 +216,46 @@
     return clamp(g, 0, 4);
   }
 
+  // --------------------------------------------------------------- presets
+
+  /**
+   * A whole chain, ready to be written to the preset library.
+   *
+   * A duck's `voiceTrack` is deliberately dropped: it is a track id, which means nothing
+   * in another project - the same reason a transition preset carries the look but never
+   * which cut it sits on. The effect comes back needing a voice track chosen, and the
+   * inspector says so rather than silently ducking to nothing.
+   */
+  function extractPreset(afx) {
+    return {
+      app: 'shortcut',
+      kind: 'audiofx',
+      afx: (Array.isArray(afx) ? afx : []).filter((f) => f && DEFS[f.type]).map((f) => {
+        const params = Object.assign({}, DEFS[f.type].params, f.params || {});
+        if (f.type === 'duck') params.voiceTrack = '';
+        return { type: f.type, enabled: f.enabled !== false, params };
+      }),
+    };
+  }
+
+  /**
+   * Read a preset back onto a clip, replacing whatever chain was there.
+   *
+   * Fresh ids, because two clips sharing an effect id would make the inspector's
+   * per-effect controls ambiguous. Unknown types are dropped rather than kept as dead
+   * weight - a preset written by a later build stays usable in an earlier one.
+   */
+  function applyPreset(clip, data) {
+    const list = (data && Array.isArray(data.afx)) ? data.afx : [];
+    clip.afx = list.filter((f) => f && DEFS[f.type]).map((f) => {
+      const fx = create(f.type);
+      fx.enabled = f.enabled !== false;
+      Object.assign(fx.params, f.params || {});
+      return normalize(fx);
+    });
+    return clip.afx;
+  }
+
   // -------------------------------------------------------------- loudness
 
   const LOUD_DEFAULTS = { enabled: false, lufs: -14, tp: -1, lra: 11 };
@@ -248,6 +288,7 @@
   const API = {
     DEFS, TYPES: Object.keys(DEFS), LOUD_DEFAULTS,
     create, normalize, normalizeClip, chain, duckOf, duckFilter,
+    extractPreset, applyPreset,
     previewGain, loudnormFilter, linFromDb, n3,
   };
 

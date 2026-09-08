@@ -470,7 +470,7 @@ ipcMain.handle('fonts:list', () => listFonts());
 
 // -------------------------------------------------------------- presets
 
-const PRESET_KINDS = ['style', 'anim', 'full', 'trans'];
+const PRESET_KINDS = ['style', 'anim', 'full', 'trans', 'audiofx'];
 const presetDir = (kind) => {
   const k = PRESET_KINDS.includes(kind) ? kind : 'full';
   const dir = path.join(app.getPath('userData'), 'presets', k);

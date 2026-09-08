@@ -150,6 +150,20 @@
           <div id="renderStatus" class="status"></div>
           <div id="renderBarWrap"><div id="renderBar"></div></div>
         </div>
+        <div id="meterPanel">
+          <div class="panel-head">
+            <span class="title">Loudness</span>
+            <button id="btnMeterReset" class="mini" title="Start the integrated reading again">Reset</button>
+          </div>
+          <canvas id="meterCanvas" width="300" height="104"></canvas>
+          <div id="meterReadout">
+            <span><b>M</b> <i id="mM">-</i></span>
+            <span><b>S</b> <i id="mS">-</i></span>
+            <span><b>I</b> <i id="mI">-</i></span>
+            <span><b>Peak</b> <i id="mPk">-</i></span>
+          </div>
+          <div id="meterNote" class="tc-hint">Play to meter the preview mix.</div>
+        </div>
         <div id="log"></div>
       </footer>
     </main>
@@ -232,6 +246,7 @@
   </div>
 
   <script src="../audiofx.js"></script>
+  <script src="meter.js"></script>
   <script src="text/model.js"></script>
   <script src="transitions.js"></script>
   <script src="waveform.js"></script>
