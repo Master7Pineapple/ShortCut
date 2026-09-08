@@ -1,0 +1,181 @@
+{
+  "kind": "full",
+  "text": "Ballsy",
+  "style": {
+    "fontFamily": "Inter 28pt 28pt Black",
+    "fontSize": 275,
+    "letterSpacing": -11.5,
+    "lineHeight": 0.8,
+    "bold": true,
+    "italic": false,
+    "underline": false,
+    "strikethrough": false,
+    "uppercase": true,
+    "align": "center",
+    "x": 0.5,
+    "y": 0.5,
+    "maxWidth": 0.58,
+    "rotate": 0,
+    "opacity": 1,
+    "fill": {
+      "type": "gradient",
+      "color": "#ffffff",
+      "gradient": {
+        "angle": 270,
+        "stops": [
+          {
+            "pos": 0,
+            "color": "#969696"
+          },
+          {
+            "pos": 0.4671986012511422,
+            "color": "#ffffff"
+          }
+        ]
+      }
+    },
+    "stroke": {
+      "on": false,
+      "color": "#000000",
+      "width": 6
+    },
+    "shadow": {
+      "on": true,
+      "distance": 0,
+      "angle": 0,
+      "blur": 55,
+      "opacity": 1,
+      "color": "#000000"
+    },
+    "glow": {
+      "on": true,
+      "color": "#ffffff",
+      "intensity": 2,
+      "size": 10,
+      "spread": 0.5
+    },
+    "blur": {
+      "on": false,
+      "amount": 0
+    },
+    "bg": {
+      "on": false,
+      "color": "#000000",
+      "opacity": 0.5,
+      "padding": 0,
+      "radius": 18
+    }
+  },
+  "animEnabled": true,
+  "anims": [
+    {
+      "id": "afl3hcnf",
+      "type": "fade",
+      "mode": "in",
+      "anchor": "start",
+      "start": 0,
+      "duration": 0.6,
+      "easing": {
+        "kind": "bezier",
+        "p": [
+          0,
+          0,
+          0.58,
+          1
+        ]
+      },
+      "motionBlur": {
+        "on": false,
+        "strength": 0.6,
+        "samples": 8
+      },
+      "params": {},
+      "disabled": false
+    },
+    {
+      "id": "a4wqklg4",
+      "type": "slide",
+      "mode": "in",
+      "anchor": "start",
+      "start": 0,
+      "duration": 0.31,
+      "easing": {
+        "kind": "bezier",
+        "p": [
+          0.19,
+          1,
+          0.22,
+          1
+        ]
+      },
+      "motionBlur": {
+        "on": true,
+        "strength": 1,
+        "samples": 32
+      },
+      "params": {
+        "from": "left",
+        "distance": 1.5
+      }
+    },
+    {
+      "id": "a0z375cv",
+      "type": "zoom",
+      "mode": "in",
+      "anchor": "end",
+      "start": 0,
+      "duration": 3.03,
+      "easing": {
+        "kind": "bezier",
+        "p": [
+          0.42,
+          0,
+          0.58,
+          1
+        ]
+      },
+      "motionBlur": {
+        "on": false,
+        "strength": 0.6,
+        "samples": 8
+      },
+      "params": {
+        "amount": 0.11
+      }
+    },
+    {
+      "id": "akdqwa3e",
+      "type": "slide",
+      "mode": "out",
+      "anchor": "end",
+      "start": 0,
+      "duration": 0.31,
+      "easing": {
+        "kind": "bezier",
+        "p": [
+          0.42,
+          0,
+          1,
+          1
+        ]
+      },
+      "motionBlur": {
+        "on": true,
+        "strength": 1,
+        "samples": 32
+      },
+      "params": {
+        "from": "right",
+        "distance": 1.5
+      }
+    }
+  ],
+  "keys": {
+    "opacity": [],
+    "x": [],
+    "y": [],
+    "scale": [],
+    "rotate": []
+  },
+  "name": "Full card preset"
+}

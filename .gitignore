@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+out/
+*.exe
+
+# ffmpeg diagnostics dropped next to temp
+shortcut-last-ffmpeg-args.txt
+
+# working project files (they carry absolute paths to local media)
+project.scut
+*.scut
+
+# scratch media used by the smoke suites
+scut_test/
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# logs
+npm-debug.log*
+*.log

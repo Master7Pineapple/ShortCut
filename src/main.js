@@ -1,0 +1,982 @@
+'use strict';
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const { spawn, execFile } = require('child_process');
+const crypto = require('crypto');
+
+const ffmpegPath = require('ffmpeg-static').replace('app.asar', 'app.asar.unpacked');
+const ffprobePath = require('ffprobe-static').path.replace('app.asar', 'app.asar.unpacked');
+
+const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ts']);
+const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma']);
+/** Stills. The timeline cannot hold one yet, but the QuickBin keeps them for transitions. */
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+
+let win = null;
+/** @type {import('child_process').ChildProcess|null} */
+let activeRender = null;
+/** Mirrored from the renderer so the close handler knows whether to warn. */
+let projectDirty = false;
+/** Set once the user has answered the "save before closing?" prompt. */
+let allowClose = false;
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1600,
+    height: 950,
+    minWidth: 1100,
+    minHeight: 700,
+    backgroundColor: '#15171c',
+    autoHideMenuBar: true,
+    title: 'ShortCut - 9:16 Editor',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      // Needed so <video src="file:///..."> can load the user's media in the renderer.
+      webSecurity: false,
+      // The playback clock rides on requestAnimationFrame. Chromium throttles that to a
+      // crawl for backgrounded windows, which would freeze the playhead while the audio
+      // elements kept running - the two would drift apart every time the window lost
+      // focus. Media apps want the real clock.
+      backgroundThrottling: false,
+    },
+  });
+  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // Set SHORTCUT_DEBUG=1 to mirror renderer console output into the terminal.
+  if (process.env.SHORTCUT_DEBUG) {
+    win.webContents.on('console-message', (_e, level, message, line, source) => {
+      console.log('[renderer:' + level + '] ' + message + ' (' + source + ':' + line + ')');
+    });
+    win.webContents.openDevTools({ mode: 'detach' });
+  }
+
+  // Set SHORTCUT_SMOKE=<path-to-js> to run a script against the live renderer and exit.
+  // Used by the smoke test in tools/ - see README.
+  if (process.env.SHORTCUT_SMOKE) {
+    win.webContents.once('did-finish-load', async () => {
+      const script = fs.readFileSync(process.env.SHORTCUT_SMOKE, 'utf8');
+      try {
+        const out = await win.webContents.executeJavaScript(script, true);
+        console.log(typeof out === 'string' ? out : JSON.stringify(out, null, 2));
+      } catch (e) {
+        console.log('SMOKE ERROR: ' + (e && e.message));
+        process.exitCode = 1;
+      }
+      // Set SHORTCUT_SHOT=<path.png> alongside it to also capture the window.
+      if (process.env.SHORTCUT_SHOT) {
+        const img = await win.webContents.capturePage();
+        fs.writeFileSync(process.env.SHORTCUT_SHOT, img.toPNG());
+        console.log('screenshot -> ' + process.env.SHORTCUT_SHOT);
+      }
+      // A smoke run is headless by definition, and every suite dirties the project as
+      // soon as it imports a clip. Without this, app.quit() hits the unsaved-changes
+      // guard below, which preventDefault()s and opens a modal nobody is there to answer
+      // - electron then sits on that dialog until something kills it, holding the machine
+      // and writing no output. This is the "Don't save" path, taken automatically.
+      allowClose = true;
+      app.quit();
+    });
+  }
+
+  // Closing with unsaved work asks first. This MUST live in the main process: a
+  // renderer `beforeunload` handler that calls preventDefault just blocks the close
+  // silently in Electron, which is why the window used to ignore the quit button until
+  // the project had been saved.
+  win.on('close', async (e) => {
+    if (allowClose || !projectDirty) return;
+    e.preventDefault();
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'warning',
+      buttons: ['Save and quit', "Don't save", 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      title: 'Unsaved changes',
+      message: 'This project has unsaved changes.',
+      detail: 'Save them before closing?',
+      noLink: true,
+    });
+    if (response === 2) return;                    // cancel: stay open
+    if (response === 1) { allowClose = true; win.close(); return; }
+
+    // Save and quit: the renderer owns the project data, so ask it to save and wait.
+    saveThenQuit = true;
+    win.webContents.send('app:requestSave');
+  });
+
+  win.on('closed', () => { win = null; });
+}
+
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+
+// ---------------------------------------------------------------- media scan
+
+/** Natural sort so "clip2" comes before "clip10" - the order the user sees in Explorer. */
+const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+function classify(file) {
+  const ext = path.extname(file).toLowerCase();
+  if (VIDEO_EXT.has(ext)) return 'video';
+  if (AUDIO_EXT.has(ext)) return 'audio';
+  return null;
+}
+
+/**
+ * Expand dropped paths into an ordered, flat list of media files.
+ *
+ * `withImages` widens the filter to stills, which the timeline has no use for but the
+ * QuickBin does.
+ */
+function expandPaths(paths, withImages) {
+  const out = [];
+  const wanted = (p) =>
+    !!classify(p) || (withImages && IMAGE_EXT.has(path.extname(p).toLowerCase()));
+  const walk = (p, depth) => {
+    let st;
+    try { st = fs.statSync(p); } catch (e) { return; }
+    if (st.isDirectory()) {
+      if (depth > 6) return;
+      const entries = fs.readdirSync(p).sort(collator.compare);
+      const files = [];
+      const dirs = [];
+      for (const e of entries) {
+        try {
+          if (fs.statSync(path.join(p, e)).isDirectory()) dirs.push(e); else files.push(e);
+        } catch (err) { /* unreadable entry - skip */ }
+      }
+      // Files first (in folder order), then recurse into subfolders.
+      for (const f of files) walk(path.join(p, f), depth + 1);
+      for (const d of dirs) walk(path.join(p, d), depth + 1);
+    } else if (wanted(p)) {
+      out.push(p);
+    }
+  };
+  for (const p of [...paths].sort(collator.compare)) walk(p, 0);
+  return out;
+}
+
+function probe(file) {
+  return new Promise((resolve) => {
+    execFile(ffprobePath, [
+      '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file,
+    ], { maxBuffer: 1024 * 1024 * 16 }, (err, stdout) => {
+      if (err) return resolve(null);
+      let json;
+      try { json = JSON.parse(stdout); } catch (e) { return resolve(null); }
+      const streams = json.streams || [];
+      const v = streams.find((s) => s.codec_type === 'video' && !(s.disposition && s.disposition.attached_pic));
+      const a = streams.find((s) => s.codec_type === 'audio');
+      const dur = parseFloat((json.format && json.format.duration) || (v && v.duration) || (a && a.duration) || 0) || 0;
+      let fps = 30;
+      if (v && v.avg_frame_rate && v.avg_frame_rate !== '0/0') {
+        const parts = v.avg_frame_rate.split('/').map(Number);
+        if (parts[1]) fps = parts[0] / parts[1];
+      }
+      resolve({
+        path: file,
+        name: path.basename(file),
+        kind: v ? 'video' : 'audio',
+        duration: dur,
+        width: v ? Number(v.width) : 0,
+        height: v ? Number(v.height) : 0,
+        fps: Math.round(fps * 1000) / 1000,
+        hasAudio: !!a,
+      });
+    });
+  });
+}
+
+ipcMain.handle('media:scan', async (_e, paths) => {
+  const files = expandPaths(paths || []);
+  const metas = [];
+  for (const f of files) {
+    const m = await probe(f);
+    if (m && m.duration > 0) metas.push(m);
+  }
+  return metas;
+});
+
+ipcMain.handle('media:pick', async () => {
+  const exts = [...VIDEO_EXT, ...AUDIO_EXT].map((e) => e.slice(1));
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import media',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Media', extensions: exts }],
+  });
+  return r.canceled ? [] : r.filePaths;
+});
+
+ipcMain.handle('media:pickImage', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose a PNG for the transition',
+    properties: ['openFile'],
+    filters: [{ name: 'Images', extensions: ['png', 'webp', 'gif', 'jpg', 'jpeg'] }],
+  });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('media:pickFolder', async () => {
+  const r = await dialog.showOpenDialog(win, { title: 'Import folder', properties: ['openDirectory'] });
+  return r.canceled ? [] : r.filePaths;
+});
+
+// ----------------------------------------------------------------- QuickBin
+
+/**
+ * The QuickBin is a media library that outlives the project.
+ *
+ * It lives in userData, not in the .scut, precisely so the same clips, music and stills
+ * are there in every project without importing them again. Nothing in it is copied - an
+ * entry is a path plus the probe result, so the bin is small and the media stays where
+ * the user put it.
+ */
+const binFile = () => path.join(app.getPath('userData'), 'quickbin.json');
+const EMPTY_BIN = () => ({ version: 1, folders: [], items: [] });
+
+function readBin() {
+  try {
+    const b = JSON.parse(fs.readFileSync(binFile(), 'utf8'));
+    if (!b || typeof b !== 'object') return EMPTY_BIN();
+    if (!Array.isArray(b.folders)) b.folders = [];
+    if (!Array.isArray(b.items)) b.items = [];
+    b.version = 1;
+    return b;
+  } catch (e) { return EMPTY_BIN(); }
+}
+
+ipcMain.handle('bin:read', () => {
+  const b = readBin();
+  // Tell the renderer which entries have gone missing so it can grey them out rather
+  // than failing at the moment someone drops one on the timeline.
+  for (const it of b.items) it.missing = !(it.path && fs.existsSync(it.path));
+  return b;
+});
+
+ipcMain.handle('bin:write', (_e, data) => {
+  const b = data && typeof data === 'object' ? data : EMPTY_BIN();
+  const clean = {
+    version: 1,
+    folders: Array.isArray(b.folders) ? b.folders : [],
+    // `missing` is a live check, not state - never persist it.
+    items: (Array.isArray(b.items) ? b.items : []).map((it) => {
+      const { missing, ...rest } = it;
+      return rest;
+    }),
+  };
+  const f = binFile();
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(clean, null, 2), 'utf8');
+  return true;
+});
+
+/** Like `media:scan`, but stills count too: the bin holds them for object transitions. */
+ipcMain.handle('bin:scan', async (_e, paths) => {
+  const files = expandPaths(paths || [], true);
+  const out = [];
+  for (const f of files) {
+    const ext = path.extname(f).toLowerCase();
+    if (IMAGE_EXT.has(ext)) {
+      let size = 0;
+      try { size = fs.statSync(f).size; } catch (err) { continue; }
+      out.push({
+        path: f, name: path.basename(f), kind: 'image',
+        duration: 0, width: 0, height: 0, fps: 0, hasAudio: false, size,
+      });
+      continue;
+    }
+    const m = await probe(f);
+    if (m && m.duration > 0) out.push(m);
+  }
+  return out;
+});
+
+ipcMain.handle('bin:pick', async () => {
+  const exts = [...VIDEO_EXT, ...AUDIO_EXT, ...IMAGE_EXT].map((e) => e.slice(1));
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Add to the QuickBin',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Media', extensions: exts }],
+  });
+  return r.canceled ? [] : r.filePaths;
+});
+
+ipcMain.handle('bin:pickFolder', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Add a folder to the QuickBin',
+    properties: ['openDirectory', 'multiSelections'],
+  });
+  return r.canceled ? [] : r.filePaths;
+});
+
+/** The immediate children of a folder, so importing one can mirror its subfolders. */
+ipcMain.handle('bin:listDir', (_e, dir) => {
+  const out = { isDir: false, files: [], dirs: [] };
+  try { out.isDir = fs.statSync(dir).isDirectory(); } catch (e) { return out; }
+  if (!out.isDir) return out;
+  try {
+    for (const name of fs.readdirSync(dir).sort(collator.compare)) {
+      const p = path.join(dir, name);
+      let st;
+      try { st = fs.statSync(p); } catch (err) { continue; }
+      if (st.isDirectory()) out.dirs.push({ path: p, name });
+      else if (classify(p) || IMAGE_EXT.has(path.extname(p).toLowerCase())) out.files.push(p);
+    }
+  } catch (e) { /* unreadable folder - report nothing rather than throwing */ }
+  return out;
+});
+
+// -------------------------------------------------------- waveform peak cache
+
+/**
+ * Decoded audio peaks, cached on disk by path + size + mtime.
+ *
+ * Decoding a few minutes of audio in the renderer costs seconds, and the timeline needs
+ * the peaks on every redraw. Keyed on the file's stats rather than its content so a
+ * re-encoded file under the same name is redrawn rather than served stale.
+ */
+const waveDir = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'wave');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const waveFile = (p) =>
+  path.join(waveDir(), crypto.createHash('sha1').update(String(p)).digest('hex') + '.json');
+
+function fileStamp(p) {
+  try {
+    const st = fs.statSync(p);
+    return { size: st.size, mtime: Math.round(st.mtimeMs) };
+  } catch (e) { return null; }
+}
+
+ipcMain.handle('wave:read', (_e, p) => {
+  const stamp = fileStamp(p);
+  if (!stamp) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(waveFile(p), 'utf8'));
+    if (j.size !== stamp.size || j.mtime !== stamp.mtime) return null;
+    return { peaks: j.peaks, duration: j.duration };
+  } catch (e) { return null; }
+});
+
+ipcMain.handle('wave:write', (_e, { path: p, peaks, duration }) => {
+  const stamp = fileStamp(p);
+  if (!stamp || !Array.isArray(peaks)) return false;
+  try {
+    fs.writeFileSync(waveFile(p), JSON.stringify({
+      size: stamp.size, mtime: stamp.mtime, duration: duration || 0, peaks,
+    }), 'utf8');
+    return true;
+  } catch (e) { return false; }
+});
+
+// ------------------------------------------------------------------ projects
+
+ipcMain.handle('project:save', async (_e, payload) => {
+  let target = payload.filePath;
+  if (!target) {
+    const r = await dialog.showSaveDialog(win, {
+      title: 'Save project',
+      defaultPath: 'project.scut',
+      filters: [{ name: 'ShortCut Project', extensions: ['scut'] }],
+    });
+    if (r.canceled) return { canceled: true };
+    target = r.filePath;
+  }
+  fs.writeFileSync(target, JSON.stringify(payload.data, null, 2), 'utf8');
+  return { canceled: false, filePath: target };
+});
+
+ipcMain.handle('project:open', async (_e, filePath) => {
+  let target = filePath;
+  if (!target) {
+    const r = await dialog.showOpenDialog(win, {
+      title: 'Open project',
+      properties: ['openFile'],
+      filters: [{ name: 'ShortCut Project', extensions: ['scut'] }],
+    });
+    if (r.canceled) return { canceled: true };
+    target = r.filePaths[0];
+  }
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(target, 'utf8'));
+  } catch (e) {
+    return { canceled: false, error: 'Could not read project: ' + e.message };
+  }
+  const missing = [];
+  for (const t of data.tracks || []) {
+    for (const c of t.clips || []) if (!fs.existsSync(c.src)) missing.push(c.src);
+  }
+  return { canceled: false, filePath: target, data, missing };
+});
+
+// --------------------------------------------------------------- fonts
+
+let fontCache = null;
+
+/**
+ * Family names of every font installed on this machine.
+ *
+ * InstalledFontCollection gives real family names ("Segoe UI"), which is what canvas
+ * needs; the registry fallback only has display names ("Segoe UI Bold (TrueType)") and
+ * has to be de-suffixed, so it is second choice.
+ */
+function listFonts() {
+  if (fontCache) return Promise.resolve(fontCache);
+  return new Promise((resolve) => {
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      'Add-Type -AssemblyName System.Drawing; ' +
+      '[System.Drawing.Text.InstalledFontCollection]::new().Families | ForEach-Object { $_.Name }',
+    ], { maxBuffer: 1024 * 1024 * 4, windowsHide: true }, (err, stdout) => {
+      let names = [];
+      if (!err && stdout) {
+        names = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      }
+      if (!names.length) {
+        try {
+          const key = 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts';
+          const out = require('child_process').execSync('reg query "' + key + '"', { encoding: 'utf8' });
+          const styles = /\s+(Bold|Italic|Light|Semilight|Semibold|Black|Thin|Medium|Regular|Oblique|Condensed|Extrabold|Ultralight)+$/i;
+          const seen = new Set();
+          for (const line of out.split(/\r?\n/)) {
+            const m = /^\s{4}(.+?)\s{4}REG_SZ/.exec(line);
+            if (!m) continue;
+            let n = m[1].replace(/\s*\((TrueType|OpenType|VGA res)\)\s*$/i, '').split('&')[0].trim();
+            while (styles.test(n)) n = n.replace(styles, '').trim();
+            if (n && !seen.has(n)) { seen.add(n); names.push(n); }
+          }
+        } catch (e) { /* fall through to the built-in list */ }
+      }
+      if (!names.length) {
+        names = ['Segoe UI', 'Arial', 'Calibri', 'Times New Roman', 'Georgia', 'Verdana',
+          'Tahoma', 'Impact', 'Comic Sans MS', 'Courier New', 'Consolas', 'Trebuchet MS'];
+      }
+      names = [...new Set(names)].sort((a, b) => a.localeCompare(b));
+      fontCache = names;
+      resolve(names);
+    });
+  });
+}
+
+ipcMain.handle('fonts:list', () => listFonts());
+
+// -------------------------------------------------------------- presets
+
+const PRESET_KINDS = ['style', 'anim', 'full', 'trans'];
+const presetDir = (kind) => {
+  const k = PRESET_KINDS.includes(kind) ? kind : 'full';
+  const dir = path.join(app.getPath('userData'), 'presets', k);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const presetFile = (kind, name) =>
+  path.join(presetDir(kind), String(name).replace(/[^\w\- ()\[\]]/g, '_') + '.json');
+
+ipcMain.handle('preset:list', () => {
+  const out = {};
+  for (const k of PRESET_KINDS) {
+    try {
+      out[k] = fs.readdirSync(presetDir(k))
+        .filter((f) => f.toLowerCase().endsWith('.json'))
+        .map((f) => f.replace(/\.json$/i, ''))
+        .sort();
+    } catch (e) { out[k] = []; }
+  }
+  return out;
+});
+
+ipcMain.handle('preset:save', (_e, { kind, name, data }) => {
+  fs.writeFileSync(presetFile(kind, name), JSON.stringify(data, null, 2), 'utf8');
+  return true;
+});
+
+ipcMain.handle('preset:load', (_e, { kind, name }) => {
+  try { return JSON.parse(fs.readFileSync(presetFile(kind, name), 'utf8')); } catch (e) { return null; }
+});
+
+ipcMain.handle('preset:delete', (_e, { kind, name }) => {
+  try { fs.unlinkSync(presetFile(kind, name)); return true; } catch (e) { return false; }
+});
+
+ipcMain.handle('preset:export', async (_e, { kind, data }) => {
+  const r = await dialog.showSaveDialog(win, {
+    title: 'Export ' + kind + ' preset',
+    defaultPath: (data && data.name ? data.name : kind) + '.shortcut-' + kind + '.json',
+    filters: [{ name: 'ShortCut preset', extensions: ['json'] }],
+  });
+  if (r.canceled) return false;
+  fs.writeFileSync(r.filePath, JSON.stringify(data, null, 2), 'utf8');
+  return r.filePath;
+});
+
+ipcMain.handle('preset:import', async (_e, kind) => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import ' + kind + ' preset',
+    properties: ['openFile'],
+    filters: [{ name: 'ShortCut preset', extensions: ['json'] }],
+  });
+  if (r.canceled) return null;
+  try { return JSON.parse(fs.readFileSync(r.filePaths[0], 'utf8')); } catch (e) { return null; }
+});
+
+// ------------------------------------------------- baked text frame sequences
+
+/**
+ * Text cards are drawn on canvas in the renderer and handed here as PNG frames, which
+ * ffmpeg then overlays as an image sequence. That keeps one drawing implementation for
+ * both preview and export - see src/renderer/text/draw.js.
+ */
+/**
+ * Baked frames are cached by a hash of everything that affects the pixels (the card, the
+ * output size, the fps and the clip length). Re-rendering an unchanged card reuses the
+ * PNGs instead of redrawing them, which is the slow half of exporting a text-heavy edit.
+ */
+const textCacheRoot = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'text');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+
+/** Trim the cache to a budget, oldest entries first. */
+function pruneTextCache(budgetBytes) {
+  const root = textCacheRoot();
+  let entries = [];
+  for (const name of fs.readdirSync(root)) {
+    const dir = path.join(root, name);
+    try {
+      const st = fs.statSync(dir);
+      if (!st.isDirectory()) continue;
+      let size = 0;
+      for (const f of fs.readdirSync(dir)) {
+        try { size += fs.statSync(path.join(dir, f)).size; } catch (e) { /* racing */ }
+      }
+      entries.push({ dir, size, used: st.mtimeMs });
+    } catch (e) { /* unreadable */ }
+  }
+  let total = entries.reduce((n, e) => n + e.size, 0);
+  entries.sort((a, b) => a.used - b.used);
+  for (const e of entries) {
+    if (total <= budgetBytes) break;
+    try { fs.rmSync(e.dir, { recursive: true, force: true }); total -= e.size; } catch (err) { /* in use */ }
+  }
+  return total;
+}
+
+/**
+ * A scratch directory for one baked sequence.
+ *
+ * Frames are written as a single raw RGBA stream rather than one PNG each. PNG encoding a
+ * large text frame costs 100-1500 ms depending on how much alpha detail it has, which made
+ * baking dwarf everything else - a four second title card could take ten minutes. Dumping
+ * the bytes straight out of the canvas costs about 4 ms a frame, so baking is now cheap
+ * enough that these do not need caching: they are temporary and deleted after the render.
+ * The finished MP4 is what gets cached (see the render cache).
+ */
+ipcMain.handle('text:seq', () => ({
+  dir: fs.mkdtempSync(path.join(app.getPath('temp'), 'shortcut-text-')),
+  cached: false,
+}));
+
+ipcMain.handle('text:seqDone', () => true);
+
+/**
+ * Finished renders are cached too.
+ *
+ * The frame cache only removes the drawing half of an export - ffmpeg still re-encodes
+ * the whole timeline, which is the bigger cost on a text-light edit. Keying the finished
+ * file by the whole job means pressing Render again after changing nothing (or after only
+ * changing where the file goes) is a file copy instead of an encode.
+ */
+const renderCacheRoot = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'render');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+
+/**
+ * Everything that decides the output pixels - deliberately NOT the destination path.
+ *
+ * The renderer computes the same key (`jobCacheKey` in app.js) so the timeline can ask
+ * "is this span still cached?" without starting a render; when it sends one along we use
+ * it, so the two implementations can never drift apart.
+ */
+function jobKey(job) {
+  if (job.cacheKey) return String(job.cacheKey).replace(/[^\w-]/g, '');
+
+  // Without a key from the renderer we can only hash what is in the job - and for a job
+  // with text that is not enough. Baking replaces each card with a scratch directory
+  // whose name is random, so the hash would differ on every render (never a hit) while
+  // stripping it out would let two different cards collide (a wrong hit). Refuse instead:
+  // callers that want caching send `cacheKey`, computed before baking.
+  if ((job.clips || []).some((c) => c.kind === 'text')) return null;
+
+  const copy = Object.assign({}, job);
+  delete copy.outPath;
+  delete copy.cacheKey;
+  delete copy.useCache;
+  delete copy.preview;
+  return crypto.createHash('sha1').update(JSON.stringify(copy)).digest('hex').slice(0, 24);
+}
+
+/**
+ * What each cached render covers, so the timeline can draw its cached spans.
+ * Entries are (key, from, to); the renderer decides whether a key is still valid by
+ * rebuilding that span's job and comparing hashes.
+ */
+const renderIndexFile = () => path.join(renderCacheRoot(), 'index.json');
+
+function readRenderIndex() {
+  try { return JSON.parse(fs.readFileSync(renderIndexFile(), 'utf8')); } catch (e) { return []; }
+}
+
+function writeRenderIndex(list) {
+  try { fs.writeFileSync(renderIndexFile(), JSON.stringify(list), 'utf8'); } catch (e) { /* best effort */ }
+}
+
+function noteRender(key, from, to, kind) {
+  const list = readRenderIndex().filter((e) => e.key !== key);
+  list.push({ key, from, to, kind: kind || 'export', at: Date.now() });
+  writeRenderIndex(list.slice(-200));
+}
+
+ipcMain.handle('render:cacheIndex', () => {
+  // Drop entries whose file has been pruned or cleared away, and hand back the file so
+  // the viewer can play a rendered span instead of compositing it live.
+  const list = [];
+  for (const e of readRenderIndex()) {
+    const file = path.join(renderCacheRoot(), e.key + '.mp4');
+    try { if (fs.existsSync(file)) list.push(Object.assign({}, e, { file })); } catch (err) { /* skip */ }
+  }
+  writeRenderIndex(list.map((e) => ({ key: e.key, from: e.from, to: e.to, kind: e.kind, at: e.at })));
+  return list;
+});
+
+function pruneRenderCache(budgetBytes) {
+  const root = renderCacheRoot();
+  const files = [];
+  for (const name of fs.readdirSync(root)) {
+    try {
+      const f = path.join(root, name);
+      const st = fs.statSync(f);
+      if (st.isFile()) files.push({ f, size: st.size, used: st.mtimeMs });
+    } catch (e) { /* unreadable */ }
+  }
+  let total = files.reduce((n, e) => n + e.size, 0);
+  files.sort((a, b) => a.used - b.used);
+  for (const e of files) {
+    if (total <= budgetBytes) break;
+    try { fs.unlinkSync(e.f); total -= e.size; } catch (err) { /* in use */ }
+  }
+}
+
+function dirSize(dir) {
+  let size = 0, entries = 0;
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (e) { return { size, entries }; }
+  for (const name of names) {
+    const p2 = path.join(dir, name);
+    try {
+      const st = fs.statSync(p2);
+      if (st.isDirectory()) {
+        entries++;
+        for (const f of fs.readdirSync(p2)) {
+          try { size += fs.statSync(path.join(p2, f)).size; } catch (e) { /* racing */ }
+        }
+      } else { entries++; size += st.size; }
+    } catch (e) { /* unreadable */ }
+  }
+  return { size, entries };
+}
+
+ipcMain.handle('text:cacheInfo', () => {
+  const t = dirSize(textCacheRoot());
+  const r = dirSize(renderCacheRoot());
+  return {
+    entries: t.entries + r.entries,
+    size: t.size + r.size,
+    frames: t,
+    renders: r,
+    root: path.join(app.getPath('userData'), 'cache'),
+  };
+});
+
+ipcMain.handle('text:cacheClear', () => {
+  for (const root of [textCacheRoot(), renderCacheRoot()]) {
+    for (const name of fs.readdirSync(root)) {
+      try { fs.rmSync(path.join(root, name), { recursive: true, force: true }); } catch (e) { /* in use */ }
+    }
+  }
+  writeRenderIndex([]);
+  return true;
+});
+
+/** Append a batch of raw RGBA frames to the sequence's single stream file. */
+ipcMain.handle('text:writeFrames', (_e, { dir, data }) => {
+  fs.appendFileSync(path.join(dir, 'frames.raw'), Buffer.from(data));
+  return true;
+});
+
+ipcMain.handle('text:endSeq', (_e, dir) => {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* temp dir */ }
+  return true;
+});
+
+
+
+// -------------------------------------------------------------------- render
+
+// Microsecond precision: rounding to milliseconds was enough to open sub-frame gaps
+// between clips whose durations are not round numbers.
+const r3 = (n) => Math.round(n * 1e6) / 1e6;
+
+/**
+ * Build the ffmpeg argument list for a render job.
+ *
+ * Video: a black base of the full duration; each clip is trimmed, PTS-shifted to its
+ * timeline position, cropped/panned to the output aspect, then overlaid with `enable`.
+ * Clips arrive already sorted bottom track -> top track, so later overlays win.
+ *
+ * Audio: each audible clip is trimmed, delayed to its position, then amixed.
+ */
+function buildArgs(job) {
+  const { width, height, fps, quality, outPath, clips, duration } = job;
+  // Visual clips carry z-order: they arrive bottom track first, so later overlays win.
+  // Text cards sit in the same chain as video, so a card on V2 lands above a clip on V1.
+  const vClips = clips.filter((c) => c.visible);
+  const aClips = clips.filter((c) => c.audible);
+  const args = ['-y', '-hide_banner'];
+
+  // One ffmpeg input per clip occurrence - simple, and lets one file appear many times.
+  const inputs = [];
+  for (const c of clips) {
+    if (c.visible || c.audible) inputs.push(c);
+  }
+  for (const c of inputs) {
+    if (c.kind === 'text' || c.kind === 'trans') {
+      // A raw RGBA stream straight from the canvas - see text:seq for why not PNG.
+      // Transitions bake the same way text does; the only difference is that a
+      // transition's layer is opaque and covers the full frame.
+      args.push('-f', 'rawvideo', '-pixel_format', 'rgba',
+        '-video_size', c.bw + 'x' + c.bh,
+        '-framerate', String(fps),
+        '-i', path.join(c.seqDir, 'frames.raw'));
+    } else {
+      args.push('-i', c.src);
+    }
+  }
+
+  const fc = [];
+  fc.push('color=c=black:s=' + width + 'x' + height + ':r=' + fps + ':d=' + r3(duration) + '[base0]');
+
+  let last = 'base0';
+  vClips.forEach((c, i) => {
+    const idx = inputs.indexOf(c);
+    const dur = c.out - c.in;
+
+    if (c.kind === 'text') {
+      fc.push('[' + idx + ':v]setpts=PTS-STARTPTS+' + r3(c.start) + '/TB,format=rgba[v' + i + ']');
+      // eof_action=pass, not repeat: once a card's frames run out the base must show
+      // through untouched, otherwise the last text frame would stick on screen.
+      fc.push(
+        '[' + last + '][v' + i + ']overlay=' + Math.round(c.bx) + ':' + Math.round(c.by) +
+        ':eof_action=pass:enable=' +
+        "'between(t," + r3(c.start) + ',' + r3(c.start + dur) + ")'[base" + (i + 1) + ']'
+      );
+      last = 'base' + (i + 1);
+      return;
+    }
+
+    const zoom = c.zoom || 1;
+    // Largest source region matching the target aspect, divided by zoom, then panned.
+    const cw = 'min(iw,ih*' + width + '/' + height + ')/' + r3(zoom);
+    const ch = 'min(ih,iw*' + height + '/' + width + ')/' + r3(zoom);
+    const scaleFlags = quality === 'draft' ? 'fast_bilinear' : 'bicubic';
+    fc.push(
+      '[' + idx + ':v]trim=start=' + r3(c.in) + ':duration=' + r3(dur) +
+      ',setpts=PTS-STARTPTS+' + r3(c.start) + '/TB' +
+      ",crop=w='" + cw + "':h='" + ch + "':x='(iw-ow)*" + r3(c.panX) + "':y='(ih-oh)*" + r3(c.panY) + "'" +
+      ',scale=' + width + ':' + height + ':flags=' + scaleFlags + ',setsar=1,fps=' + fps + '[v' + i + ']'
+    );
+    // eof_action=repeat holds the clip's last frame instead of punching through to the
+    // black base. Container duration often outruns the video stream (audio is longer, or
+    // the last frame is short), and `pass` turned that overrun into black frames at every
+    // cut. `enable` still switches the overlay off cleanly outside the clip's window.
+    fc.push(
+      '[' + last + '][v' + i + ']overlay=0:0:eof_action=repeat:enable=' +
+      "'between(t," + r3(c.start) + ',' + r3(c.start + dur) + ")'[base" + (i + 1) + ']'
+    );
+    last = 'base' + (i + 1);
+  });
+  fc.push('[' + last + ']trim=duration=' + r3(duration) + ',format=yuv420p[vout]');
+
+  if (aClips.length) {
+    aClips.forEach((c, i) => {
+      const idx = inputs.indexOf(c);
+      const dur = c.out - c.in;
+      const delay = Math.max(0, Math.round(c.start * 1000));
+      fc.push(
+        '[' + idx + ':a]atrim=start=' + r3(c.in) + ':duration=' + r3(dur) +
+        ',asetpts=PTS-STARTPTS' +
+        ',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo' +
+        ',volume=' + r3(c.volume) + ',adelay=' + delay + '|' + delay + '[a' + i + ']'
+      );
+    });
+    const ins = aClips.map((_, i) => '[a' + i + ']').join('');
+    fc.push(ins + 'amix=inputs=' + aClips.length + ':normalize=0:dropout_transition=0' +
+      ',atrim=duration=' + r3(duration) + ',alimiter=limit=0.98[aout]');
+  } else {
+    args.push('-f', 'lavfi', '-t', String(r3(duration)), '-i', 'anullsrc=r=48000:cl=stereo');
+  }
+
+  args.push('-filter_complex', fc.join(';'));
+  args.push('-map', '[vout]');
+  args.push('-map', aClips.length ? '[aout]' : inputs.length + ':a');
+
+  const presets = {
+    high: ['-c:v', 'libx264', '-preset', 'slow', '-crf', '18'],
+    medium: ['-c:v', 'libx264', '-preset', 'medium', '-crf', '22'],
+    fast: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26'],
+    draft: ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '34', '-tune', 'zerolatency'],
+  };
+  args.push(...(presets[quality] || presets.medium));
+  args.push('-pix_fmt', 'yuv420p', '-r', String(fps));
+  args.push('-c:a', 'aac', '-b:a', quality === 'draft' ? '96k' : '192k', '-ar', '48000');
+  args.push('-movflags', '+faststart', '-t', String(r3(duration)), outPath);
+  return args;
+}
+
+ipcMain.handle('render:pickOutput', async (_e, defaultName) => {
+  const r = await dialog.showSaveDialog(win, {
+    title: 'Render to',
+    defaultPath: defaultName || 'output.mp4',
+    filters: [{ name: 'MP4 video', extensions: ['mp4'] }],
+  });
+  return r.canceled ? null : r.filePath;
+});
+
+ipcMain.handle('render:start', async (_e, job) => {
+  if (activeRender) return { ok: false, error: 'A render is already running.' };
+
+  const key = jobKey(job);
+  const cacheFile = key ? path.join(renderCacheRoot(), key + '.mp4') : null;
+
+  // A preview render has no destination of its own: it IS the cache entry. That is what
+  // keeps reviewing from littering the user's folder with export byproducts.
+  if (job.preview) {
+    if (!cacheFile) return { ok: false, error: 'A preview render needs a cacheKey from the renderer.' };
+    job.outPath = cacheFile;
+  }
+
+  if (key && job.useCache !== false && fs.existsSync(cacheFile)) {
+    try {
+      if (!job.preview) fs.copyFileSync(cacheFile, job.outPath);
+      const now = new Date();
+      fs.utimesSync(cacheFile, now, now);   // most-recently-used, for pruning
+      noteRender(key, job.rangeFrom || 0, job.rangeTo == null ? job.duration : job.rangeTo,
+        job.preview ? 'preview' : 'export');
+      return { ok: true, outPath: job.outPath, file: cacheFile, cached: true };
+    } catch (e) {
+      // A broken cache entry must never block a real render.
+      try { fs.unlinkSync(cacheFile); } catch (err) { /* gone already */ }
+    }
+  }
+
+  let args;
+  try {
+    args = buildArgs(job);
+  } catch (e) {
+    return { ok: false, error: 'Could not build render command: ' + e.message };
+  }
+  // Dropped next to the temp dir so a failed render can be reproduced by hand.
+  try {
+    fs.writeFileSync(path.join(app.getPath('temp'), 'shortcut-last-ffmpeg-args.txt'), args.join('\n'), 'utf8');
+  } catch (e) { /* diagnostics only */ }
+
+  return await new Promise((resolve) => {
+    const p = spawn(ffmpegPath, args, { windowsHide: true });
+    activeRender = p;
+    let log = '';
+    p.stderr.on('data', (d) => {
+      const s = d.toString();
+      log += s;
+      if (log.length > 200000) log = log.slice(-100000);
+      const m = /time=(\d+):(\d+):(\d+\.\d+)/.exec(s);
+      if (m && win) {
+        const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+        win.webContents.send('render:progress', { time: t, total: job.duration });
+      }
+    });
+    p.on('error', (err) => { activeRender = null; resolve({ ok: false, error: err.message }); });
+    p.on('close', (code) => {
+      const wasCancelled = activeRender === null;
+      activeRender = null;
+      if (code === 0) {
+        try {
+          if (!key) throw new Error('uncacheable job');
+          // A preview render wrote straight into the cache; an export needs copying in.
+          if (!job.preview) fs.copyFileSync(job.outPath, cacheFile);
+          noteRender(key, job.rangeFrom || 0, job.rangeTo == null ? job.duration : job.rangeTo,
+            job.preview ? 'preview' : 'export');
+          pruneRenderCache(3 * 1024 * 1024 * 1024);   // keep finished renders under ~3 GB
+        } catch (e) { /* caching is best-effort */ }
+        resolve({ ok: true, outPath: job.outPath, file: cacheFile, cached: false });
+      }
+      else if (wasCancelled) resolve({ ok: false, cancelled: true, error: 'Render cancelled.' });
+      else resolve({ ok: false, error: log.split('\n').slice(-25).join('\n') || 'ffmpeg exited ' + code });
+    });
+  });
+});
+
+ipcMain.handle('render:cancel', () => {
+  if (activeRender) {
+    const p = activeRender;
+    activeRender = null;
+    p.kill();
+    return true;
+  }
+  return false;
+});
+
+let saveThenQuit = false;
+
+ipcMain.handle('app:setDirty', (_e, dirty) => { projectDirty = !!dirty; });
+
+/** The renderer reports the outcome of a save it was asked to do before quitting. */
+ipcMain.handle('app:saveResult', (_e, saved) => {
+  if (saveThenQuit && saved) {
+    saveThenQuit = false;
+    allowClose = true;
+    if (win) win.close();
+  } else {
+    saveThenQuit = false;   // save cancelled or failed: stay open
+  }
+});
+
+/**
+ * Test-only: inject REAL (trusted) input events.
+ *
+ * Synthetic MouseEvents dispatched from a script never perform the default action, so they
+ * cannot focus an input or type into one - a smoke test using them cannot tell a working
+ * field from a dead one. sendInputEvent goes through the same path as a physical mouse or
+ * keyboard, so it can. Only available while a smoke script is driving the app.
+ */
+ipcMain.handle('debug:input', (_e, ev) => {
+  if (!process.env.SHORTCUT_SMOKE || !win) return false;
+  win.webContents.sendInputEvent(ev);
+  return true;
+});
+
+/** Test-only: write a file, so a smoke script can make its own fixtures. */
+ipcMain.handle('debug:writeFile', (_e, { file, data }) => {
+  if (!process.env.SHORTCUT_SMOKE) return false;
+  fs.writeFileSync(file, Buffer.from(data));
+  return true;
+});
+
+ipcMain.handle('shell:showItem', (_e, p) => { shell.showItemInFolder(p); });
+ipcMain.handle('app:title', (_e, t) => { if (win) win.setTitle(t); });

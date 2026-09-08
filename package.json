@@ -1,0 +1,19 @@
+{
+  "name": "shortcut-editor",
+  "version": "1.0.0",
+  "description": "Short-form (9:16) video editor for Windows",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^32.2.0"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0"
+  }
+}

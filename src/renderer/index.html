@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ShortCut</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ================= LEFT THIRD: the short itself, nothing else ================= -->
+    <aside id="left">
+      <div class="panel-head">
+        <span class="title">Preview</span>
+        <span id="aspectBadge" class="badge">9:16</span>
+      </div>
+
+      <div id="stage">
+        <canvas id="preview" width="1080" height="1920"></canvas>
+        <div id="frameHint" class="hint">Drag on the preview to reposition the frame</div>
+      </div>
+
+      <div id="transport">
+        <button id="btnStart" title="Go to start (Home)">&#9198;</button>
+        <button id="btnPrevFrame" title="Previous frame (Left)">&#9204;</button>
+        <button id="btnPlay" class="primary" title="Play / Pause (Space)">&#9654;</button>
+        <button id="btnNextFrame" title="Next frame (Right)">&#9205;</button>
+        <button id="btnEnd" title="Go to end (End)">&#9197;</button>
+        <span id="timecode" class="tc">00:00:00.00 / 00:00:00.00</span>
+      </div>
+
+    </aside>
+
+    <!-- ====================== RIGHT TWO THIRDS: work area ====================== -->
+    <main id="right">
+      <header id="toolbar">
+        <div class="group">
+          <button id="btnImport" title="Import media (Ctrl+I)">Import</button>
+          <button id="btnImportFolder" title="Import folder (Ctrl+Shift+I)">Import folder</button>
+        </div>
+        <div class="sep"></div>
+        <div class="group">
+          <button id="btnNew" title="New project (Ctrl+N)">New</button>
+          <button id="btnOpen" title="Open project (Ctrl+O)">Open</button>
+          <button id="btnSave" title="Save project (Ctrl+S)">Save</button>
+          <button id="btnSaveAs" title="Save as (Ctrl+Shift+S)">Save as</button>
+        </div>
+        <div class="sep"></div>
+        <div class="group">
+          <button id="btnSplit" title="Split at playhead (S)">Split</button>
+          <button id="btnDelete" title="Delete selected (Del)">Delete</button>
+          <button id="btnRipple" title="Ripple delete: close the gap (Shift+Del)">Ripple del</button>
+          <button id="btnLink" title="Link A/V (Ctrl+L)">Link</button>
+          <button id="btnUnlink" title="Unlink A/V (Ctrl+Shift+L)">Unlink</button>
+          <button id="btnDuplicate" title="Duplicate selected (Ctrl+D)">Duplicate</button>
+        </div>
+        <div class="sep"></div>
+        <div class="group">
+          <button id="btnUndo" title="Undo (Ctrl+Z)">Undo</button>
+          <button id="btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+        </div>
+        <div class="spacer"></div>
+        <div class="group">
+          <button id="btnAddText" class="primary" title="Add a text card at the playhead (Ctrl+T)">+ Text</button>
+          <button id="btnAddTransition" title="Drop a transition on the nearest cut (T). Double-clicking a cut does the same.">+ Transition</button>
+          <button id="btnAddVideoTrack" title="Add video track">+ V track</button>
+          <button id="btnAddAudioTrack" title="Add audio track">+ A track</button>
+          <label class="snap" title="Toggle snapping (N)"><input id="snapToggle" type="checkbox" checked /> Snap</label>
+          <label class="snap" title="Play rendered spans from the render cache instead of compositing them live (P)"><input id="usePreviewRender" type="checkbox" checked /> Use render</label>
+          <label class="snap" title="Resolution the viewer works at. Lower is faster to draw AND faster to render.">Preview
+            <select id="previewScale">
+              <option value="1">Full</option>
+              <option value="0.5" selected>1/2</option>
+              <option value="0.25">1/4</option>
+            </select>
+          </label>
+        </div>
+        <div class="sep"></div>
+        <button id="btnShortcuts" class="mini">Shortcuts</button>
+      </header>
+
+      <section id="timelineWrap">
+        <div id="rulerRow">
+          <div id="headSpacer">
+            <button id="btnZoomOut" class="mini" title="Zoom out (-)">-</button>
+            <button id="btnZoomIn" class="mini" title="Zoom in (+)">+</button>
+            <button id="btnZoomFit" class="mini" title="Fit (Shift+Z)">Fit</button>
+          </div>
+          <div id="rulerScroll"><canvas id="ruler" height="38"></canvas></div>
+        </div>
+        <div id="tracksScroll">
+          <div id="trackHeads"></div>
+          <div id="tracksArea">
+            <div id="tracks"></div>
+            <div id="rangeOverlay"><div class="dim before"></div><div class="dim after"></div></div>
+            <div id="playhead"></div>
+          </div>
+        </div>
+      </section>
+
+      <footer id="bottom">
+        <div id="renderPanel">
+          <div class="panel-head"><span class="title">Render</span></div>
+          <div class="render-grid">
+            <label>Preset
+              <select id="preset">
+                <option value="1080x1920" selected>1080 x 1920 - Vertical (main)</option>
+                <option value="720x1280">720 x 1280 - Vertical (light)</option>
+                <option value="1920x1080">1920 x 1080 - Horizontal</option>
+                <option value="1280x720">1280 x 720 - Horizontal (light)</option>
+              </select>
+            </label>
+            <label>Quality
+              <select id="quality">
+                <option value="high">High (slow, crf 18)</option>
+                <option value="medium" selected>Medium (crf 22)</option>
+                <option value="fast">Fast (crf 26)</option>
+                <option value="draft">Draft - very low / very quick</option>
+              </select>
+            </label>
+            <label>FPS
+              <select id="fps">
+                <option value="24">24</option>
+                <option value="25">25</option>
+                <option value="30" selected>30</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+            <label>Range
+              <select id="renderRange" title="Render the whole timeline, or just between the in/out marks">
+                <option value="all" selected>Whole project</option>
+                <option value="marks">In to Out marks</option>
+              </select>
+            </label>
+            <button id="btnRenderPreview" class="primary" title="Render this range into the viewer (Ctrl+R). Nothing is written to your folders.">Render preview</button>
+            <button id="btnRenderFull" title="Render the preview again, ignoring the cache">Re-render</button>
+            <button id="btnRender" title="Write a finished file to disk (Ctrl+Shift+R)">Export...</button>
+            <button id="btnCancelRender" disabled>Cancel</button>
+            <button id="btnClearCache" title="Delete cached bakes and renders">Clear cache</button>
+            <span id="rangeInfo" class="range-info"></span>
+            <span id="cacheInfo" class="cache-info"></span>
+          </div>
+          <div id="renderStatus" class="status"></div>
+          <div id="renderBarWrap"><div id="renderBar"></div></div>
+        </div>
+        <div id="log"></div>
+      </footer>
+    </main>
+
+    <!-- ===== RIGHT COLUMN: inspector - framing, clip details, text card editor ===== -->
+    <aside id="inspectorCol">
+      <div id="inspectorResize" title="Drag to resize this panel"></div>
+
+      <div class="panel-head" id="binHead">
+        <span class="title">QuickBin</span>
+        <span id="binMeta" class="tc-meta"></span>
+        <button id="btnBinCollapse" class="mini" title="Show / hide the bin (B)">&minus;</button>
+      </div>
+      <div id="binBar">
+        <button id="btnBinAdd" class="mini" title="Add files to the bin">+ Files</button>
+        <button id="btnBinAddFolder" class="mini" title="Add a folder, mirroring its subfolders">+ Folder</button>
+        <button id="btnBinNewFolder" class="mini" title="Create an empty folder in the bin">New folder</button>
+        <button id="btnBinUse" class="mini" title="Put the selection on the timeline at the playhead">Use</button>
+        <button id="btnBinRemove" class="mini" title="Remove from the bin. Nothing is deleted from disk.">Remove</button>
+      </div>
+      <div id="quickBin"></div>
+
+      <div class="panel-head"><span class="title">Framing</span>
+        <button id="btnResetFrame" class="mini" title="Reset framing (Shift+R)">Reset</button>
+      </div>
+      <div id="framing" class="pad">
+        <div class="row"><span>Pan X</span>
+          <input id="panX" type="range" min="0" max="1" step="0.005" value="0.5" />
+          <input id="panXv" class="tc-num" type="number" min="0" max="1" step="0.005" value="0.5" title="Type an exact value" />
+          <button class="tc-reset" data-reset="panX" title="Reset to 0.5">&#8634;</button>
+        </div>
+        <div class="row"><span>Pan Y</span>
+          <input id="panY" type="range" min="0" max="1" step="0.005" value="0.5" />
+          <input id="panYv" class="tc-num" type="number" min="0" max="1" step="0.005" value="0.5" title="Type an exact value" />
+          <button class="tc-reset" data-reset="panY" title="Reset to 0.5">&#8634;</button>
+        </div>
+        <div class="row"><span>Zoom</span>
+          <input id="zoom" type="range" min="1" max="4" step="0.01" value="1" />
+          <input id="zoomv" class="tc-num" type="number" min="1" max="8" step="0.01" value="1" title="Type an exact value" />
+          <button class="tc-reset" data-reset="zoom" title="Reset to 1">&#8634;</button>
+        </div>
+        <div class="row btns">
+          <button id="btnFrameLeft" class="mini">Left</button>
+          <button id="btnFrameCenter" class="mini">Center</button>
+          <button id="btnFrameRight" class="mini">Right</button>
+          <button id="btnFrameAll" class="mini" title="Copy this framing to every clip">Apply to all</button>
+        </div>
+      </div>
+
+      <div class="panel-head"><span class="title">Clip</span></div>
+      <div id="inspector" class="pad">
+        <div class="empty">No clip selected.</div>
+      </div>
+
+
+      <div class="panel-head" id="transPanelHead" hidden>
+        <span class="title">Transition</span>
+        <span id="transMeta" class="tc-meta"></span>
+        <button id="btnDelTransition" class="mini" title="Remove this transition (Del)">&times;</button>
+      </div>
+      <div id="transPanel" hidden></div>
+
+      <div class="panel-head" id="textPanelHead" hidden>
+        <span class="title">Text card</span>
+        <span id="textCardMeta" class="tc-meta"></span>
+        <button id="btnCloseText" class="mini" title="Deselect the card (Esc)">&times;</button>
+      </div>
+      <div id="textPanel" hidden></div>
+    </aside>
+  </div>
+
+  <div id="dropOverlay"><div>Drop files or a folder to import</div></div>
+
+  <div id="modal" hidden>
+    <div class="sheet">
+      <h2>Keyboard shortcuts</h2>
+      <div id="shortcutList"></div>
+      <button id="modalClose" class="primary">Close</button>
+    </div>
+  </div>
+
+  <script src="text/model.js"></script>
+  <script src="transitions.js"></script>
+  <script src="waveform.js"></script>
+  <script src="quickbin.js"></script>
+  <script src="text/draw.js"></script>
+  <script src="text/ui.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
