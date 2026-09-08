@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are fourteen suites:
+There are fifteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -69,6 +69,12 @@ There are fourteen suites:
   loudness passes, the chain surviving a save/reload, one undo removing a whole chain, the
   preview mix, and — the load-bearing one — that a clip with **no** effects still produces
   a byte-identical argument list to the one `buildArgs()` emitted before any of it existed.
+- `tools/smoke-select.js` — window (marquee) selection and Close gaps: what a box catches
+  in time and in tracks, that it extends to link groups and skips locked tracks, that a
+  press which never moves is still a click, and for Close gaps that whole link groups
+  move, that nothing outside the selection does, that overlapping groups are left alone,
+  and that the pass is one undo entry — or none at all when there is no gap. It also
+  covers Tighten over a genuine multi-selection.
 - `tools/smoke-tighten.js` — Tighten: the real `silencedetect` handler over a fixture
   with two known silences (and its cache, including the noise floor being part of the
   key), the threshold/pad maths, the cut list, that picture and sound come out of a
@@ -123,6 +129,11 @@ smoke script is running. `tools/smoke-input.js` uses it.
 Note the scripts run in the *page's* scope, so a syntax error in your script reports only
 as "Script failed to execute" — wrap the body in `try/catch` and return `e.stack` if you
 need to see what went wrong.
+
+**Run the suites one at a time.** They share the render cache, the text bake cache and
+the QuickBin, so two electron instances racing each other produce failures that belong to
+neither run — `smoke-textrender.js` reporting `cached=false` on a job it just rendered is
+the usual symptom.
 
 **A smoke run force-closes.** Every suite dirties the project the moment it imports a clip,
 and the unsaved-changes guard on `win.on('close')` would then `preventDefault()` and open a
@@ -462,6 +473,15 @@ and a +6 dB gain effect could not otherwise be heard at all. Two traps that shap
 This is the one place in the app where preview and render deliberately disagree, and it is
 the reason the panel carries a line of text saying so - and the reason the loudness meter
 above reads the preview mix rather than claiming to predict the export.
+
+**Everything audible goes through the master bus**, including a rendered span's player.
+Inside a rendered span the viewer plays a finished MP4 rather than compositing, and that
+file's audio *is* the mix - but it used to reach the speakers directly, so the loudness
+meter went dead the moment the playhead crossed into a rendered band and came back to life
+on the way out. `previewBandNode()` routes each span's element through the same
+`createMediaElementSource -> gain -> master` path a clip's audio takes, under the same two
+rules: only while the context is running, and the node is dropped with the element,
+because `createMediaElementSource` cannot be undone.
 
 ### Tighten (silence removal)
 
@@ -1116,6 +1136,39 @@ picture and sound drift apart.
 acceptable for a local tool with no remote content; if you ever load remote pages, move
 media through a custom protocol handler instead.
 
+### Selecting
+
+Clicking a clip selects its whole **link group**, so an imported A/V pair is one thing to
+click and one thing to drag. Dragging on empty timeline draws a **selection box**
+(`startMarquee()`): it catches every clip the box overlaps — overlap, not containment, so
+a box drawn across the middle of a long clip includes it — in both time and track, then
+extends what it caught to full link groups for the same reason clicking does. Locked
+tracks are skipped, shift adds to the selection, and a press that never moves more than
+3px is still a plain click, which on empty timeline clears the selection. Ctrl+drag stays
+the playhead scrub.
+
+`Ctrl+A` selects everything. A selection of several clips that all share one `linkId` is
+**not** a multi-selection — `singleUnit()` treats it as the one pair it is, which is why
+the inspector shows framing and audio for a clicked A/V pair rather than "2 clips
+selected". A real multi-selection shows the count, and still offers Tighten, because
+Tighten works over as many link groups as are selected.
+
+### Close gaps
+
+`closeGaps()` pulls the selected clips together: the selection is taken as link groups
+ordered by start, the earliest stays put, and each later group slides left until it butts
+against the end of everything before it.
+
+Two rules make it predictable rather than clever:
+
+- **Whole groups move, never halves.** Shifting the two halves of a pair independently is
+  the same sync bug that Tighten's ripple is written to avoid.
+- **It is local, not a ripple.** Nothing outside the selection moves, and groups that
+  already overlap are left where they are — there is no gap between them to close.
+
+One `pushUndo()` for the whole pass, and **none at all** if there was no gap to close: an
+undo entry that restores an identical timeline is worse than no button at all.
+
 ### Snapping
 
 `snapDetail(t, movingIds)` is the single source of truth: 0, the playhead, the in/out
@@ -1189,6 +1242,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A typewriter unit effect | a `case` in `unitTransform()` (`text/draw.js`) and an option in the `params.effect` select (`text/ui.js`) |
 | A keyframable property | `KEYABLE` in `text/model.js`, read it out in `evalCard`, and give it a slider range in `keyframeTrack()` |
 | A toolbar button | `index.html` (`#toolbar`) + one `addEventListener` in section 10 |
+| A timeline-wide editing op | a function in `app.js` §7 + a button in `index.html` + one `addEventListener` in section 10 + a row in `SHORTCUTS` and the `keydown` handler |
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
@@ -1205,6 +1259,8 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 
 ### Known limits
 
+- Close gaps is local: clips outside the selection stay where they are, and groups that
+  already overlap are not pulled further together — see "Close gaps".
 - Tighten only cuts into the selection's own link groups. Other clips shift with the
   ripple but are never sliced, text cards shift but are never cut, and a locked track is
   left entirely alone — see "Tighten".

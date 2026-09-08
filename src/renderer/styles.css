@@ -128,6 +128,12 @@ select, input[type=number], input[type=text] {
 }
 #tracksArea { position: relative; flex: 1 0 auto; }
 #tracks { position: relative; }
+/* The window-selection box. Pointer-events off so the drag keeps reaching the document. */
+#marquee {
+  position: absolute; z-index: 6; pointer-events: none;
+  border: 1px solid var(--accent, #4da3ff);
+  background: rgba(77, 163, 255, .14);
+}
 
 .track-head {
   border-bottom: 1px solid var(--line); padding: 4px 6px;

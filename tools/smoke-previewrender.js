@@ -161,6 +161,29 @@
       ok('stop actually stops the rendered span', !!el2 && el2.paused,
         el2 ? 'paused=' + el2.paused : 'no element');
       ok('stop clears the playing flag', !state.playing);
+
+      // A rendered span's audio IS the mix, so it has to arrive at the master bus like
+      // everything else - the meter hangs off master, and a span wired straight to the
+      // speakers is what made the meter go dead inside a rendered band and come back on
+      // the way out.
+      if (previewMix.ctx && previewMix.ctx.state === 'running') {
+        ok('the rendered span is routed through the preview mix',
+          previewMix.bandNodes.has(band2.key),
+          [...previewMix.bandNodes.keys()].length + ' band node(s)');
+        ok('and it lands on the master bus, not the speakers',
+          !!previewMix.master &&
+          (previewMix.bandNodes.get(band2.key) || {}).gain !== undefined);
+        ok('its element runs at unity, with the node carrying the level',
+          !!el2 && el2.volume === 1 && !el2.muted, el2 ? String(el2.volume) : '');
+      } else {
+        results.push('SKIP  the rendered span is routed through the preview mix   ' +
+          'no running AudioContext (headless machine with no audio device)');
+      }
+
+      // Dropping the span must drop its node too: createMediaElementSource cannot be
+      // undone, so a leaked node would keep a dead element connected to the bus.
+      dropPreviewEl(band2.key);
+      ok('dropping the span drops its mix node', !previewMix.bandNodes.has(band2.key));
     }
 
     // ===================================================== preview resolution

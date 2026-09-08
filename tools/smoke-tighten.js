@@ -72,6 +72,7 @@
       state.tighten.noise === TIGHTEN_DEFAULTS.noise);
 
     // =============================================== 3. the cut list
+    markClean();   // else newProject()'s unsaved-changes confirm() hangs the run
     newProject();
     await importPaths([SRC]);
     const vT = state.tracks.find((t) => t.type === 'video');
@@ -179,6 +180,7 @@
     undo();
 
     // =============================================== 6. what the ripple may cut
+    markClean();   // else newProject()'s unsaved-changes confirm() hangs the run
     newProject();
     await importPaths([SRC]);
     const vTrack = state.tracks.find((t) => t.type === 'video');

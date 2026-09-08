@@ -177,6 +177,8 @@ const previewMix = {
   nodes: new Map(),
   /** Every clip gain lands here, so the meter sees the mix rather than one clip. */
   master: null,
+  /** The same, per rendered span - see previewBandNode(). Keyed by band key. */
+  bandNodes: new Map(),
   /** The metering session (Meter.Session) and its worklet node, once it is running. */
   session: null,
   meterNode: null,
@@ -435,6 +437,42 @@ function previewGainNode(clip, el) {
   } catch (e) {
     return null;   // already routed, or the element is not eligible - fall back below
   }
+}
+
+/**
+ * Route a rendered span's player through the master bus too.
+ *
+ * Inside a rendered span the viewer plays a finished MP4 instead of compositing, and that
+ * file's audio IS the mix - but it was reaching the speakers directly, so the loudness
+ * meter went dead the moment the playhead crossed into a rendered band and came back to
+ * life on the way out. The meter hangs off `previewMix.master`, so anything audible has
+ * to arrive there. Same rules as a clip's node: only while the context is running, and
+ * `createMediaElementSource` cannot be undone, so it is created once per element and
+ * disconnected with it.
+ */
+function previewBandNode(key, el) {
+  const ctx = previewMix.ctx;
+  if (!ctx || ctx.state !== 'running') return null;
+  const have = previewMix.bandNodes.get(key);
+  if (have) return have.el === el ? have : null;
+  try {
+    const src = ctx.createMediaElementSource(el);
+    const gain = ctx.createGain();
+    src.connect(gain);
+    gain.connect(previewMix.master || ctx.destination);
+    const node = { src, gain, el };
+    previewMix.bandNodes.set(key, node);
+    return node;
+  } catch (e) {
+    return null;
+  }
+}
+
+function dropPreviewBandNode(key) {
+  const n = previewMix.bandNodes.get(key);
+  if (!n) return;
+  try { n.src.disconnect(); n.gain.disconnect(); } catch (e) { /* already gone */ }
+  previewMix.bandNodes.delete(key);
 }
 
 function dropPreviewGain(clipId) {
@@ -1280,7 +1318,14 @@ function renderInspector() {
   // and no inspector at all: no framing, no volume, no audio effects. The pair is shown
   // as the video clip, which is the half with a picture, framing and a name on it.
   const row = singleUnit(sel);
-  if (!row) { box.innerHTML = '<div class="empty">' + sel.length + ' clips selected.</div>'; return; }
+  if (!row) {
+    // A genuine multi-selection has no single clip to describe - but Tighten works over
+    // as many link groups as are selected, so it is offered here rather than being
+    // reachable only one clip at a time.
+    box.innerHTML = '<div class="empty">' + sel.length + ' clips selected.</div>';
+    if (sel.some((x) => tightenAudioFor(x.clip))) box.appendChild(tightenPanel());
+    return;
+  }
   const c = row.clip;
   const isText = c.kind === 'text';
   const source = isText ? 'text card'
@@ -1772,7 +1817,9 @@ $('#tracks').addEventListener('mousedown', (e) => {
 
   const clipEl = e.target.closest('.clip');
   if (!clipEl) {
-    if (!e.shiftKey) setSelection([], false);
+    // Ctrl+drag is the playhead scrub, which #tracksArea handles; everything else on
+    // empty timeline is a selection box.
+    if (!e.ctrlKey && !e.metaKey) startMarquee(e, e.shiftKey);
     return;
   }
   const found = findClip(clipEl.dataset.clipId);
@@ -1792,6 +1839,139 @@ $('#tracks').addEventListener('mousedown', (e) => {
   if (handle) startTrim(e, c, handle.classList.contains('l') ? 'in' : 'out');
   else startMove(e, c);
 });
+
+/**
+ * Window (marquee) selection: drag a box over empty timeline to select what it touches.
+ *
+ * It starts on a mousedown that hits no clip and no transition. A press that never moves
+ * is still a click, and a click on empty timeline still clears the selection - the 3px
+ * threshold is what keeps both behaviours out of each other's way.
+ *
+ * A clip is caught if the box overlaps it at all, in BOTH time and track: overlap rather
+ * than containment, because a box drawn across the middle of a long clip is obviously
+ * meant to include it. Locked tracks are skipped, exactly as a click on one is ignored.
+ *
+ * Whatever is caught is then extended to full link groups, so a box drawn over the audio
+ * lane alone still takes the picture with it. Selecting half of an A/V pair and then
+ * dragging it is how sync gets broken, and clicking already behaves this way.
+ */
+function startMarquee(e, additive) {
+  const area = $('#tracksArea');
+  const areaRect = area.getBoundingClientRect();
+  const tracksRect = $('#tracks').getBoundingClientRect();
+  const x0 = e.clientX, y0 = e.clientY;
+
+  const box = document.createElement('div');
+  box.id = 'marquee';
+  box.hidden = true;
+  area.appendChild(box);
+
+  const base = additive ? new Set(state.selection) : new Set();
+  let live = false;
+
+  const paint = (ev) => {
+    const l = Math.min(x0, ev.clientX), r = Math.max(x0, ev.clientX);
+    const t = Math.min(y0, ev.clientY), b = Math.max(y0, ev.clientY);
+    box.hidden = false;
+    box.style.left = (l - areaRect.left) + 'px';
+    box.style.top = (t - areaRect.top) + 'px';
+    box.style.width = (r - l) + 'px';
+    box.style.height = (b - t) + 'px';
+    return { l, r, t, b };
+  };
+
+  const hits = (r) => {
+    const t0 = Math.max(0, (r.l - tracksRect.left) / state.pxPerSec);
+    const t1 = Math.max(0, (r.r - tracksRect.left) / state.pxPerSec);
+    const i0 = Math.floor((r.t - tracksRect.top) / TRACK_H);
+    const i1 = Math.floor((r.b - tracksRect.top) / TRACK_H);
+    const out = [];
+    state.tracks.forEach((track, i) => {
+      if (track.locked || i < i0 || i > i1) return;
+      for (const c of track.clips) {
+        if (c.start < t1 && clipEnd(c) > t0) out.push(c);
+      }
+    });
+    return out;
+  };
+
+  const onMove = (ev) => {
+    if (!live && Math.abs(ev.clientX - x0) < 3 && Math.abs(ev.clientY - y0) < 3) return;
+    live = true;
+    const ids = new Set(base);
+    for (const c of hits(paint(ev))) for (const m of linkGroup(c)) ids.add(m.id);
+    state.selection = ids;
+    state.selTransition = null;
+    renderLanes();
+  };
+
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    box.remove();
+    // A press that never became a drag is a plain click on empty timeline.
+    if (!live && !additive) setSelection([], false);
+    else renderInspector();
+  };
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}
+
+/**
+ * Close the gaps between the selected clips.
+ *
+ * Local, not a ripple: nothing outside the selection moves. The selection is taken as
+ * LINK GROUPS ordered by start, the earliest stays put, and each later group slides left
+ * until it butts against the end of everything before it. Moving whole groups is what
+ * keeps a pair's picture and sound together - shifting the two halves independently is
+ * the same sync bug in a different coat.
+ *
+ * Groups that already overlap are left where they are: there is no gap between them to
+ * close, and pulling one further left would only bury it deeper under the other.
+ */
+function closeGaps() {
+  const seen = new Set();
+  const units = [];
+  for (const { clip } of selectedClips()) {
+    const key = clip.linkId || clip.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const clips = linkGroup(clip).filter((c) => {
+      const row = allClips().find((x) => x.clip === c);
+      return row && !row.track.locked;
+    });
+    if (!clips.length) continue;
+    units.push({
+      clips,
+      start: Math.min(...clips.map((c) => c.start)),
+      end: Math.max(...clips.map((c) => clipEnd(c))),
+    });
+  }
+  if (units.length < 2) { log('Select at least two clips to close the gaps between them.'); return null; }
+
+  units.sort((a, b) => a.start - b.start);
+  let cursor = units[0].end;
+  let moved = 0, closed = 0;
+  for (let i = 1; i < units.length; i++) {
+    const u = units[i];
+    const shift = u.start - cursor;
+    if (shift > 1e-6) {
+      if (!moved) pushUndo();               // snapshot once, and only if something moves
+      for (const c of u.clips) c.start -= shift;
+      moved++;
+      closed += shift;
+    }
+    cursor = Math.max(cursor, u.end - Math.max(0, shift));
+  }
+  if (!moved) { log('No gaps between the selected clips.'); return null; }
+
+  sortTracks();
+  markDirty();
+  renderAll();
+  log('Closed ' + moved + ' gap(s), ' + closed.toFixed(2) + 's.');
+  return { moved, closed };
+}
 
 function startMove(e, anchor) {
   pushUndo();
@@ -2073,6 +2253,7 @@ function previewElFor(band) {
 function dropPreviewEl(key) {
   const el = previewEls.get(key);
   if (el) { try { el.pause(); } catch (e) {} el.removeAttribute('src'); el.load(); }
+  dropPreviewBandNode(key);
   previewEls.delete(key);
 }
 
@@ -2105,6 +2286,12 @@ function syncPreviewBand(band) {
   const el = previewElFor(band);
   const target = state.playhead - band.from;
   el.muted = false;
+  // The audio context only exists once something has played; until then the element's own
+  // volume carries the sound, exactly as a clip's does before its gain node is attached.
+  if (previewMix.ctx) {
+    const node = previewBandNode(band.key, el);
+    if (node) { node.gain.gain.value = 1; el.volume = 1; }
+  }
   if (state.playing) {
     if (!el.seeking && Math.abs(el.currentTime - target) > 0.3) el.currentTime = target;
     if (el.paused) el.play().catch(() => {});
@@ -3669,6 +3856,7 @@ $('#btnSaveAs').addEventListener('click', () => saveProject(true));
 $('#btnSplit').addEventListener('click', splitAtPlayhead);
 $('#btnDelete').addEventListener('click', () => deleteSelected(false));
 $('#btnRipple').addEventListener('click', () => deleteSelected(true));
+$('#btnCloseGaps').addEventListener('click', closeGaps);
 $('#btnLink').addEventListener('click', linkSelected);
 $('#btnUnlink').addEventListener('click', unlinkSelected);
 $('#btnDuplicate').addEventListener('click', duplicateSelected);
@@ -3778,6 +3966,8 @@ const SHORTCUTS = [
   ['S or Ctrl+K', 'Split at playhead'],
   ['Delete', 'Delete selected clips'],
   ['Shift+Delete', 'Ripple delete (close the gap)'],
+  ['G', 'Close the gaps between the selected clips'],
+  ['Drag on empty timeline', 'Window-select the clips the box touches'],
   ['I / O', 'Set the in / out mark for a ranged render'],
   ['X', 'Clear the in / out marks'],
   ['Alt+I / Alt+O', 'Trim the selected clip in / out to the playhead'],
@@ -3846,6 +4036,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'i') { e.altKey ? trimToPlayhead('in') : setInPoint(); }
   else if (e.key.toLowerCase() === 'o') { e.altKey ? trimToPlayhead('out') : setOutPoint(); }
   else if (e.key.toLowerCase() === 'x') { clearRange(); }
+  else if (e.key.toLowerCase() === 'g' && !ctrl) { closeGaps(); }
   else if (e.key.toLowerCase() === 'p') {
     const cb = $('#usePreviewRender');
     cb.checked = !cb.checked;
