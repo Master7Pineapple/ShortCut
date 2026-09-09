@@ -36,6 +36,7 @@
         <div class="group">
           <button id="btnImport" title="Import media (Ctrl+I)">Import</button>
           <button id="btnImportFolder" title="Import folder (Ctrl+Shift+I)">Import folder</button>
+          <button id="btnRecord" title="Record the screen, with cursor telemetry (Ctrl+Shift+F9 stops)">Record</button>
         </div>
         <div class="sep"></div>
         <div class="group">
@@ -248,6 +249,24 @@
 
   <div id="dropOverlay"><div>Drop files or a folder to import</div></div>
 
+  <div id="recModal" hidden>
+    <div class="sheet">
+      <h2>Record the screen</h2>
+      <p class="rec-note">A whole display also records what the cursor did - position, and
+        clicks - so auto-zoom and click effects have exact data instead of guesses. A single
+        window records picture only.</p>
+      <div id="recSources" class="rec-grid"></div>
+      <div class="rec-actions">
+        <label class="rec-opt"><input type="checkbox" id="recCursor" checked /> Cursor telemetry</label>
+        <span id="recStatus" class="tc-meta"></span>
+        <span class="grow"></span>
+        <button id="recStart" class="primary">Record</button>
+        <button id="recStop" disabled title="Ctrl+Shift+F9 works from any app">Stop</button>
+        <button id="recClose" class="mini">Close</button>
+      </div>
+    </div>
+  </div>
+
   <div id="modal" hidden>
     <div class="sheet">
       <h2>Keyboard shortcuts</h2>
@@ -257,6 +276,7 @@
   </div>
 
   <script src="../audiofx.js"></script>
+  <script src="../screen.js"></script>
   <script src="../captions.js"></script>
   <script src="meter.js"></script>
   <script src="anim.js"></script>

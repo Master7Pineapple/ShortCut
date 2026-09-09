@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ShortCut recorder</title>
+</head>
+<!--
+  The capture host. This window is never shown.
+
+  Electron's desktopCapturer hands out a source id, but the actual capture is
+  getUserMedia + MediaRecorder, which only exist in a renderer - so a renderer has to
+  host it. It is not the editor window, for one blunt reason: the editor window is on
+  the screen being recorded, and a renderer doing H.264 encoding on the same thread as
+  the timeline would make both of them stutter.
+
+  It stays hidden because it would otherwise appear in its own recording. The controls
+  the user sees live in the editor's Record panel, and Ctrl+Shift+F9 stops a recording
+  from anywhere - see "The screen recorder" in the README.
+-->
+<body>
+  <script src="recorder.js"></script>
+</body>
+</html>

@@ -607,6 +607,11 @@ async function importPaths(paths, opts) {
         srcW: m.width, srcH: m.height, fps: m.fps,
         panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
         linkId: m.hasAudio ? linkId : null,
+        // Screen-recording telemetry, when the file has a sidecar next to it. ABSENT
+        // otherwise, which is the normal case for anything not recorded in ShortCut -
+        // see the contract at the top of src/screen.js. Plain JSON, like everything else
+        // on a clip, because undo is JSON.stringify of the track list.
+        ...(m.screen ? { screen: m.screen } : {}),
       });
       if (m.hasAudio) {
         at_.clips.push({
@@ -1434,6 +1439,24 @@ function renderTransitionPanel() {
   host.appendChild(body);
 }
 
+/**
+ * The inspector's telemetry line: what a screen recording knows about the cursor.
+ *
+ * Empty for everything that is not a video clip with telemetry on it, which is most
+ * clips - the row appears when there is something to report and stays out of the way
+ * otherwise.
+ */
+function telemetryRow(c) {
+  if (!c || c.kind !== 'video') return '';
+  const t = clipTelemetry(c);
+  if (!t) return '';
+  const clicks = t.events.filter((e) => e.type === ScreenTel.DOWN).length;
+  return '<b>Cursor</b><span title="Recorded alongside the capture. Timed from the ' +
+    'video\'s first frame, and normalised to the captured display.">' +
+    t.events.length + ' samples' + (t.clicks ? ', ' + clicks + ' clicks' : ', no click data') +
+    '</span>';
+}
+
 function renderInspector() {
   const box = $('#inspector');
   const sel = selectedClips();
@@ -1508,6 +1531,10 @@ function renderInspector() {
     '<b>Length</b><span>' + fmtTc(c.out - c.in) + '</span>' +
     (noClock ? '' : '<b>In / Out</b><span>' + fmtTc(c.in) + ' - ' + fmtTc(c.out) + '</span>') +
     (noClock ? '' : '<b>Linked</b><span>' + (c.linkId ? 'yes' : 'no') + '</span>') +
+    // Screen telemetry is worth a line precisely because its ABSENCE is normal: an OBS
+    // or Screen Studio capture never has any, and the user needs to know that before
+    // they go looking for auto-zoom on it.
+    (telemetryRow(c)) +
     (noClock ? '' :
       '<b>Volume</b><span class="kv-range">' +
       '<input id="clipVol" type="range" min="0" max="2" step="0.01" value="' + c.volume + '">' +
@@ -5226,6 +5253,203 @@ window.api.onRenderProgress((d) => {
 $('#btnImport').addEventListener('click', async () => importPaths(await window.api.pickMedia()));
 $('#btnImportFolder').addEventListener('click', async () => importPaths(await window.api.pickFolder()));
 
+// ---- the screen recorder -------------------------------------------------
+//
+// The panel picks a source and starts the capture; main owns the capture itself and the
+// telemetry (see "The screen recorder" in the README). What comes back is a file path,
+// which then goes through importPaths() like anything else the user dropped in - so a
+// recording is an ordinary clip on an ordinary track, and the telemetry rides in on its
+// sidecar rather than through a second, special import path.
+const Rec = {
+  sources: [],
+  pick: null,      // the chosen source object
+  busy: false,
+  recording: false,
+  since: 0,
+  timer: null,
+  file: null,
+};
+
+/** Is this clip carrying screen telemetry? The one question every consumer asks first. */
+function clipTelemetry(clip) {
+  return ScreenTel.hasTelemetry(clip) ? clip.screen : null;
+}
+
+/**
+ * The cursor position at `tLocal` seconds into a clip, or null.
+ *
+ * Telemetry `t` is in SOURCE time - seconds from the video file's first frame - which is
+ * the only timebase that survives what the editor does to a clip afterwards. Trimming
+ * moves `in`, splitting makes two clips out of one and both keep the whole event list,
+ * and dragging changes `start`; none of that may move a click ripple off the pixel it
+ * happened on. So every lookup goes through `clip.in`, exactly the way `mediaFor()` and
+ * the framing maths do, and that is what steps 9 and 14 must use rather than reaching
+ * into `clip.screen.events` themselves.
+ */
+function clipCursorAt(clip, tLocal) {
+  const t = clipTelemetry(clip);
+  return t ? ScreenTel.cursorAt(t, clip.in + tLocal) : null;
+}
+
+/** Mouse-downs inside a clip's visible span, retimed to seconds from the clip's start. */
+function clipClicks(clip) {
+  const t = clipTelemetry(clip);
+  if (!t) return [];
+  return ScreenTel.clicksIn(t, clip.in, clip.out).map((e) => ({ t: e.t - clip.in, x: e.x, y: e.y }));
+}
+
+function recSetStatus(msg) {
+  const el = $('#recStatus');
+  if (el) el.textContent = msg || '';
+}
+
+function recPaintSources() {
+  const host = $('#recSources');
+  if (!host) return;
+  host.innerHTML = '';
+  if (!Rec.sources.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = 'No capturable screens or windows were offered.';
+    host.appendChild(e);
+    return;
+  }
+  for (const s of Rec.sources) {
+    const b = document.createElement('button');
+    b.className = 'rec-src' + (Rec.pick && Rec.pick.id === s.id ? ' sel' : '');
+    b.title = s.name;
+    const img = document.createElement('img');
+    if (s.thumbnail) img.src = s.thumbnail;
+    b.appendChild(img);
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = s.name;
+    b.appendChild(n);
+    const k = document.createElement('span');
+    k.className = 'k';
+    // Say it on the card, not in a footnote: this is the choice that decides whether
+    // step 9's auto-zoom has anything to work with.
+    k.textContent = s.region ? 'display - cursor telemetry' : 'window - picture only';
+    b.appendChild(k);
+    b.addEventListener('click', () => {
+      if (Rec.recording) return;
+      Rec.pick = s;
+      recPaintSources();
+      recUpdate();
+    });
+    host.appendChild(b);
+  }
+}
+
+function recUpdate() {
+  const start = $('#recStart'), stop = $('#recStop'), cur = $('#recCursor');
+  if (!start) return;
+  start.disabled = Rec.recording || Rec.busy || !Rec.pick;
+  stop.disabled = !Rec.recording;
+  if (cur) cur.disabled = Rec.recording || !(Rec.pick && Rec.pick.region);
+  if (Rec.recording) {
+    const secs = Math.max(0, (Date.now() - Rec.since) / 1000);
+    recSetStatus('Recording  ' + fmtTc(secs));
+  }
+}
+
+async function recOpen() {
+  $('#recModal').hidden = false;
+  if (Rec.recording) { recUpdate(); return; }
+  recSetStatus('Looking for screens...');
+  const r = await window.api.screenSources();
+  if (!Array.isArray(r)) {
+    Rec.sources = [];
+    recSetStatus('Screen capture is unavailable: ' + ((r && r.error) || 'unknown error'));
+  } else {
+    Rec.sources = r;
+    // A whole display is what the feature is for, so it is what is selected by default.
+    Rec.pick = r.find((s) => s.type === 'screen' && s.region) || r[0] || null;
+    recSetStatus('');
+  }
+  recPaintSources();
+  recUpdate();
+}
+
+function recClose() { $('#recModal').hidden = true; }
+
+async function startRecording() {
+  if (Rec.recording || Rec.busy || !Rec.pick) return;
+  Rec.busy = true;
+  recUpdate();
+  const wantCursor = $('#recCursor') ? $('#recCursor').checked : true;
+  recSetStatus('Starting...');
+  const r = await window.api.screenStart({
+    sourceId: Rec.pick.id,
+    name: Rec.pick.name,
+    type: Rec.pick.type,
+    displayId: Rec.pick.displayId,
+    cursor: wantCursor,
+  });
+  Rec.busy = false;
+  if (!r || !r.ok) {
+    recSetStatus('Could not start: ' + ((r && r.error) || 'unknown error'));
+    log('Screen recording failed to start: ' + ((r && r.error) || 'unknown error'));
+    recUpdate();
+    return;
+  }
+  Rec.recording = true;
+  Rec.since = Date.now();
+  Rec.file = r.file;
+  // The sheet is closed on purpose: it is on the screen being recorded. Ctrl+Shift+F9
+  // is the way back, and it works while another application has focus.
+  recClose();
+  setStatus('Recording the screen - Ctrl+Shift+F9 to stop');
+  log('Recording ' + (r.cursor ? 'with cursor telemetry' : 'picture only') +
+    (r.cursor && !r.clicks ? ' (no click watcher - positions only)' : '') + '.');
+  if (Rec.timer) clearInterval(Rec.timer);
+  Rec.timer = setInterval(recUpdate, 250);
+  recUpdate();
+}
+
+/**
+ * Stop, then import what was recorded.
+ *
+ * The import is an ordinary `importPaths()` at the playhead, which means one pushUndo()
+ * entry covering the whole arrival - and it means a recording behaves like any other
+ * media from the moment it lands.
+ */
+async function stopRecording() {
+  if (!Rec.recording) return;
+  Rec.recording = false;
+  if (Rec.timer) { clearInterval(Rec.timer); Rec.timer = null; }
+  recSetStatus('Finishing...');
+  setStatus('Finishing the recording...');
+  const r = await window.api.screenStop();
+  recUpdate();
+  if (!r || !r.ok) {
+    recSetStatus('Recording failed: ' + ((r && r.error) || 'unknown error'));
+    log('Recording failed: ' + ((r && r.error) || 'unknown error'));
+    setStatus('Ready');
+    return;
+  }
+  const secs = Math.max(0, (Date.now() - Rec.since) / 1000);
+  log('Recorded ' + fmtTc(secs) + ' -> ' + r.file +
+    (r.cursor ? '  (' + r.samples + ' cursor samples, ' + r.clicks + ' clicks)' : '  (no telemetry)'));
+  recSetStatus('Saved ' + fmtTc(secs));
+  setStatus('Ready');
+  await importPaths([r.file], { at: state.playhead });
+  return r;
+}
+
+$('#btnRecord').addEventListener('click', () => recOpen());
+$('#recClose').addEventListener('click', () => recClose());
+$('#recStart').addEventListener('click', () => startRecording());
+$('#recStop').addEventListener('click', () => stopRecording());
+// The hotkey is registered in main, because it has to fire while another app has focus.
+window.api.onScreenHotkeyStop(() => stopRecording());
+window.api.onScreenFailed((m) => {
+  Rec.recording = false;
+  if (Rec.timer) { clearInterval(Rec.timer); Rec.timer = null; }
+  recUpdate();
+  log('The recorder stopped: ' + m);
+});
+
 // ---- the QuickBin --------------------------------------------------------
 //
 // The bin is the library, the timeline is the edit: nothing in the bin is part of the
@@ -5438,6 +5662,7 @@ const SHORTCUTS = [
   ['G', 'Close the gaps between the selected clips'],
   ['Drag on empty timeline', 'Window-select the clips the box touches'],
   ['I / O', 'Set the in / out mark for a ranged render'],
+  ['Ctrl+Shift+F9', 'Stop the screen recording (works from any app)'],
   ['X', 'Clear the in / out marks'],
   ['Alt+I / Alt+O', 'Trim the selected clip in / out to the playhead'],
   ['Ctrl+L / Ctrl+Shift+L', 'Link / unlink selected clips'],
@@ -5530,7 +5755,7 @@ document.addEventListener('keydown', (e) => {
     if (t) { t.muted = !t.muted; markDirty(); renderAll(); }
   }
   else if (e.key === 'F5') { location.reload(); }
-  else if (e.key === 'Escape') { $('#modal').hidden = true; setSelection([], false); }
+  else if (e.key === 'Escape') { $('#modal').hidden = true; $('#recModal').hidden = true; setSelection([], false); }
   else handled = false;
 
   if (handled) e.preventDefault();

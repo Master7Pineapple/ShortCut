@@ -207,8 +207,27 @@ select, input[type=number], input[type=text] {
 }
 #dropOverlay.show { display: flex; }
 
-#modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 60; }
-#modal[hidden] { display: none; }
+#modal, #recModal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 60; }
+#modal[hidden], #recModal[hidden] { display: none; }
+
+/* The screen recorder sheet. The source picker is a thumbnail grid because a list of
+   window titles is unreadable on a machine with twenty windows open. */
+#recModal .sheet { min-width: 720px; max-width: 860px; }
+.rec-note { margin: 0 0 12px; color: var(--dim); font-size: 12px; line-height: 1.5; max-width: 70ch; }
+.rec-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; max-height: 46vh; overflow: auto; }
+.rec-src {
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px; cursor: pointer;
+  background: #14161b; text-align: left; color: inherit; font: inherit;
+}
+.rec-src:hover { border-color: var(--accent); }
+.rec-src.sel { border-color: var(--accent); background: rgba(79,140,255,.14); }
+.rec-src img { width: 100%; aspect-ratio: 16/9; object-fit: cover; border-radius: 3px; background: #000; display: block; }
+.rec-src .n { display: block; font-size: 11px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rec-src .k { font-size: 10px; color: var(--dim); }
+.rec-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.rec-actions .grow { flex: 1; }
+.rec-opt { font-size: 12px; display: flex; align-items: center; gap: 5px; }
+
 .sheet {
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 18px 22px; max-height: 80vh; overflow: auto; min-width: 460px;

@@ -34,6 +34,15 @@ contextBridge.exposeInMainWorld('api', {
   transcribeImport: () => ipcRenderer.invoke('transcribe:import'),
   onTranscribeProgress: (cb) => ipcRenderer.on('transcribe:progress', (_e, d) => cb(d)),
 
+  // The screen recorder. `screen:start` answers once capture is actually running, so a
+  // resolved promise means the encoder has frames - not merely that a window opened.
+  screenSources: () => ipcRenderer.invoke('screen:sources'),
+  screenStart: (opts) => ipcRenderer.invoke('screen:start', opts),
+  screenStop: () => ipcRenderer.invoke('screen:stop'),
+  screenState: () => ipcRenderer.invoke('screen:state'),
+  onScreenHotkeyStop: (cb) => ipcRenderer.on('screen:hotkeyStop', () => cb()),
+  onScreenFailed: (cb) => ipcRenderer.on('screen:failed', (_e, m) => cb(m)),
+
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),
 

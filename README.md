@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-one suites:
+There are twenty-two suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -149,6 +149,17 @@ There are twenty-one suites:
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
   the user's real bin at the start and writes it back at the end - a run must not eat
   someone's library.
+- `tools/smoke-recorder.js` — the screen recorder and its cursor telemetry: the sidecar
+  shape and what a foreign JSON is rejected as, first-frame alignment (the pre-roll dropped,
+  the last pre-roll position kept at `t=0`, a click before frame zero discarded), coordinate
+  normalisation across display scales and across a second monitor, the click watcher's output
+  parser, source-time lookups surviving a move, a trim and a split, telemetry staying out of
+  the render job, the sidecar surviving save and reload — and, load-bearing for steps 9 and
+  14, that a clip with **no** telemetry answers "none" everywhere rather than throwing. It
+  ends with a real 2.5 s capture: the file, the sidecar, that the first frame is timestamped
+  after Record was pressed, and that the recording imports with its telemetry attached. It
+  reuses `clip1.mp4` from `smoke.js`, copying it rather than writing a sidecar next to the
+  shared fixture, and *skips* the live capture on a machine that offers no display.
 
 `tools/smoke.js` is a 26-assertion test of the timeline logic — import ordering, A/V
 linking, split, ripple delete, undo/redo, trimming, the render job, and project
@@ -208,6 +219,7 @@ tools/smoke-preview.js    playback/compositing test suite
 tools/smoke-layers.js     alpha compositing + stills-on-the-timeline test suite
 tools/smoke-bakefirst.js  bake-first rendering: fast path, composite bake, parity
 tools/smoke-fx.js         the per-clip effect stack: each effect, order, keys, parity
+tools/smoke-recorder.js   the screen recorder: telemetry shape, alignment, degradation
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -223,6 +235,11 @@ src/renderer/text/ui.js     text cards: the editor panel
 src/renderer/transitions.js transitions: every pixel of all three types (preview AND export)
 src/renderer/waveform.js  audio peaks: decode once per file, draw a slice per clip
 src/renderer/quickbin.js  the QuickBin: a media library kept in userData, not in the project
+src/screen.js             screen telemetry: the sidecar shape, alignment, normalisation
+                          (loaded twice, like audiofx.js - see "The screen recorder")
+src/clickwatch.ps1        the click watcher: prints mouse-button transitions, one per line
+src/recorder-preload.js   contextBridge for the recorder window - video bytes and nothing else
+src/renderer/recorder.html + recorder.js   the hidden capture window (MediaRecorder)
 src/captions.js           transcripts and captions: parsing, phrasing, placement, fillers
                           (loaded twice, like audiofx.js - see "Transcription and captions")
 ```
@@ -290,7 +307,10 @@ Clip = {
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
   keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
-  captions               // generated captions only - { gen: true, src } - see below
+  captions,              // generated captions only - { gen: true, src } - see below
+  screen                 // OPTIONAL - screen-recording telemetry, { events, displayW,
+                         //   displayH, clicks }. Absent for anything not recorded here;
+                         //   see "The screen recorder" for the degradation contract
 }
 ```
 
@@ -852,6 +872,134 @@ a mistake is not a call an editor gets to make silently.
 Filler spans are **not** subject to the silence threshold — a filler word is short by
 definition — but they do get the same pad. A provider that throws costs its own spans and
 nothing else.
+
+### The screen recorder
+
+Product footage is most of a B2B short, so ShortCut records it rather than making you
+find another tool for it. **Record** in the toolbar picks a display or a window, captures
+it to `userData/recordings/screen-<stamp>.webm`, and — for a display — writes a second
+file next to it holding what the cursor did.
+
+Recording the cursor as *data* is the whole point of doing this before the cursor
+effects rather than after. Recovering a pointer path and its clicks from the pixels is
+possible and fragile: the cursor changes shape, disappears over video, and a click leaves
+no mark at all. Sampled at capture time it is exact, free, and it is what makes step 9's
+auto-zoom and step 14's click SFX authoring work instead of a computer-vision project.
+
+#### Three processes, because the three signals live in three places
+
+| Signal | Where it comes from | Why there |
+| --- | --- | --- |
+| The picture | a hidden renderer window, `renderer/recorder.html` | `getUserMedia` and `MediaRecorder` exist only in a renderer, and it must not be the editor's — that one is on the screen being recorded, and encoding on the timeline's thread would stutter both |
+| Cursor position | `screen.getCursorScreenPoint()` in main, on a timer | it is a main-process call, and a sampler on the editor's render thread would stall exactly when the user is not looking at it |
+| Clicks | `src/clickwatch.ps1`, a PowerShell child process | Electron exposes no global mouse hook; `GetAsyncKeyState` reads the physical button state without installing one, so it cannot swallow or delay a real click |
+
+The recorder window is never shown: it would otherwise appear in its own recording. That
+means the editor window is the only UI, and it is behind whatever is being demonstrated —
+so `Ctrl+Shift+F9` stops a recording from any application. The panel's Stop button does
+the same thing when the editor is reachable.
+
+#### The sidecar
+
+`<recording>.screen.json`, plain JSON, written by `finishRecording()`:
+
+```js
+{ app: 'shortcut-screen', version: 1,
+  source: { id, name, type, displayId },
+  video:  { file, w, h, fps, firstFrameEpochMs, durationMs },
+  region: { x, y, w, h, scaleFactor, displayW, displayH },
+  clicks: true,                       // false = positions only, the watcher was unavailable
+  events: [ { t, x, y, type } ] }     // type: 'move' | 'down' | 'up'
+```
+
+`src/screen.js` owns every rule about that file and is loaded twice — as a `<script>`
+global `ScreenTel` and as a CommonJS module in main — exactly like `audiofx.js` and
+`captions.js`. Main writes sidecars, the renderer reads them, and one copy of the rules
+is the only way the two cannot drift.
+
+Two properties of the file carry everything downstream:
+
+**`t` is seconds from the video's FIRST FRAME.** Not from when Record was pressed, and
+not wall clock. Between `MediaRecorder.start()` and the first decoded frame sit the
+capture negotiation and the encoder warming up — measured on this machine, **~200 ms**,
+and not a constant. Time the telemetry from the button press instead and every click
+ripple lands six frames late, consistently enough to look deliberate and wrong. The
+recorder window takes the timestamp in `requestVideoFrameCallback`, which fires when a
+frame is actually available, and `alignEvents()` retimes everything onto it. Samples from
+before that frame are dropped — with one exception: the last pre-roll *position* is kept
+and retimed to `t = 0`, or a recording that opens on a motionless pointer would carry no
+cursor position at all until it first moved. A *click* before the first frame is genuinely
+not in the video, and is dropped outright.
+
+**`x`/`y` are normalised to the captured region, 0..1.** Bounds are DIP and the cursor
+point is DIP, so the ratio is already scale-independent: a 150% display and a 100% one
+recording the same gesture produce the same numbers, and the file replays on a machine
+with different hardware. They are deliberately *not* clamped — a sample taken while the
+pointer was on another monitor is outside 0..1, and saying so is more useful than
+pretending it sat on the edge. Draw code clamps; the file records what happened.
+
+#### Windows record picture only
+
+Telemetry needs the captured region's bounds to normalise a desktop point into it, and
+only a *screen* source has knowable bounds — a window moves, resizes and can be partly
+offscreen, and guessing at it would produce coordinates that are subtly wrong rather than
+absent. So a window capture writes no sidecar. The source picker says so on the card
+rather than in a footnote, because it is the choice that decides whether auto-zoom has
+anything to work with.
+
+#### The contract: telemetry is optional, and its absence is normal
+
+**Stated here because steps 9 and 14 both depend on it.** A clip may carry `clip.screen`,
+or it may not, and every consumer must degrade to "no cursor data" rather than break. A
+recording from Screen Studio, OBS or a phone imports as an ordinary video clip with no
+`screen` field at all, and that is a supported permanent state — not a missing feature.
+There is no separate importer for it: telemetry comes in through exactly one door,
+`readTelemetry()` in `media:scan`, which looks for a sidecar and simply does not find one.
+A malformed or foreign JSON file is treated as no telemetry rather than as an error.
+
+Ask `ScreenTel.hasTelemetry(clip)` first. `ScreenTel.cursorAt()` answers `null` and
+`clicksIn()` answers `[]` for a clip without it, rather than throwing.
+
+#### Reading it back: source time, always
+
+Telemetry `t` is in **source** time — seconds from the video file's first frame — because
+that is the only timebase that survives what the editor does to a clip afterwards.
+Trimming moves `in`, splitting makes two clips out of one and both keep the whole event
+list, and dragging changes `start`. None of that may move a click ripple off the pixel it
+happened on. So use the two helpers in `app.js` rather than reaching into
+`clip.screen.events`:
+
+```js
+clipCursorAt(clip, tLocal)   // seconds into the clip -> {x, y} in 0..1, or null
+clipClicks(clip)             // mouse-downs inside the clip's span, retimed to its start
+```
+
+Both go through `clip.in`, the same way `mediaFor()` and the framing maths do. `screen`
+is plain JSON on the clip like everything else, because undo is `JSON.stringify` of the
+track list — and it never reaches `buildJob()`, so it is not in the render cache key. It
+describes the source, not the pixels.
+
+#### The container has to be remuxed
+
+`MediaRecorder` writes a *live* WebM: the stream is open-ended while it is being written,
+so the header carries no duration and no cues. `ffprobe` then reports a duration of 0,
+`media:scan` drops the file for having no length, and **a recording you just made silently
+refuses to import** — which is what happened the first time the suite ran end to end.
+`remuxRecording()` runs `ffmpeg -i rec.webm -c copy` before the file is handed back: same
+streams, same bytes, seekable container, a fraction of a second even on a long capture. If
+it fails the original is kept, because a recording that imports awkwardly beats one that
+is gone.
+
+#### What can go wrong, and what happens instead
+
+| Failure | Result |
+| --- | --- |
+| PowerShell missing or blocked by policy | positions still recorded, sidecar written with `clicks: false` |
+| Not Windows | same — the watcher is skipped |
+| A window source was chosen | picture only, no sidecar |
+| The capture is refused (permission, no display) | `screen:start` answers `{ok: false, error}`; nothing is left behind |
+| The user stops the capture from the OS | the track's `ended` event stops the recorder like a normal Stop |
+| Nothing was written | the empty file is deleted and the error is reported |
 
 ### Transcription and captions
 
@@ -2050,6 +2198,16 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   frame for the length of the window, so anything on a track above it is not composited
   over the transition in the preview. Text cards are, as before.
 - Deleting a track deletes its clips with it (undoable).
+- Screen recordings are captured to WebM in `userData/recordings`, and only a whole
+  DISPLAY carries cursor telemetry - a single-window capture records picture only. Clicks
+  need PowerShell (Windows only); without it the sidecar still holds the cursor path and
+  says `clicks: false`. Nothing downstream may assume telemetry exists - see the contract
+  in "The screen recorder".
+- Telemetry is recorded, not yet drawn: nothing in the preview or the render uses it yet.
+  Cursor smoothing, click ripples and auto-zoom are step 9, and read it through
+  `clipCursorAt()` and `clipClicks()`.
+- A recorded clip and its telemetry are joined by the file name alone. Move or rename the
+  `.webm` without its `.screen.json` and the next import of it has no cursor data.
 
 ### Packaging a standalone .exe
 
@@ -2094,6 +2252,7 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `Ctrl+S` / `Ctrl+O` | Save / open project |
 | `Ctrl+R` | Render a preview of the range into the viewer |
 | `Ctrl+Shift+R` | Export a file to disk |
+| `Ctrl+Shift+F9` | Stop the screen recording (works while another app has focus) |
 | `P` | Play rendered spans / composite live |
 | `N` | Toggle snapping |
 | `B` | Show / hide the QuickBin |

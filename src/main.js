@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, desktopCapturer, globalShortcut, screen: electronScreen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn, execFile } = require('child_process');
@@ -10,6 +10,9 @@ const ffprobePath = require('ffprobe-static').path.replace('app.asar', 'app.asar
 // Shared with the renderer, which loads the same file as a <script> global. One
 // definition of what an audio effect means, so preview and render cannot drift apart.
 const AudioFX = require('./audiofx.js');
+// Same trick again: the screen-recording telemetry rules are shared with the renderer,
+// which loads this exact file as a <script> global.
+const ScreenTel = require('./screen.js');
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ts']);
 const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma']);
@@ -113,6 +116,17 @@ function createWindow() {
 }
 
 app.whenReady().then(createWindow);
+
+// Stopping a recording needs a key that works while another app has focus - the editor
+// window is hidden behind whatever is being demonstrated, and on the screen being
+// recorded. The renderer owns the stop so the panel and the timeline stay in step; this
+// only pokes it.
+app.whenReady().then(() => {
+  try {
+    globalShortcut.register('CommandOrControl+Shift+F9', () => { if (rec) recSend('screen:hotkeyStop'); });
+  } catch (e) { /* another app holds the combination; the panel button still works */ }
+});
+app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch (e) { /* ignore */ } });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
@@ -226,7 +240,12 @@ ipcMain.handle('media:scan', async (_e, paths) => {
   for (const f of files) {
     if (IMAGE_EXT.has(path.extname(f).toLowerCase())) { metas.push(await stillMeta(f)); continue; }
     const m = await probe(f);
-    if (m && m.duration > 0) metas.push(m);
+    if (m && m.duration > 0) {
+      // A recording made here carries a telemetry sidecar; one made anywhere else does
+      // not, and imports perfectly well without it.
+      if (m.kind === 'video') { const tel = readTelemetry(f); if (tel) m.screen = tel; }
+      metas.push(m);
+    }
   }
   return metas;
 });
@@ -254,6 +273,357 @@ ipcMain.handle('media:pickFolder', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Import folder', properties: ['openDirectory'] });
   return r.canceled ? [] : r.filePaths;
 });
+
+// -------------------------------------------------------- the screen recorder
+/**
+ * Capture a display to a file, and log what the cursor did while it happened.
+ *
+ * The split, and why it is this way round:
+ *
+ *   - the PICTURE is captured by a hidden renderer window (`recorder.html`), because
+ *     getUserMedia and MediaRecorder only exist in a renderer;
+ *   - the CURSOR is sampled here, because `screen.getCursorScreenPoint()` is a main
+ *     process call and because a sampler on the editor's render thread would stall
+ *     whenever the timeline redrew - which is precisely when the user is not looking;
+ *   - CLICKS come from a third process (`clickwatch.ps1`), because Electron exposes no
+ *     global mouse hook and a native module for one boolean is not worth the build.
+ *
+ * Recovering all of this from the pixels afterwards is possible and fragile. Recording
+ * it as data is exact, and it is what makes step 9's auto-zoom and step 14's click SFX
+ * cheap instead of a computer-vision project.
+ */
+
+const recordingsDir = () => {
+  const d = path.join(app.getPath('userData'), 'recordings');
+  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { /* ignore */ }
+  return d;
+};
+
+/** `2026-09-09T14:03:22.123Z` -> `20260909-140322`, which sorts and has no colons. */
+function stamp() {
+  const s = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-');
+  return s.slice(0, 15);
+}
+
+/** Everything about the recording in flight. `null` when nothing is being recorded. */
+let rec = null;
+
+function recSend(channel, payload) {
+  if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+}
+
+/**
+ * Start the PowerShell click watcher.
+ *
+ * Failure here is not failure of the recording: the sidecar is written with
+ * `clicks: false`, the cursor path is still exact, and everything downstream degrades to
+ * "no click data" the same way it degrades for an imported OBS capture. That is the
+ * whole reason it is a child process and not a dependency.
+ */
+function startClickWatcher(state) {
+  if (process.platform !== 'win32') { state.clicks = false; return; }
+  const script = path.join(__dirname, 'clickwatch.ps1');
+  let child;
+  try {
+    child = spawn('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script],
+      { windowsHide: true });
+  } catch (e) { state.clicks = false; return; }
+
+  state.clickProc = child;
+  state.clicks = true;
+  let buf = '';
+  child.stdout.on('data', (d) => {
+    buf += d.toString('utf8');
+    const lines = buf.split(/\r?\n/);
+    buf = lines.pop();
+    for (const line of lines) {
+      const ev = ScreenTel.parseClickLine(line);
+      // Only the left button reaches the sidecar: a right-click is a context menu, not a
+      // gesture worth a ripple, and step 14 would sonify it wrongly.
+      if (!ev || ev.button !== 1) continue;
+      const pt = electronScreen.getCursorScreenPoint();
+      const n = ScreenTel.normPoint(pt.x, pt.y, state.region);
+      state.raw.push({ ms: ev.ms, x: n.x, y: n.y, type: ev.type });
+    }
+  });
+  child.on('error', () => { state.clicks = false; });
+  child.on('exit', () => { state.clickProc = null; });
+}
+
+function stopClickWatcher(state) {
+  if (state && state.clickProc) {
+    try { state.clickProc.kill(); } catch (e) { /* already gone */ }
+    state.clickProc = null;
+  }
+}
+
+ipcMain.handle('screen:sources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: false,
+    });
+    const displays = electronScreen.getAllDisplays();
+    return sources.map((s) => {
+      const d = s.display_id ? displays.find((x) => String(x.id) === String(s.display_id)) : null;
+      return {
+        id: s.id,
+        name: s.name,
+        type: s.id.startsWith('screen:') ? 'screen' : 'window',
+        displayId: s.display_id || '',
+        // A window's bounds are not knowable from here, so a window source records
+        // WITHOUT telemetry - see the note on `screen:start`.
+        region: d ? ScreenTel.regionOfDisplay(d) : null,
+        thumbnail: s.thumbnail && !s.thumbnail.isEmpty() ? s.thumbnail.toDataURL() : '',
+      };
+    });
+  } catch (e) {
+    return { error: (e && e.message) || String(e) };
+  }
+});
+
+ipcMain.handle('screen:state', () => ({
+  recording: !!rec,
+  file: rec ? rec.file : null,
+  cursor: rec ? !!rec.region : false,
+  clicks: rec ? !!rec.clicks : false,
+  samples: rec ? rec.raw.length : 0,
+  since: rec ? rec.startedEpoch : 0,
+}));
+
+/**
+ * Begin a recording.
+ *
+ * Telemetry needs the captured region's bounds to normalise a desktop point into it, and
+ * only a SCREEN source has knowable bounds - a window moves, resizes and can be partly
+ * offscreen, and guessing at it would produce coordinates that are subtly wrong rather
+ * than absent. So a window capture records picture only, writes no sidecar, and imports
+ * as an ordinary clip. That is the documented degradation, not an oversight.
+ */
+ipcMain.handle('screen:start', async (_e, opts) => {
+  if (rec) return { ok: false, error: 'already recording' };
+  const o = opts || {};
+  const sourceId = o.sourceId;
+  if (!sourceId) return { ok: false, error: 'no source chosen' };
+
+  const displays = electronScreen.getAllDisplays();
+  const d = o.displayId ? displays.find((x) => String(x.id) === String(o.displayId)) : null;
+  const wantCursor = o.cursor !== false && !!d;
+  const region = wantCursor ? ScreenTel.regionOfDisplay(d) : null;
+
+  const file = path.join(o.dir || recordingsDir(), 'screen-' + stamp() + '.webm');
+  let stream;
+  try { stream = fs.createWriteStream(file); }
+  catch (e) { return { ok: false, error: 'cannot write ' + file }; }
+
+  const state = {
+    file, region, source: { id: sourceId, name: o.name || '', type: o.type || 'screen', displayId: o.displayId || '' },
+    stream, raw: [], clicks: false, clickProc: null, timer: null,
+    firstFrameEpochMs: 0, startedEpoch: Date.now(), video: null,
+    win: null, pending: [], done: null, error: null, sampleHz: Number(o.sampleHz) || ScreenTel.DEFAULTS.sampleHz,
+  };
+  rec = state;
+
+  const started = new Promise((resolve) => { state.onStarted = resolve; });
+
+  state.win = new BrowserWindow({
+    show: false, width: 320, height: 200, skipTaskbar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'recorder-preload.js'),
+      contextIsolation: true, nodeIntegration: false, backgroundThrottling: false,
+    },
+  });
+  state.win.loadFile(path.join(__dirname, 'renderer', 'recorder.html'));
+
+  const info = await Promise.race([
+    started,
+    new Promise((r) => setTimeout(() => r({ ok: false, error: 'the recorder window did not start' }), 12000)),
+  ]);
+  if (!info || info.ok === false) {
+    await finishRecording(true);
+    return { ok: false, error: (info && info.error) || 'capture failed' };
+  }
+
+  state.video = info;
+  if (region) {
+    // Sampling starts NOW, before the first frame - the pre-roll is dropped in
+    // ScreenTel.alignEvents(), which is also where the last pre-roll sample is kept so a
+    // recording that opens on a motionless pointer still knows where it is.
+    const period = Math.max(4, Math.round(1000 / state.sampleHz));
+    state.timer = setInterval(() => {
+      try {
+        const pt = electronScreen.getCursorScreenPoint();
+        const n = ScreenTel.normPoint(pt.x, pt.y, region);
+        state.raw.push({ ms: Date.now(), x: n.x, y: n.y, type: 'move' });
+      } catch (err) { /* a display can vanish mid-recording; keep going */ }
+    }, period);
+    startClickWatcher(state);
+  }
+  return { ok: true, file, cursor: !!region, clicks: !!state.clicks, w: info.w, h: info.h };
+});
+
+ipcMain.handle('screen:stop', async () => {
+  if (!rec) return { ok: false, error: 'not recording' };
+  return finishRecording(false);
+});
+
+/**
+ * Stop everything, write the sidecar, and return what happened.
+ *
+ * `abort` is the failure path: the capture never started, so there is nothing to keep.
+ * Both paths must tear down the timer, the watcher, the write stream and the window -
+ * a recorder that leaks a hidden window holds a capture handle open and the next Record
+ * fails for a reason nobody can see.
+ */
+async function finishRecording(abort) {
+  const state = rec;
+  if (!state) return { ok: false, error: 'not recording' };
+  rec = null;
+
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  stopClickWatcher(state);
+
+  if (state.win && !state.win.isDestroyed()) {
+    const stopped = new Promise((resolve) => { state.onDone = resolve; });
+    try { state.win.webContents.send('rec:stop'); } catch (e) { /* window already gone */ }
+    await Promise.race([stopped, new Promise((r) => setTimeout(r, 6000))]);
+    try { state.win.destroy(); } catch (e) { /* ignore */ }
+  }
+
+  await new Promise((resolve) => { try { state.stream.end(resolve); } catch (e) { resolve(); } });
+
+  if (abort) {
+    try { fs.unlinkSync(state.file); } catch (e) { /* nothing written */ }
+    return { ok: false, error: state.error || 'capture failed' };
+  }
+
+  let size = 0;
+  try { size = fs.statSync(state.file).size; } catch (e) { /* ignore */ }
+  if (!size) {
+    try { fs.unlinkSync(state.file); } catch (e) { /* ignore */ }
+    return { ok: false, error: 'the recording is empty' };
+  }
+
+  await remuxRecording(state.file);
+  try { size = fs.statSync(state.file).size; } catch (e) { /* ignore */ }
+
+  let json = null, events = [];
+  if (state.region && state.firstFrameEpochMs) {
+    events = ScreenTel.alignEvents(state.raw, state.firstFrameEpochMs);
+    const doc = ScreenTel.makeDoc({
+      source: state.source,
+      video: {
+        file: path.basename(state.file),
+        w: (state.video && state.video.w) || 0,
+        h: (state.video && state.video.h) || 0,
+        fps: (state.video && state.video.fps) || 0,
+        firstFrameEpochMs: state.firstFrameEpochMs,
+        durationMs: Date.now() - state.firstFrameEpochMs,
+      },
+      region: state.region,
+      clicks: !!state.clicks,
+      events,
+    });
+    json = ScreenTel.sidecarPath(state.file);
+    try { fs.writeFileSync(json, JSON.stringify(doc)); } catch (e) { json = null; }
+  }
+
+  return {
+    ok: true, file: state.file, json, bytes: size,
+    samples: events.length,
+    clicks: events.filter((e) => e.type === 'down').length,
+    cursor: !!json,
+  };
+}
+
+// The recorder window talks back on these. Every one of them is guarded by "is this the
+// recording we are actually holding" - a late message from a torn-down window must not
+// resurrect state that finishRecording() has already let go of.
+ipcMain.on('rec:ready', (e) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  e.sender.send('rec:start', {
+    sourceId: rec.source.id,
+    fps: ScreenTel.DEFAULTS.fps,
+    maxW: rec.region ? rec.region.displayW : 3840,
+    maxH: rec.region ? rec.region.displayH : 2160,
+  });
+});
+ipcMain.on('rec:started', (e, info) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  if (rec.onStarted) { rec.onStarted(info || { w: 0, h: 0 }); rec.onStarted = null; }
+});
+ipcMain.on('rec:firstFrame', (e, ms) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  if (!rec.firstFrameEpochMs) rec.firstFrameEpochMs = Number(ms) || Date.now();
+});
+ipcMain.on('rec:chunk', (e, buf) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  try { rec.stream.write(Buffer.from(buf)); } catch (err) { /* the stream is closing */ }
+});
+ipcMain.on('rec:done', (e) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  if (rec.onDone) { rec.onDone(true); rec.onDone = null; }
+});
+ipcMain.on('rec:error', (e, msg) => {
+  if (!rec || !rec.win || e.sender !== rec.win.webContents) return;
+  rec.error = msg;
+  if (rec.onStarted) { rec.onStarted({ ok: false, error: msg }); rec.onStarted = null; }
+  if (rec.onDone) { rec.onDone(false); rec.onDone = null; }
+  recSend('screen:failed', msg);
+});
+
+/**
+ * Rewrite the recording's container so it has a duration in its header.
+ *
+ * MediaRecorder writes a LIVE WebM: the stream is open-ended while it is being written,
+ * so the header carries no duration and no cues. ffprobe then reports `duration` as 0,
+ * `media:scan` drops the file for having no length, and a recording you just made
+ * silently refuses to import - which is exactly what happened the first time this suite
+ * ran end to end.
+ *
+ * `-c copy` fixes it without touching a pixel: same streams, same bytes, seekable
+ * container. It takes a fraction of a second even on a long capture, so it happens
+ * before the file is handed back rather than being left as a trap for the importer.
+ * If it fails for any reason the original is kept - a recording that imports awkwardly
+ * beats a recording that is gone.
+ */
+function remuxRecording(file) {
+  return new Promise((resolve) => {
+    const tmp = file.replace(/\.webm$/i, '') + '.fix.webm';
+    execFile(ffmpegPath, ['-y', '-v', 'error', '-i', file, '-c', 'copy', tmp],
+      { maxBuffer: 1024 * 1024 * 8 }, (err) => {
+        let good = false;
+        try { good = !err && fs.statSync(tmp).size > 0; } catch (e) { good = false; }
+        if (!good) { try { fs.unlinkSync(tmp); } catch (e) { /* never made */ } return resolve(false); }
+        try {
+          fs.unlinkSync(file);
+          fs.renameSync(tmp, file);
+          resolve(true);
+        } catch (e) {
+          try { fs.unlinkSync(tmp); } catch (e2) { /* ignore */ }
+          resolve(false);
+        }
+      });
+  });
+}
+
+/**
+ * Read the telemetry sidecar sitting next to a media file, if there is one.
+ *
+ * This is the only door telemetry comes in through, which means an OBS or Screen Studio
+ * recording - no sidecar - takes exactly the same path and simply arrives without it.
+ * A malformed or foreign JSON file is treated as no telemetry rather than as an error.
+ */
+function readTelemetry(file) {
+  try {
+    const p = ScreenTel.sidecarPath(file);
+    if (!fs.existsSync(p)) return null;
+    const doc = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return ScreenTel.clipScreen(doc);
+  } catch (e) { return null; }
+}
 
 // ----------------------------------------------------------------- QuickBin
 
