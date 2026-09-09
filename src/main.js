@@ -500,12 +500,17 @@ ipcMain.handle('analyze:silence', async (_e, { path: p, noise }) => {
  */
 const Captions = require('./captions.js');
 
+/**
+ * `dtw` is whisper.cpp's own name for that model's alignment-head preset, which is NOT
+ * always the model's name (`large-v3-turbo` is `large.v3.turbo`). Pass the wrong one and
+ * whisper refuses the flag; pass none and there are no word timings at all.
+ */
 const WHISPER_MODELS = {
-  'tiny.en': { size: 77691713 },
-  'base.en': { size: 147964211 },
-  'small.en': { size: 487601967 },
-  'medium.en': { size: 1533763059 },
-  'large-v3-turbo': { size: 1624555275 },
+  'tiny.en': { size: 77691713, dtw: 'tiny.en' },
+  'base.en': { size: 147964211, dtw: 'base.en' },
+  'small.en': { size: 487601967, dtw: 'small.en' },
+  'medium.en': { size: 1533763059, dtw: 'medium.en' },
+  'large-v3-turbo': { size: 1624555275, dtw: 'large.v3.turbo' },
 };
 const DEFAULT_MODEL = 'base.en';
 const MODEL_HOST = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/';
@@ -610,8 +615,19 @@ function downloadModel(name) {
         res.pipe(out);
         out.on('error', () => finish({ ok: false, error: 'Could not write the model file.' }));
         out.on('finish', () => out.close(() => {
-          // Renamed only once the whole file is there: a half-written model that looks
-          // present is worse than one that is plainly missing.
+          // A dropped connection ends the stream cleanly and SHORT. Renaming that into
+          // place gives you a model file that looks present and then fails to load with
+          // "not all tensors loaded" every time, forever - the download never retries
+          // because the file is there. So the byte count is checked before the rename,
+          // and a short file is thrown away rather than kept.
+          if (total && got < total) {
+            try { fs.unlinkSync(tmp); } catch (e2) {}
+            return finish({
+              ok: false,
+              error: 'The model download ended early (' + Math.round(got / 1e6) + ' of ' +
+                     Math.round(total / 1e6) + ' MB). Try again.',
+            });
+          }
           try { fs.renameSync(tmp, dest); } catch (e) {
             return finish({ ok: false, error: 'Could not save the model.' });
           }
@@ -703,21 +719,45 @@ ipcMain.handle('transcribe:run', async (_e, { path: p, model, language, force })
 
     sendTrProgress({ phase: 'transcribe', model: name, duration: meta ? meta.duration : 0 });
     const outBase = path.join(scratch, 'out');
-    const args = ['-m', mf, '-f', wav, '--output-json-full', '--output-file', outBase, '-nt', '-pp'];
+    // Three flags here are load-bearing and none of them is obvious:
+    //
+    //  -oj   `-ojf` only says "put MORE in the JSON file" - it does not ask for one.
+    //        Without `-oj` alongside it whisper.cpp writes no JSON at all, and the run
+    //        ends in "wrote no JSON", which reads like a parse failure and is not one.
+    //  --dtw word-level timestamps are not a by-product of decoding: whisper derives them
+    //        by aligning cross-attention with dynamic time warping, and ONLY when asked.
+    //        Without this every token carries its segment's bounds instead, which looks
+    //        like timing and is not - one caption held for the whole line.
+    //  -nfa  flash attention is ON by default in these builds and silently turns DTW back
+    //        off again: "dtw_token_timestamps is not supported with flash_attn -
+    //        disabling", on stderr, followed by a perfectly normal-looking transcript.
+    //        Disabling it costs some speed and buys the entire feature.
+    const args = ['-m', mf, '-f', wav, '-oj', '-ojf', '--output-file', outBase, '-nt', '-pp'];
+    const dtw = (WHISPER_MODELS[name] || {}).dtw;
+    if (dtw) args.push('-nfa', '--dtw', dtw);
     if (language) args.push('-l', language);
 
+    let whisperLog = '';
     const code = await new Promise((resolve) => {
       const proc = spawn(bin, args, { windowsHide: true });
       activeTranscribe = proc;
-      let log = '';
       // whisper.cpp prints progress with -pp. Scraping it is the same trick the render
-      // bar uses on ffmpeg's `time=`.
+      // bar uses on ffmpeg's `time=` - except that whisper writes several ticks into one
+      // line without a newline between them, so the line really does read
+      // `progress = 1060%` when it has passed 10 and then 60. A value outside 0-100 is
+      // therefore two readings stuck together and cannot be untangled: show no number at
+      // all rather than a made-up one.
       const onData = (d) => {
         const s = d.toString();
-        log += s;
-        if (log.length > 200000) log = log.slice(-100000);
+        whisperLog += s;
+        if (whisperLog.length > 200000) whisperLog = whisperLog.slice(-100000);
         const m = /progress\s*=\s*(\d+)%/.exec(s);
-        if (m) sendTrProgress({ phase: 'transcribe', model: name, percent: Number(m[1]) });
+        if (!m) return;
+        const pct = Number(m[1]);
+        sendTrProgress({
+          phase: 'transcribe', model: name,
+          percent: pct >= 0 && pct <= 100 ? pct : null,
+        });
       };
       proc.stderr.on('data', onData);
       proc.stdout.on('data', onData);
@@ -726,10 +766,15 @@ ipcMain.handle('transcribe:run', async (_e, { path: p, model, language, force })
     });
     activeTranscribe = null;
     if (code !== 0) {
+      // A half-downloaded model loads as far as "not all tensors" and then exits. Saying
+      // so, and naming the file to delete, beats "exited with 1".
+      const badModel = /not all tensors loaded|failed to load model/i.test(whisperLog);
       return {
         ok: false,
-        reason: code === -1 ? 'no-binary' : 'failed',
-        error: code === -1 ? 'whisper.cpp could not be started.' : 'whisper.cpp exited with ' + code + '.',
+        reason: code === -1 ? 'no-binary' : badModel ? 'no-model' : 'failed',
+        error: code === -1 ? 'whisper.cpp could not be started.'
+          : badModel ? 'The ' + name + ' model is incomplete. Delete ' + mf + ' and transcribe again.'
+          : 'whisper.cpp exited with ' + code + '.',
       };
     }
 
@@ -739,7 +784,8 @@ ipcMain.handle('transcribe:run', async (_e, { path: p, model, language, force })
     }
     if (!doc) return { ok: false, reason: 'failed', error: 'whisper.cpp wrote no JSON.' };
 
-    const words = Captions.parseWhisper(doc);
+    // The probed duration clips whisper's 30 s padding off the tail - see parseWhisper.
+    const words = Captions.parseWhisper(doc, meta ? meta.duration : 0);
     const lang = (doc.result && doc.result.language) || language || '';
     if (words.length) writeTranscriptCache(p, name, words, lang);
     sendTrProgress({ phase: 'done', model: name, words: words.length });

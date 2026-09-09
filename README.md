@@ -645,6 +645,50 @@ Every failure degrades to a message with a `reason` on it — `no-binary`, `no-m
 `no-audio`, `missing` or `failed` — and never to a broken editor or a broken render. Being
 offline costs you the transcript and nothing else.
 
+#### Installing the binary
+
+Take the CPU build from the official releases and put `whisper-cli.exe` next to the DLLs it
+loads, in `%APPDATA%\shortcut-editor\whisper`:
+
+```bash
+# whisper-bin-x64.zip is the ~8 MB CPU build; the cublas ones are 270 MB-670 MB and only
+# worth it on an NVIDIA machine. Take whisper-cli.exe, whisper.dll and every ggml*.dll
+# out of its Release/ folder - flat, not in a subfolder, which is where whisperBin() looks.
+curl -L -o w.zip https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip
+```
+
+`ggml-cpu-*.dll` is one file per instruction set (haswell, skylakex, alderlake, ...) and
+the loader picks the right one at runtime — keep them all, or it falls back to the slowest
+path it can find.
+
+#### The four flags that matter
+
+All four were learned by running it, and three of them fail *quietly* — you get a perfectly
+good transcript with useless timings and nothing says so.
+
+- **`-ojf` does not ask for a JSON file.** It means "put *more* in the JSON file", so it
+  has to be passed alongside `-oj`. On its own whisper.cpp writes nothing, and the run ends
+  in "wrote no JSON", which reads like a parse failure and is not one.
+- **`--dtw <preset>` is what produces word timings at all.** They are not a by-product of
+  decoding: whisper derives them by aligning cross-attention with dynamic time warping, and
+  only when asked. Without it every token in a segment carries *the segment's own bounds* —
+  which is not timing, it just looks like it. On a real 2.8 s clip that gave the first word
+  0.13–2.83 s and all six after it 2.83–2.83, i.e. one caption held over the whole line.
+  The preset name is not always the model name (`large-v3-turbo` → `large.v3.turbo`), so it
+  lives in `WHISPER_MODELS`.
+- **`-nfa` (no flash attention) is required for `--dtw` to survive.** Flash attention is on
+  by default in these builds and silently turns DTW back off:
+  `dtw_token_timestamps is not supported with flash_attn - disabling`, on stderr, followed
+  by a normal-looking transcript. It costs some speed and buys the entire feature.
+- A model file that is **present but short** loads as far as `not all tensors loaded` and
+  then exits, every time, forever — nothing retries a download whose file is already there.
+  So `downloadModel()` checks the byte count against `content-length` before renaming
+  `.part` into place and throws a short file away, and a whisper run that fails that way is
+  reported as `no-model` naming the file to delete, rather than as `exited with 1`.
+
+Measured on this machine, `base.en` on a 2.8 s clip: **3.7 s** end to end (extract, DTW
+transcribe, parse), and instant on the second call from the transcript cache.
+
 #### The transcript cache
 
 `userData/cache/transcript`, keyed by path + **model**, with size and mtime checked inside
@@ -654,12 +698,25 @@ because a bigger model produces different words for the same audio.
 
 #### Parsing
 
-`Captions.parseWhisper()` reads `--output-json-full`. Tokens are sub-word pieces with their
-own offsets in **milliseconds**: a word begins at a token whose text starts with a space
-and swallows every continuation token after it, taking the lowest token confidence of the
-lot. Special tokens are dropped — and note they are `[_BEG_]`, `[_TT_170]`, `[_EOT_]`, so
-only *some* end in an underscore. A pattern that assumed a trailing `_` let a timestamp
-token ride along on the end of the last real word of every segment; there is a test for it.
+`Captions.parseWhisper(json, duration)` reads `--output-json-full`. Tokens are sub-word
+pieces — a word begins at a token whose text starts with a space and swallows every
+continuation token after it, taking the lowest confidence of the lot, which is how
+`Ship` + `ping` becomes one word and how the full stop stays on `AI.`
+
+**`t_dtw` is the time to read, not `offsets`.** It is in whisper's own 10 ms units and it
+is a single *instant* per token, not a span — so a word ends where the next one begins, and
+the last word of a segment ends on its own trailing token. `offsets` is the segment's
+bounds stamped onto every token; trusting it is the bug described under the flags above.
+If no token has a `t_dtw` (flash attention left on, an older build) the parser falls back to
+`offsets` rather than producing nothing.
+
+Special tokens are dropped, and they come in **two shapes**: `[_BEG_]`, `[_TT_170]`,
+`[_EOT_]` *and* `<|endoftext|>`. Only some of the bracketed ones end in an underscore. Miss
+either shape and it rides along on the end of the last real word — `AI.<|endoftext|>` was a
+real caption before there was a test for it.
+
+`duration` clips the tail: whisper pads its input to 30 s chunks and times the last token
+against the padding, so a 2.8 s clip can come back with a word ending at 30 s.
 
 A plain `--output-json` has no tokens at all. Rather than refuse it, the segment's words are
 spread across its span in proportion to their length and marked low-confidence. SRT and VTT

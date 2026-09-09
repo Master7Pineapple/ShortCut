@@ -74,6 +74,20 @@
 
   // ------------------------------------------------------------- parsing
 
+  /**
+   * Whisper's special tokens, which carry no text and must never reach a caption.
+   *
+   * They come in TWO shapes and both have been seen in the same file: `[_BEG_]`,
+   * `[_TT_170]`, `[_EOT_]` and `<|endoftext|>`, `<|0.00|>`. Note that only some of the
+   * bracketed ones end in an underscore, so the closing `_` must not be in the pattern.
+   * Miss either shape and it rides along on the end of the last real word of a segment -
+   * `AI.<|endoftext|>` was a real caption.
+   */
+  function isSpecial(text) {
+    const t = String(text == null ? '' : text).trim();
+    return !t || /^\[_[^\]]*\]$/.test(t) || /^<\|[^|]*\|>$/.test(t);
+  }
+
   /** Keep only the fields a word may carry, and only if it is a usable one. */
   function cleanWords(list) {
     const out = [];
@@ -111,7 +125,7 @@
    * approximate, clearly marked with a low confidence, and still far more useful than
    * one caption per sentence.
    */
-  function parseWhisper(json) {
+  function parseWhisper(json, duration) {
     const doc = typeof json === 'string' ? JSON.parse(json) : json;
     const segs = (doc && (doc.transcription || doc.segments)) || [];
     const words = [];
@@ -120,16 +134,45 @@
       const so = seg.offsets || {};
       const segStart = isFinite(Number(so.from)) ? Number(so.from) / 1000 : Number(seg.start) || 0;
       const segEnd = isFinite(Number(so.to)) ? Number(so.to) / 1000 : Number(seg.end) || segStart;
-      // Special tokens are [_BEG_], [_TT_170], [_EOT_] ... - note that only SOME of them
-      // end in an underscore, so the closing `_` must not be in the pattern. Left in, a
-      // timestamp token rides along on the end of the last real word of every segment.
-      const toks = (seg.tokens || []).filter((t) => t && !/^\s*\[_[^\]]*\]\s*$/.test(String(t.text || '')));
+      const toks = (seg.tokens || []).filter((t) => t && !isSpecial(t.text));
 
-      if (toks.length) {
+      // `t_dtw` is the ONLY real per-token time in this file. Whisper's `offsets` are the
+      // segment's own bounds copied onto every token - "That" got 0.13-2.83 and the other
+      // six tokens all got 2.83-2.83, which is not word timing, it is one caption's worth
+      // of nothing. See the DTW note in the README before trusting `offsets` here.
+      const dtw = toks.some((t) => Number(t.t_dtw) >= 0);
+
+      if (toks.length && dtw) {
+        // t_dtw is in whisper's own 10ms units, and it is a single INSTANT per token, not
+        // a span - so a word ends where the next one begins.
+        const marks = [];
         let cur = null;
         for (const t of toks) {
           const raw = String(t.text || '');
-          if (!raw.trim()) continue;
+          const ct = Number(t.t_dtw);
+          const at = ct >= 0 ? ct / 100 : (cur ? cur.last : segStart);
+          const p = isFinite(Number(t.p)) ? Number(t.p) : 1;
+          if (!cur || /^\s/.test(raw)) {
+            cur = { w: raw.trim(), start: at, last: at, conf: p };
+            marks.push(cur);
+          } else {
+            cur.w += raw;
+            cur.last = Math.max(cur.last, at);
+            cur.conf = Math.min(cur.conf, p);
+          }
+        }
+        marks.forEach((m, i) => {
+          const next = marks[i + 1];
+          // The last word has nothing after it to end against. Its own trailing token
+          // (usually the full stop) is the best mark there is; failing that, hold it for
+          // a beat rather than giving it zero length.
+          const end = next ? next.start : Math.max(m.last, m.start + 0.24);
+          words.push({ w: m.w, start: m.start, end: Math.max(m.start, end), conf: m.conf });
+        });
+      } else if (toks.length) {
+        let cur = null;
+        for (const t of toks) {
+          const raw = String(t.text || '');
           const o = t.offsets || {};
           const ts = isFinite(Number(o.from)) ? Number(o.from) / 1000 : segStart;
           const te = isFinite(Number(o.to)) ? Number(o.to) / 1000 : ts;
@@ -156,7 +199,17 @@
         }
       }
     }
-    return cleanWords(words);
+    // Whisper pads its input to 30 s chunks and times the tail against the PADDING, so
+    // the last word of a 2.8 s clip can come back ending at 30 s. Given the real duration,
+    // clip to it; without one, leave the words alone rather than guess.
+    const out = cleanWords(words);
+    if (duration > 0) {
+      for (const w of out) {
+        w.start = Math.min(w.start, duration);
+        w.end = Math.min(w.end, duration);
+      }
+    }
+    return out.filter((w) => w.end > w.start || !(duration > 0) || w.start < duration);
   }
 
   /** `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (VTT) to seconds. */

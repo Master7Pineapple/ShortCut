@@ -45,6 +45,50 @@
     ok('special tokens are dropped, including the ones without a trailing _',
       w.every((x) => !/\[_/.test(x.w)), JSON.stringify(w.map((x) => x.w)));
 
+    // ---- the DTW path, which is where real word timings actually come from.
+    // Whisper's per-token `offsets` are the SEGMENT's bounds copied onto every token:
+    // note that below the first token gets 130-2830 and every other one 2830-2830. Only
+    // `t_dtw` (in 10ms units) is a real per-token time. This is the shape a run with
+    // `-nfa --dtw base.en` produces, and it is a transcript of a real clip.
+    const dtwDoc = {
+      transcription: [{
+        offsets: { from: 0, to: 30000 },
+        text: ' That restaurant is 100% AI.',
+        tokens: [
+          { text: ' That', offsets: { from: 130, to: 2830 }, t_dtw: 28, p: 0.51 },
+          { text: ' restaurant', offsets: { from: 2830, to: 2830 }, t_dtw: 72, p: 0.97 },
+          { text: ' is', offsets: { from: 2830, to: 2830 }, t_dtw: 104, p: 0.99 },
+          { text: ' 100', offsets: { from: 2830, to: 2830 }, t_dtw: 136, p: 0.94 },
+          { text: '%', offsets: { from: 2830, to: 2830 }, t_dtw: 194, p: 0.81 },
+          { text: ' AI', offsets: { from: 2830, to: 2830 }, t_dtw: 230, p: 0.87 },
+          { text: '.', offsets: { from: 2830, to: 2830 }, t_dtw: 280, p: 0.80 },
+          { text: '<|endoftext|>', offsets: { from: 30000, to: 30000 }, t_dtw: -1, p: 0.77 },
+        ],
+      }],
+    };
+    const dw = Captions.parseWhisper(dtwDoc, 2.833);
+    ok('t_dtw is preferred over the segment bounds every token carries',
+      dw.length === 5 && near(dw[0].start, 0.28) && near(dw[1].start, 0.72),
+      JSON.stringify(dw.map((x) => [x.w, x.start, x.end])));
+    ok('a word ends where the next one begins - t_dtw is an instant, not a span',
+      near(dw[0].end, 0.72) && near(dw[2].end, 1.36), JSON.stringify(dw.map((x) => x.end)));
+    ok('the last word ends on its own trailing token, not on the segment',
+      near(dw[4].end, 2.80), dw[4] && dw[4].end);
+    ok('`<|endoftext|>` is dropped, like the bracketed specials',
+      dw.every((x) => !/[<[]\|?_/.test(x.w)), JSON.stringify(dw.map((x) => x.w)));
+    ok('and whisper pads to 30s, so the tail is clipped to the real duration',
+      dw.every((x) => x.end <= 2.833 + 1e-6), JSON.stringify(dw.map((x) => x.end)));
+    ok('punctuation stays attached to its word', dw[4] && dw[4].w === 'AI.', dw[4] && dw[4].w);
+    // No t_dtw anywhere (flash attention left on, or an older build) - fall back rather
+    // than produce nothing.
+    const noDtw = Captions.parseWhisper({
+      transcription: [{ offsets: { from: 0, to: 2000 }, text: ' a b',
+        tokens: [{ text: ' a', offsets: { from: 100, to: 900 }, t_dtw: -1, p: 1 },
+                 { text: ' b', offsets: { from: 900, to: 1800 }, t_dtw: -1, p: 1 }] }],
+    });
+    ok('with no DTW at all it falls back to the offsets instead of failing',
+      noDtw.length === 2 && near(noDtw[0].start, 0.1), JSON.stringify(noDtw));
+
     // A plain --output-json has no tokens: the segment is spread across its own span.
     const flat = Captions.parseWhisper({
       transcription: [{ offsets: { from: 1000, to: 3000 }, text: 'one two', tokens: [] }],
@@ -313,6 +357,14 @@
         ['Transcribe', 'Import...', 'Generate captions', 'Clear'].every((t) =>
           [...panel.querySelectorAll('button')].some((b) => b.textContent === t)),
         [...panel.querySelectorAll('button')].map((b) => b.textContent).join(','));
+      // #capPanel is a bare <div>, not a `.pad` one, so without padding of its own every
+      // row sits hard against the column edge - unlike every other inspector panel.
+      const host = document.querySelector('#capPanel');
+      const hr = host.getBoundingClientRect(), br = panel.getBoundingClientRect();
+      ok('the panel is not flush against the column edge',
+        br.left - hr.left >= 6 && hr.right - br.right >= 6,
+        'gaps ' + Math.round(br.left - hr.left) + ' / ' + Math.round(hr.right - br.right));
+
       const uN = undoStack.length, dirtyWas = state.dirty;
       const slider = panel.querySelector('input[type=range]');
       slider.value = '4';

@@ -441,6 +441,12 @@ select, input[type=number], input[type=text] {
 .transition .thandle.l { left: 0; } .transition .thandle.r { right: 0; }
 .transition .thandle:hover { background: var(--accent); }
 
+/* The captions panel is a bare <div>, not a `.pad` one - without this its rows sit hard
+   against the column edge, unlike every other panel in the inspector. */
+#capPanel { padding: 8px 10px 16px; }
+#capPanel[hidden] { display: none; }
+#capPanel .afx-box:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+
 #transPanel[hidden] { display: none; }
 #transPanel { padding: 0 0 12px; }
 #btnDelTransition { padding: 0 6px; font-size: 14px; line-height: 1; }
@@ -470,10 +476,23 @@ select, input[type=number], input[type=text] {
 #meterPanel {
   flex: 0 0 220px; display: flex; flex-direction: column;
   border-left: 1px solid var(--line); background: var(--panel);
-  padding-bottom: 6px; overflow: hidden;
+  /* #bottom is a fixed 168px and this panel is `overflow: hidden`, so anything that does
+     not fit is not scrolled to - it is simply cut off. The note under the readout was,
+     which is why the bar heights below are chosen to leave room for it. */
+  padding-bottom: 8px; overflow: hidden;
 }
 #meterPanel .panel-head { display: flex; align-items: center; justify-content: space-between; }
-#meterCanvas { width: calc(100% - 16px); height: 104px; margin: 6px 8px 4px; display: block; }
+/* #bottom is a fixed height, so something in here has to give. Make the BARS the only
+   thing that can: the head, the readout and the note keep their size and the canvas
+   absorbs whatever is left. Letting the flex layout shrink everything a little instead
+   left the whole column still overflowing, and the note cut off against the bottom of
+   the window. drawMeter() sizes the backing store from this box every frame, so the
+   height lives here and here only - index.html's width/height are just a first guess. */
+#meterPanel > * { flex: none; }
+#meterCanvas {
+  width: calc(100% - 16px); height: 88px; margin: 5px 8px 4px; display: block;
+  flex: 1 1 auto; min-height: 46px;
+}
 #meterReadout {
   display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px;
   margin: 0 8px; font-size: 11px; color: var(--dim);
@@ -485,4 +504,4 @@ select, input[type=number], input[type=text] {
 }
 #meterReadout i.over { color: #ff6b5e; }
 #meterReadout i.on { color: #6fdc8c; }
-#meterNote { margin: 6px 8px 0; }
+#meterNote { margin: 5px 8px 0; }

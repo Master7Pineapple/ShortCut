@@ -271,6 +271,20 @@
         Math.abs(live.shortTerm() - I) < 0.2);
     }
 
+    // ================================================ the panel's own layout
+    // #bottom is a fixed height and #meterPanel is `overflow: hidden`, so anything that
+    // does not fit is not scrolled to - it is cut off. The note under the readout was,
+    // sitting flush against the bottom of the window with its descenders clipped.
+    const mPanel = document.querySelector('#meterPanel');
+    const mNote = document.querySelector('#meterNote');
+    const pr = mPanel.getBoundingClientRect(), nr = mNote.getBoundingClientRect();
+    ok('the meter note is not clipped against the bottom of the panel',
+      nr.bottom <= pr.bottom - 4,
+      'note ends at ' + Math.round(nr.bottom) + ', panel at ' + Math.round(pr.bottom));
+    ok('and the bars still have room to be readable',
+      document.querySelector('#meterCanvas').getBoundingClientRect().height >= 46,
+      Math.round(document.querySelector('#meterCanvas').getBoundingClientRect().height) + 'px');
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {
