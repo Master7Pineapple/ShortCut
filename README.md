@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are eighteen suites:
+There are nineteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -113,6 +113,17 @@ There are eighteen suites:
   serialising and reloading intact), the filler-word hook joining Tighten's own plan, and
   that a missing file fails cleanly. It needs **no fixture and no whisper.cpp**: the
   transcript goes in through `setTranscript()`, the same door "Import transcript" uses.
+- `tools/smoke-layers.js` — real layers: a PNG importing as a `kind:'image'` clip on a
+  video track with no in-point and no source-length ceiling, that it serialises and
+  reloads intact, that the job lists layers bottom-up, that a still becomes a
+  `-loop 1 -t <len> -i` input and every picture chain carries `format=yuva420p`, that the
+  preview composites a 50%-alpha PNG over footage to the arithmetic blend, that an
+  undecodable layer is skipped **without clearing what is below it**, that hiding a track
+  drops it out of the composite, that a real ffmpeg render lands on the same sampled
+  pixels as the preview canvas, that double-clicking a still in the bin puts it on the
+  timeline at the playhead, and that one undo restores an image clip exactly. It needs
+  `flat_blue.mp4` and `half_red.png` in `%TEMP%\scut_test` (its header gives the two
+  ffmpeg commands).
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -174,6 +185,7 @@ here too, or the suites will hang instead of failing.
 package.json
 tools/smoke.js            timeline-logic test suite (see Testing above)
 tools/smoke-preview.js    playback/compositing test suite
+tools/smoke-layers.js     alpha compositing + stills-on-the-timeline test suite
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -1581,9 +1593,24 @@ Every clip lazily gets its own `<video>`/`<audio>` element (`mediaFor()`, cached
 `syncMedia()` plays/pauses/re-seeks each element that overlaps the playhead (re-seeking
 only when drift exceeds 0.3 s so playback is not constantly stuttering) and puts each audio
 clip's level and mute onto it through `applyPreviewMix()` - see "The audio chain" for what
-the preview does and does not honour. The canvas draws
-only the topmost visible video clip — there is no compositing or blending, so a clip on
-V2 fully hides V1 beneath it.
+the preview does and does not honour.
+
+The canvas **composites every visible video track, bottom-up, with alpha**.
+`activeLayers()` returns the clips under the playhead in the same order `buildJob()` walks
+the tracks in - bottom track first - so a clip on V2 draws over V1, a semi-transparent
+still lets what is underneath through, and a text card on V1 sits *below* footage on V2
+exactly as it does in the render. Hidden tracks and locked-out kinds simply never enter
+the list.
+
+Compositing needs every layer at once, which is what `layerSurfaces` is for: one scratch
+canvas per picture clip, holding its last successfully decoded frame already framed to the
+output size, **cleared to transparent rather than black** so alpha survives. A `<video>`
+that is mid-seek has no frame to give back, and a naive loop would drop that layer to
+nothing the instant it started seeking - the old black-flash bug, except now it can punch
+a hole in the middle of a stack. Holding the last good frame means a not-yet-decoded
+element is *skipped*, not cleared, and there is a test for exactly that. If **nothing** in
+the stack has a frame yet the canvas is left alone entirely; only a genuine gap (no
+visible clips at all) paints black.
 
 Three rules in here are load-bearing for a flicker-free preview, all learned the hard way:
 
@@ -1710,9 +1737,10 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
   `importPaths(paths, { at })`, which places clips on the first track that is actually
   free over that span rather than on top of what is already there, adding a track if
   every one is taken.
-- Stills can live in the bin even though the timeline has no images. Double-clicking one
-  hands it to the selected **object transition**, which is the one place the app uses a
-  PNG; with no object transition selected it says so rather than doing nothing.
+- Stills are ordinary timeline media now. Double-clicking one places it at the playhead
+  like any other import - **unless an object transition is selected**, in which case it is
+  handed to that transition instead. Selecting the transition first is what says "this one
+  is for you"; that is the one place in the app that wants a PNG rather than a clip.
 - Drops that land on the bin panel go into the bin, not onto the timeline - the bin's
   handler calls `stopPropagation()`. The drop overlay is therefore cleared by a
   **capture-phase** listener in `app.js`, or it would stay up over an import the
@@ -1732,6 +1760,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A timeline-wide editing op | a function in `app.js` §7 + a button in `index.html` + one `addEventListener` in section 10 + a row in `SHORTCUTS` and the `keydown` handler |
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
+| A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain |
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
@@ -1769,14 +1798,23 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   still work from an imported transcript.
 - Captions are generated for the **selected** clips, from their linked audio, and land on
   one caption track. Regenerating replaces only the cards this generator made.
-- Text cards cover the still-image and shape needs; the timeline still holds no images
-  (the QuickBin will keep them, and an object transition will use one, but nothing puts a
-  still on a track).
+- Stills (PNG, JPG, WebP, GIF, BMP) are `kind:'image'` clips on video tracks: the same
+  pan/zoom framing as footage, no decoder, and no source-length ceiling - `in` stays 0,
+  `mediaDuration` is 3600 like a text card's, and the length is whatever `out` says. They
+  import at 5 s by default (`IMAGE_DEFAULT_DUR` in `main.js`).
 - Several text cards can be edited at once: the panel shows the first and mirrors every
   change onto the rest — see "Editing several cards at once".
 - Audio clips draw a waveform; video clips have no thumbnails.
 - Preview is nearest-frame accurate, not frame-exact; the render is the source of truth.
-- Video-track compositing is topmost-wins, not alpha blending.
+- Video-track compositing is bottom-up alpha blending, in the preview and in the render
+  alike. The two agree on **who is on top** exactly; they agree on the blended *value* to
+  within about 4% of full scale, because ffmpeg blends through yuv420p while the canvas
+  blends in RGB. `tools/smoke-layers.js` asserts that tolerance rather than equality. It
+  is the clearest remaining case of the same picture being built twice, and step 6's
+  bake-first render is what removes it.
+- A transition still shows only its own two clips: `drawTransitionFrame()` owns the whole
+  frame for the length of the window, so anything on a track above it is not composited
+  over the transition in the preview. Text cards are, as before.
 - Deleting a track deletes its clips with it (undoable).
 
 ### Packaging a standalone .exe

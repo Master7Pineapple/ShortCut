@@ -225,6 +225,7 @@ select, input[type=number], input[type=text] {
 :root { --text-clip: #6b4b9a; --text-clip-sel: #a97bff; }
 
 .clip.text { background: var(--text-clip); }
+.clip.image { background: #4a5f8a; }
 .clip.text .label { font-style: italic; }
 
 /* The waveform sits behind the label, which keeps its own text shadow for contrast. */

@@ -317,9 +317,9 @@ const QuickBin = (() => {
   /**
    * Put the selected entries to work.
    *
-   * Video and audio go onto the timeline at the playhead. A still has nowhere to go -
-   * the timeline holds no images - so it is offered to the selected object transition
-   * instead, which is the one place the app does use a PNG.
+   * Everything goes onto the timeline at the playhead now that stills are timeline media
+   * too - except when an object transition is selected, which still wants a PNG handed
+   * to it. `useImage` owns that choice; the bin only says which entries are stills.
    */
   async function use(ids) {
     const items = [...(ids || selection)].map(itemOf).filter(Boolean);
@@ -331,7 +331,7 @@ const QuickBin = (() => {
       hooks.log('QuickBin: ' + gone.length + ' entry(ies) point at files that are no longer there.');
     }
     if (media.length && hooks.insert) await hooks.insert(media.map((i) => i.path));
-    if (images.length && hooks.useImage) hooks.useImage(images[0].path);
+    if (images.length && hooks.useImage) await hooks.useImage(images.map((i) => i.path));
   }
 
   /** Fold a folder's contents into the same call, so "add" on a folder adds its media. */

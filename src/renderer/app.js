@@ -140,6 +140,15 @@ const mediaEls = new Map();
 function mediaFor(clip) {
   let el = mediaEls.get(clip.id);
   if (el) return el;
+  // A still is an <img>: no decoder, no clock, nothing to seek. It lives in the same map
+  // as the media elements because everything downstream - the compositor, the framing
+  // draw, eviction - only ever asks it for a picture and its natural size.
+  if (clip.kind === 'image') {
+    el = document.createElement('img');
+    el.src = 'file:///' + clip.src.replace(/\\/g, '/').replace(/^\/+/, '');
+    mediaEls.set(clip.id, el);
+    return el;
+  }
   el = document.createElement(clip.kind === 'video' ? 'video' : 'audio');
   el.src = 'file:///' + clip.src.replace(/\\/g, '/').replace(/^\/+/, '');
   el.preload = 'auto';
@@ -149,10 +158,25 @@ function mediaFor(clip) {
   return el;
 }
 
+/** Does this element have a picture to draw right now? */
+function frameReady(el) {
+  if (!el) return false;
+  if (el.tagName === 'IMG') return !!(el.complete && el.naturalWidth);
+  return el.readyState >= 2 && !!el.videoWidth;
+}
+/** Natural pixel size of whatever kind of element this is. */
+function elW(el) { return (el && (el.videoWidth || el.naturalWidth)) || 0; }
+function elH(el) { return (el && (el.videoHeight || el.naturalHeight)) || 0; }
+
 function dropMedia(clipId) {
   const el = mediaEls.get(clipId);
-  if (el) { try { el.pause(); } catch (e) {} el.removeAttribute('src'); el.load(); }
+  if (el && el.tagName !== 'IMG') {
+    try { el.pause(); } catch (e) {}
+    el.removeAttribute('src');
+    el.load();
+  }
   mediaEls.delete(clipId);
+  dropLayerSurface(clipId);
   dropPreviewGain(clipId);
 }
 
@@ -565,7 +589,18 @@ async function importPaths(paths, opts) {
     const linkId = nextId();
     const vt = at == null ? vTrack : freeTrack('video', cursor, cursor + m.duration);
     const at_ = at == null ? aTrack : freeTrack('audio', cursor, cursor + m.duration);
-    if (m.kind === 'video') {
+    if (m.kind === 'image') {
+      // A still has no decoder and no source duration to run out of, so - exactly like a
+      // text card - `in` stays 0, the clip's length is simply `out`, and `mediaDuration`
+      // is left effectively unbounded so it can be stretched as far as anyone wants.
+      vt.clips.push({
+        id: nextId(), src: m.path, name: m.name, kind: 'image',
+        start: cursor, in: 0, out: m.duration, mediaDuration: 3600,
+        srcW: m.width, srcH: m.height, fps: 0,
+        panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
+        linkId: null,
+      });
+    } else if (m.kind === 'video') {
       vt.clips.push({
         id: nextId(), src: m.path, name: m.name, kind: 'video',
         start: cursor, in: 0, out: m.duration, mediaDuration: m.duration,
@@ -891,6 +926,7 @@ function deleteTransition(id) {
 // ========================================== 4. timeline rendering
 
 function renderAll() {
+  pruneLayerSurfaces();
   renderHeads();
   renderLanes();
   renderRuler();
@@ -1452,7 +1488,12 @@ function renderInspector() {
   }
   const c = row.clip;
   const isText = c.kind === 'text';
+  const isStill = c.kind === 'image';
+  // A still and a card share every "there is no source clock here" row: no in/out to
+  // show, no link, and nothing to set a volume on.
+  const noClock = isText || isStill;
   const source = isText ? 'text card'
+    : isStill ? (c.srcW ? c.srcW + 'x' + c.srcH + ' still' : 'still')
     : (c.srcW ? c.srcW + 'x' + c.srcH + ' @' + c.fps + 'fps' : 'audio');
   const name = isText
     ? (String(c.card.text).split(/\r?\n/)[0].slice(0, 40) || '(empty)')
@@ -1465,9 +1506,9 @@ function renderInspector() {
     '<b>Source</b><span>' + source + '</span>' +
     '<b>Start</b><span>' + fmtTc(c.start) + '</span>' +
     '<b>Length</b><span>' + fmtTc(c.out - c.in) + '</span>' +
-    (isText ? '' : '<b>In / Out</b><span>' + fmtTc(c.in) + ' - ' + fmtTc(c.out) + '</span>') +
-    (isText ? '' : '<b>Linked</b><span>' + (c.linkId ? 'yes' : 'no') + '</span>') +
-    (isText ? '' :
+    (noClock ? '' : '<b>In / Out</b><span>' + fmtTc(c.in) + ' - ' + fmtTc(c.out) + '</span>') +
+    (noClock ? '' : '<b>Linked</b><span>' + (c.linkId ? 'yes' : 'no') + '</span>') +
+    (noClock ? '' :
       '<b>Volume</b><span class="kv-range">' +
       '<input id="clipVol" type="range" min="0" max="2" step="0.01" value="' + c.volume + '">' +
       '<input id="clipVolN" class="tc-num" type="number" min="0" max="4" step="0.01" value="' + c.volume + '">' +
@@ -2416,13 +2457,16 @@ function resizeCanvas() {
   $('#aspectBadge').textContent = state.out.w > state.out.h ? '16:9' : '9:16';
 }
 
-/** Clips under the playhead, topmost visible video first. */
+/** A clip that puts pixels on the canvas through an element: footage or a still. */
+function isPictureClip(c) { return c && (c.kind === 'video' || c.kind === 'image'); }
+
+/** Picture clips under the playhead, topmost visible first. */
 function activeVideoClip() {
   const eps = 1e-6;
   for (const t of state.tracks) {
     if (t.type !== 'video' || t.hidden) continue;
     for (const c of t.clips) {
-      if (c.kind !== 'video') continue;
+      if (!isPictureClip(c)) continue;
       if (state.playhead >= c.start - eps && state.playhead < clipEnd(c) - eps) return c;
     }
   }
@@ -2431,10 +2475,37 @@ function activeVideoClip() {
   if (dur > 0 && state.playhead >= dur - eps) {
     for (const t of state.tracks) {
       if (t.type !== 'video' || t.hidden) continue;
-      for (const c of t.clips) if (c.kind === 'video' && Math.abs(clipEnd(c) - dur) < 0.001) return c;
+      for (const c of t.clips) if (isPictureClip(c) && Math.abs(clipEnd(c) - dur) < 0.001) return c;
     }
   }
   return null;
+}
+
+/**
+ * Every visible clip under the playhead, BOTTOM track first - the order they composite in.
+ *
+ * This is the same order `buildJob()` walks the tracks in, which is what makes the
+ * preview and the render agree about who is on top: a clip on V2 draws over a clip on
+ * V1, and a text card on V1 draws under both.
+ *
+ * The last frame of the timeline is a deliberate special case for the same reason
+ * `activeVideoClip()` has one: parking the playhead on the very end should hold the final
+ * picture rather than fall off into black.
+ */
+function activeLayers() {
+  const eps = 1e-6;
+  const dur = projectDuration();
+  const atEnd = dur > 0 && state.playhead >= dur - eps;
+  const out = [];
+  for (const t of state.tracks) {
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c) && c.kind !== 'text') continue;
+      const live = state.playhead >= c.start - eps && state.playhead < clipEnd(c) - eps;
+      if (live || (atEnd && Math.abs(clipEnd(c) - dur) < 0.001)) out.push(c);
+    }
+  }
+  return out.reverse();
 }
 
 /**
@@ -2443,7 +2514,7 @@ function activeVideoClip() {
  */
 /** Framed draw at an explicit size, for baking at the job's resolution. */
 function drawClipTo(c, el, target, W, H) {
-  const sw = el.videoWidth || c.srcW, sh = el.videoHeight || c.srcH;
+  const sw = elW(el) || c.srcW, sh = elH(el) || c.srcH;
   if (!sw || !sh) return;
   const outAspect = state.out.w / state.out.h;
   const cw = Math.min(sw, sh * outAspect) / c.zoom;
@@ -2452,7 +2523,7 @@ function drawClipTo(c, el, target, W, H) {
 }
 
 function drawClip(c, el, target) {
-  const sw = el.videoWidth || c.srcW, sh = el.videoHeight || c.srcH;
+  const sw = elW(el) || c.srcW, sh = elH(el) || c.srcH;
   if (!sw || !sh) return;
   // Aspect comes from the OUTPUT, not the preview canvas: the crop must match the render.
   const outAspect = state.out.w / state.out.h;
@@ -2560,6 +2631,57 @@ function videoFrameCache() {
   return frameCache;
 }
 
+/**
+ * One scratch canvas per picture clip, holding its last successfully decoded frame,
+ * already framed to the output size and with its own alpha intact.
+ *
+ * Compositing several tracks means clearing and repainting the whole frame every time,
+ * and a <video> that is mid-seek has no frame to give back - so a naive loop would drop
+ * a layer to nothing the instant its element started seeking, which is the black-flash
+ * bug the single-clip path learned about years ago, only now it can punch a hole in the
+ * MIDDLE of a stack. Holding each layer's last good picture means a not-yet-decoded
+ * element is skipped without clearing what is underneath it.
+ *
+ * The surface is cleared to TRANSPARENT, never to black: a still with an alpha channel
+ * has to let the layers below it through.
+ */
+const layerSurfaces = new Map();   // clip.id -> canvas holding its last good frame
+
+function dropLayerSurface(clipId) { layerSurfaces.delete(clipId); }
+
+/**
+ * This clip's layer, repainted if its element has a frame, or its last good one if not.
+ * Returns null when it has never had a frame to hold.
+ */
+function layerFor(clip, P) {
+  let cv = layerSurfaces.get(clip.id);
+  if (!cv) {
+    cv = document.createElement('canvas');
+    cv.width = P.w; cv.height = P.h;
+    cv.dataset.held = '';
+    layerSurfaces.set(clip.id, cv);
+  }
+  // Resizing clears the canvas, so whatever it was holding goes with it.
+  if (cv.width !== P.w || cv.height !== P.h) {
+    cv.width = P.w; cv.height = P.h; cv.dataset.held = '';
+  }
+  const el = mediaFor(clip);
+  if (frameReady(el)) {
+    const c2 = cv.getContext('2d');
+    c2.clearRect(0, 0, P.w, P.h);
+    drawClip(clip, el, c2);
+    cv.dataset.held = '1';
+  }
+  return cv.dataset.held ? cv : null;
+}
+
+/** Forget the held frame of anything no longer on the timeline. */
+function pruneLayerSurfaces() {
+  const live = new Set();
+  for (const { clip } of allClips()) live.add(clip.id);
+  for (const id of [...layerSurfaces.keys()]) if (!live.has(id)) layerSurfaces.delete(id);
+}
+
 function drawPreview() {
   const P = previewSize();
 
@@ -2588,35 +2710,47 @@ function drawPreview() {
     // Frames not ready yet - fall through and show the plain clip rather than black.
   }
 
-  const c = activeVideoClip();
-  const texts = activeTextClips();
+  // Composite every visible video track, bottom-up, with alpha.
+  const layers = activeLayers();
   const cache = videoFrameCache();
 
-  if (c) {
-    const el = mediaFor(c);
-    if (el.readyState >= 2 && el.videoWidth) {
-      const cctx = cache.getContext('2d');
-      cctx.fillStyle = '#000';
-      cctx.fillRect(0, 0, P.w, P.h);
-      drawClip(c, el, cctx);
-      frameCacheValid = true;
-    }
-  } else {
-    frameCacheValid = false; // a real gap shows black, not the previous clip
-  }
-
-  // Without text there is nothing to composite, so keep the old cheap path: repaint only
-  // when a frame exists, and otherwise leave the canvas alone.
-  if (!texts.length) {
-    if (frameCacheValid) ctx.drawImage(cache, 0, 0);
-    else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, P.w, P.h); }
+  if (!layers.length) {
+    // A real gap shows black, not the previous frame.
+    frameCacheValid = false;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, P.w, P.h);
     return;
   }
 
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, P.w, P.h);
-  if (frameCacheValid) ctx.drawImage(cache, 0, 0);
-  drawTextLayer(texts);
+  const cctx = cache.getContext('2d');
+  const frameDur = 1 / state.out.fps;
+  let painted = false;
+  cctx.save();
+  cctx.globalCompositeOperation = 'source-over';
+  cctx.fillStyle = '#000';
+  cctx.fillRect(0, 0, P.w, P.h);
+  for (const c of layers) {
+    if (c.kind === 'text') {
+      // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
+      // proportionally smaller card - the layout is identical, there is just less to paint.
+      TextDraw.draw(cctx, c, P.w, P.h, state.playhead - c.start, frameDur);
+      painted = true;
+      continue;
+    }
+    const layer = layerFor(c, P);
+    if (!layer) continue;     // still decoding: skip it, keep what is underneath
+    cctx.drawImage(layer, 0, 0);
+    painted = true;
+  }
+  cctx.restore();
+
+  // Nothing in the whole stack has a frame yet (every element mid-seek, on the very first
+  // paint after an import). Leave the canvas exactly as it was rather than flash black.
+  if (!painted) return;
+
+  frameCacheValid = true;
+  ctx.clearRect(0, 0, P.w, P.h);
+  ctx.drawImage(cache, 0, 0);
 }
 
 /**
@@ -2627,7 +2761,7 @@ function drawPreview() {
  */
 function clipFrameAt(clip, atTime, name, P) {
   const el = mediaFor(clip);
-  if (!el || el.readyState < 2 || !el.videoWidth) return null;
+  if (!frameReady(el)) return null;
   const cv = transSurface(name, P.w, P.h);
   const c2 = cv.getContext('2d');
   c2.fillStyle = '#000';
@@ -2736,6 +2870,7 @@ function syncMedia() {
   const transIds = new Set((transTargets || []).map((x) => x.clip.id));
   if (transTargets) {
     for (const { clip, t } of transTargets) {
+      if (clip.kind === 'image') continue;   // a still has no clock to park
       const m = mediaFor(clip);
       m.muted = true;             // audio during a transition comes from the audio track
       if (state.playing) {
@@ -2755,6 +2890,18 @@ function syncMedia() {
 
   for (const { clip, track } of allClips()) {
     if (clip.kind === 'text') continue; // drawn from canvas, nothing to decode
+    if (clip.kind === 'image') {
+      // A still has no clock to keep in step, only a picture to have ready. Warming it
+      // on approach is the same reason video clips are pre-created: arriving at the cut
+      // with an <img> that has not loaded yet is one skipped layer.
+      const near = state.playhead >= clip.start - PRELOAD_AHEAD && state.playhead < clipEnd(clip) + 1;
+      if (near) mediaFor(clip);
+      else if (mediaEls.has(clip.id)) {
+        const dist = Math.max(clip.start - state.playhead, state.playhead - clipEnd(clip));
+        if (dist > EVICT_BEYOND) dropMedia(clip.id);
+      }
+      continue;
+    }
     if (transIds.has(clip.id)) continue;
     const active = state.playhead >= clip.start && state.playhead < clipEnd(clip);
     const el = mediaEls.get(clip.id);
@@ -2891,7 +3038,7 @@ document.addEventListener('mouseup', () => {
 });
 
 function framingTarget() {
-  const sel = selectedClips().map((x) => x.clip).filter((c) => c.kind === 'video');
+  const sel = selectedClips().map((x) => x.clip).filter(isPictureClip);
   if (sel.length) return sel;
   const a = activeVideoClip();
   return a ? [a] : [];
@@ -4067,7 +4214,8 @@ function buildJob(outPath, range) {
         // names as its voice source, so buildArgs() needs it to find the sidechain feed.
         trackId: t.id,
         afx: c.afx && c.afx.length ? JSON.parse(JSON.stringify(c.afx)) : undefined,
-        visible: (c.kind === 'video' || c.kind === 'text') && t.type === 'video' && !t.hidden,
+        visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
+          t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
       };
       if (c.kind === 'text') {
@@ -4591,12 +4739,16 @@ $('#btnImportFolder').addEventListener('click', async () => importPaths(await wi
 QuickBin.init({
   log,
   insert: (paths) => importPaths(paths, { at: state.playhead }),
-  // A still cannot go on the timeline, but it is exactly what an object transition
-  // wants, so double-clicking one in the bin hands it to the selected transition.
-  useImage: async (p) => {
+  // A still goes on the timeline like anything else - UNLESS an object transition is
+  // selected, which is the one thing in the app that wants a PNG rather than a clip.
+  // Selecting the transition first is what says "this one is for you".
+  useImage: async (paths) => {
+    const list = Array.isArray(paths) ? paths : [paths];
+    if (!list.length) return;
+    const p = list[0];
     const r = selectedTransition();
     if (!r || r.tr.type !== 'object') {
-      log('Select an object transition first - a still has nowhere else to go yet.');
+      await importPaths(list, { at: state.playhead });
       return;
     }
     pushUndo();

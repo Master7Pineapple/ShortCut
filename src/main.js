@@ -193,10 +193,38 @@ function probe(file) {
   });
 }
 
+/**
+ * Default length of a still dropped on the timeline, in seconds.
+ *
+ * A still has no duration of its own, so one has to be invented. The clip's
+ * `mediaDuration` is left effectively unbounded (like a text card's) so the length is
+ * freely settable afterwards - this is only where it starts.
+ */
+const IMAGE_DEFAULT_DUR = 5;
+
+/**
+ * A still's metadata, in the same shape a probed video's comes back in.
+ *
+ * ffprobe reads a PNG or JPEG happily and reports it as a one-frame video stream, so the
+ * dimensions come from the same place everything else's do; only `kind` and `duration`
+ * are ours.
+ */
+async function stillMeta(f) {
+  const m = await probe(f);
+  return {
+    path: f, name: path.basename(f), kind: 'image',
+    duration: IMAGE_DEFAULT_DUR,
+    width: m ? m.width : 0, height: m ? m.height : 0,
+    fps: 0, hasAudio: false,
+  };
+}
+
 ipcMain.handle('media:scan', async (_e, paths) => {
-  const files = expandPaths(paths || []);
+  // Stills are timeline media now, so the timeline importer takes them too.
+  const files = expandPaths(paths || [], true);
   const metas = [];
   for (const f of files) {
+    if (IMAGE_EXT.has(path.extname(f).toLowerCase())) { metas.push(await stillMeta(f)); continue; }
     const m = await probe(f);
     if (m && m.duration > 0) metas.push(m);
   }
@@ -204,7 +232,7 @@ ipcMain.handle('media:scan', async (_e, paths) => {
 });
 
 ipcMain.handle('media:pick', async () => {
-  const exts = [...VIDEO_EXT, ...AUDIO_EXT].map((e) => e.slice(1));
+  const exts = [...VIDEO_EXT, ...AUDIO_EXT, ...IMAGE_EXT].map((e) => e.slice(1));
   const r = await dialog.showOpenDialog(win, {
     title: 'Import media',
     properties: ['openFile', 'multiSelections'],
@@ -285,10 +313,7 @@ ipcMain.handle('bin:scan', async (_e, paths) => {
     if (IMAGE_EXT.has(ext)) {
       let size = 0;
       try { size = fs.statSync(f).size; } catch (err) { continue; }
-      out.push({
-        path: f, name: path.basename(f), kind: 'image',
-        duration: 0, width: 0, height: 0, fps: 0, hasAudio: false, size,
-      });
+      out.push(Object.assign(await stillMeta(f), { size }));
       continue;
     }
     const m = await probe(f);
@@ -1212,6 +1237,11 @@ function buildArgs(job, opts) {
         '-video_size', c.bw + 'x' + c.bh,
         '-framerate', String(fps),
         '-i', path.join(c.seqDir, 'frames.raw'));
+    } else if (c.kind === 'image') {
+      // A still is an endless input, so it needs an explicit duration or ffmpeg would
+      // sit on it forever - the filter's own trim ends the stream, but only after the
+      // demuxer has been asked for frames that will never stop coming.
+      args.push('-loop', '1', '-t', r3(Math.max(0.001, c.out - c.in)), '-i', c.src);
     } else {
       args.push('-i', c.src);
     }
@@ -1358,11 +1388,20 @@ function buildArgs(job, opts) {
     const cw = 'min(iw,ih*' + width + '/' + height + ')/' + r3(zoom);
     const ch = 'min(ih,iw*' + height + '/' + width + ')/' + r3(zoom);
     const scaleFlags = quality === 'draft' ? 'fast_bilinear' : 'bicubic';
+    // yuva420p, not yuv420p: overlay only honours a layer's alpha if the layer HAS an
+    // alpha channel. A PNG with a transparent background would otherwise arrive as an
+    // opaque black rectangle and hide everything below it. On an opaque source the extra
+    // plane is simply full, and the final [vout] converts back to yuv420p for the encoder.
+    // A still's input was already cut to length by its own -t, and it has no source
+    // timeline to seek into: its trim always starts at 0, whatever the range lopped off
+    // the head. Using c.in there would cut the same head off twice.
+    const tin = c.kind === 'image' ? 0 : c.in;
     fc.push(
-      '[' + idx + ':v]trim=start=' + r3(c.in) + ':duration=' + r3(dur) +
+      '[' + idx + ':v]trim=start=' + r3(tin) + ':duration=' + r3(dur) +
       ',setpts=PTS-STARTPTS+' + r3(c.start) + '/TB' +
       ",crop=w='" + cw + "':h='" + ch + "':x='(iw-ow)*" + r3(c.panX) + "':y='(ih-oh)*" + r3(c.panY) + "'" +
-      ',scale=' + width + ':' + height + ':flags=' + scaleFlags + ',setsar=1,fps=' + fps + '[v' + i + ']'
+      ',scale=' + width + ':' + height + ':flags=' + scaleFlags +
+      ',setsar=1,format=yuva420p,fps=' + fps + '[v' + i + ']'
     );
     // eof_action=repeat holds the clip's last frame instead of punching through to the
     // black base. Container duration often outruns the video stream (audio is longer, or
