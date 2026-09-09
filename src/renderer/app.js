@@ -1877,6 +1877,10 @@ async function refreshAudioPresets(rebuild) {
  * as one undo entry. A duck's voice track is not carried, because a track id means
  * nothing in another project - see AudioFX.extractPreset().
  */
+// The audio chain preset picked last, remembered across the panel rebuilding - see the
+// comment where the <select> is built.
+let lastAudioPreset = '';
+
 function audioFxPresetBar(clip, mirror) {
   const el = TextUI.el;
   const box = el('div', 'tc-preset-box');
@@ -1894,6 +1898,11 @@ function audioFxPresetBar(clip, mirror) {
   for (const n of audioPresetNames) {
     const o = el('option'); o.value = n; o.textContent = n; sel.appendChild(o);
   }
+  // Same trap as the text preset bar: applying a chain calls renderAll(), which rebuilds
+  // this panel and puts a fresh <select> back on "Choose a saved chain...". Without a
+  // remembered name, Delete could never see one.
+  if (lastAudioPreset && audioPresetNames.includes(lastAudioPreset)) sel.value = lastAudioPreset;
+  else lastAudioPreset = '';
   const apply = (data, what) => {
     pushUndo();
     const applied = AudioFX.applyPreset(clip, data);
@@ -1908,6 +1917,7 @@ function audioFxPresetBar(clip, mirror) {
       (ducks ? ' Choose a voice track for the ducking.' : ''));
   };
   sel.addEventListener('change', async () => {
+    lastAudioPreset = sel.value;
     if (!sel.value) return;
     const data = await window.api.loadPreset('audiofx', sel.value);
     if (!data) { log('Could not read that audio preset.'); return; }
@@ -1930,6 +1940,7 @@ function audioFxPresetBar(clip, mirror) {
     const data = AudioFX.extractPreset(clip.afx);
     data.name = name;
     nameInput.value = '';
+    lastAudioPreset = name;          // so Delete and Export act on what was just saved
     await window.api.savePreset('audiofx', name, data);
     await refreshAudioPresets(true);
     log('Saved audio chain preset "' + name + '".');
@@ -1943,9 +1954,12 @@ function audioFxPresetBar(clip, mirror) {
   const acts = el('div', 'tc-preset-acts');
   const del = el('button', 'mini', 'Delete');
   del.addEventListener('click', async () => {
-    if (!sel.value) { log('Pick a saved audio preset above first.'); return; }
-    await window.api.deletePreset('audiofx', sel.value);
+    const name = sel.value || lastAudioPreset;
+    if (!name) { log('Pick a saved audio preset above first.'); return; }
+    lastAudioPreset = '';
+    await window.api.deletePreset('audiofx', name);
     await refreshAudioPresets(true);
+    log('Deleted audio chain preset "' + name + '".');
   });
   const exp = el('button', 'mini', 'Export');
   exp.addEventListener('click', async () => {
@@ -5003,6 +5017,25 @@ TextUI.init({
     return d;
   },
   getClip: () => selectedTextClip(),
+  selectedCardCount: () => selectedTextClips().length,
+  applyToSelected: (kind, data, label) => {
+    const cards = selectedTextClips();
+    if (cards.length < 2) { log('Select more than one text card first.'); return; }
+    // ONE undo entry for the whole spread, like every other bulk operation.
+    pushUndo();
+    // `keepText` is not optional here even for a 'full' payload: the wording and the word
+    // timings are CONTENT, and copying the lead's across a selection of captions would
+    // give thirty cards the same sentence. It is the same rule TEXT_PEER_SKIP enforces
+    // for the panel's ordinary propagation.
+    for (const c of cards.slice(1)) TextModel.applyPreset(c.card, data, { keepText: true });
+    // The gesture baseline has to be re-taken, or the next edit to the lead would replay
+    // the differences this just erased back across the whole selection.
+    snapshotTextEdit();
+    markDirty();
+    renderAll();
+    log('Applied this card\'s ' + String(label || kind).toLowerCase() + ' to ' +
+      (cards.length - 1) + ' other selected card(s).');
+  },
   getLocalTime: () => {
     const c = selectedTextClip();
     return c ? state.playhead - c.start : 0;

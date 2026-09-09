@@ -405,6 +405,9 @@ select, input[type=number], input[type=text] {
 }
 .tc-preset-acts { display: flex; gap: 4px; }
 .tc-preset-acts button { flex: 1; }
+/* Full width and on its own row: the label is a sentence, not a verb. */
+.tc-preset-spread { width: 100%; margin-top: 4px; }
+.tc-preset-spread:disabled { opacity: 0.45; cursor: default; }
 
 .cache-info { color: var(--dim); font-size: 10px; align-self: center; }
 

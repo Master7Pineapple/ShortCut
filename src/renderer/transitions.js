@@ -302,9 +302,9 @@ const Trans = (() => {
     /**
      * Average `samples` offset-and-stretched copies of the plate.
      *
-     * The averaging is additive - each copy goes on with `lighter` at 1/samples - for the
-     * same reason the text cards' motion blur is: compositing them source-over at 1/n
-     * converges to ~63% opacity and visibly washes the picture out.
+     * Through `Anim.temporalAverage`, like every other motion blur in the app: it groups
+     * the samples instead of scaling each one by 1/samples, so the plate's soft padded
+     * edges survive the averaging rather than being quantised away.
      */
     const smearPlate = (pad, PW, PH) => {
       if (samples < 2) return pad;
@@ -315,10 +315,8 @@ const Trans = (() => {
       ac.globalAlpha = 1;
       ac.filter = 'none';
       ac.clearRect(0, 0, PW, PH);
-      ac.globalCompositeOperation = 'lighter';
-      ac.globalAlpha = 1 / samples;
       const cx = PW / 2, cy = PH / 2;
-      for (let i = 0; i < samples; i++) {
+      Anim.temporalAverage(ac, PW, PH, samples, (sc, i) => {
         const u = samples === 1 ? 0 : (i / (samples - 1)) - 0.5;
         let dx = 0, dy = 0, sx = 1, sy = 1;
         if (axis === 'x') { dx = u * reach; sx = 1 + u * str * 2; }
@@ -332,9 +330,9 @@ const Trans = (() => {
           const s = 1 + u * (str * 2 + dfm * 0.5);
           sx = s; sy = s;
         }
-        ac.setTransform(sx, 0, 0, sy, cx - cx * sx + dx, cy - cy * sy + dy);
-        ac.drawImage(pad, 0, 0);
-      }
+        sc.setTransform(sx, 0, 0, sy, cx - cx * sx + dx, cy - cy * sy + dy);
+        sc.drawImage(pad, 0, 0);
+      }, surface, 'smear');
       ac.setTransform(1, 0, 0, 1, 0, 0);
       ac.globalCompositeOperation = 'source-over';
       ac.globalAlpha = 1;
@@ -661,8 +659,10 @@ const Trans = (() => {
     const mb = tr.motionBlur || {};
     if (!mb.on || !frameDur) { paintObject(ctx, W, H, tr, e); return; }
 
-    // Same temporal sampling as text cards: draw the object at several instants across
-    // the shutter and average them additively.
+    // Same temporal sampling as text cards, through the same `Anim.temporalAverage`:
+    // draw the object at several instants across the shutter and average them. An
+    // object PNG's soft edges and any glow baked into it are exactly the faint pixels a
+    // naive 1/samples accumulation destroys.
     const samples = Math.max(2, Math.min(32, Math.round(mb.samples || 8)));
     const shutter = frameDur * Math.max(0, Math.min(2, mb.strength || 0));
     const dur = Math.max(0.001, tr.duration);
@@ -670,22 +670,10 @@ const Trans = (() => {
     if (t0 < 0) { t0 = 0; t1 = Math.min(1, shutter / dur); }
     if (t1 > 1) { t1 = 1; t0 = Math.max(0, 1 - shutter / dur); }
 
-    const sample = surface('objSample', W, H);
-    const sctx = sample.getContext('2d');
-    const accum = surface('objAccum', W, H);
-    const actx = accum.getContext('2d');
-    actx.clearRect(0, 0, W, H);
-    actx.save();
-    actx.globalCompositeOperation = 'lighter';
-    actx.globalAlpha = 1 / samples;
-    for (let i = 0; i < samples; i++) {
+    Anim.temporalAverage(ctx, W, H, samples, (sctx, i) => {
       const q = t0 + (i / (samples - 1)) * (t1 - t0);
-      sctx.clearRect(0, 0, W, H);
       paintObject(sctx, W, H, tr, TextModel.ease(tr.easing, q));
-      actx.drawImage(sample, 0, 0);
-    }
-    actx.restore();
-    ctx.drawImage(accum, 0, 0);
+    }, surface, 'obj');
   }
 
   /**

@@ -7,7 +7,7 @@
  * deliberately behaviour-preserving, and `TextModel` now re-exports these functions so
  * text cards keep behaving byte-identically.
  *
- * `Anim` owns four things and nothing else:
+ * `Anim` owns five things and nothing else:
  *
  *   1. Easing - the cubic bezier solver, the named curves a bezier cannot express,
  *      and the preset menu both of those feed.
@@ -15,9 +15,13 @@
  *   3. Track editing - add / remove / move / retime one key.
  *   4. A registry of which properties a clip may put keyframes on, so the inspector's
  *      keyframe strip can be built generically instead of listing them by hand.
+ *   5. `temporalAverage()` - the shutter. Motion blur is animation sampled across time
+ *      and averaged, so the one correct averaging lives here and every motion-blurred
+ *      thing in the app (text cards, transition objects, the swipe's plate) uses it.
  *
- * Pure functions, no DOM, no canvas: the UI lives in `TextUI.keyStrip()` and the drawing
- * lives in whoever reads the value back out. Keys are plain JSON on the clip, because
+ * Pure functions and no DOM: the UI lives in `TextUI.keyStrip()` and the drawing lives in
+ * whoever reads the value back out. `temporalAverage()` is the one exception - it touches
+ * canvases, because being in one place is worth more than being pure. Keys are plain JSON on the clip, because
  * undo is `JSON.stringify` of the track list and that is also the `.scut` file.
  */
 const Anim = (() => {
@@ -286,9 +290,101 @@ const Anim = (() => {
     return v == null ? fallback : v;
   }
 
+  // ------------------------------------------------------- temporal averaging
+
+  /**
+   * Average `samples` painted instants into one image: the shutter, for motion blur.
+   *
+   * Every motion-blurred thing in the app goes through here - text cards, transition
+   * objects and the swipe's plate smear - because the naive way to do it silently
+   * destroys everything soft.
+   *
+   * THE TRAP. The obvious implementation draws each sample onto one accumulator with
+   * `lighter` at `globalAlpha = 1/samples`. Canvas quantises each draw to 8 bits BEFORE
+   * adding it, so a pixel of alpha `a` contributes `round(a / samples)` - which is ZERO
+   * for every pixel with `a < samples/2`. At 16 samples everything below alpha 8 out of
+   * 255 vanishes; at 32 samples, everything below 16. A glyph at alpha 255 sails through,
+   * so the text stayed crisp and smeared correctly while the glow and the drop shadow
+   * around it - which live almost entirely in that faint range - were annihilated. The
+   * symptom was a card whose glow and shadow did not react to motion blur at all, and
+   * which got WORSE the more samples you asked for.
+   *
+   * THE FIX. Average in two levels. The samples are split into roughly `sqrt(n)` balanced
+   * groups; each group averages its own members at `1/groupSize`, then enters the
+   * accumulator weighted by how many samples it holds. The weights still sum to exactly
+   * one - this is the same mean as before, not a fudge - but the smallest alpha any
+   * quantisation ever sees is about `1/sqrt(n)` instead of `1/n`. At 32 samples that is
+   * the difference between a 16/255 cutoff and a 3/255 one, which is the difference
+   * between a glow that smears and a glow that disappears.
+   *
+   * Addition stays additive for the original reason: compositing samples source-over at
+   * 1/n converges to 1-(1-1/n)^n (~63%) and visibly washes the picture out.
+   *
+   * `paintSample(sctx, i)` paints sample `i` cleanly into a scratch canvas that has
+   * already been cleared and reset. `surface(name, w, h)` is the caller's own canvas
+   * pool, so no module allocates canvases per frame. `tag` namespaces the three scratch
+   * surfaces this needs, so two callers cannot share one by accident.
+   */
+  function temporalAverage(destCtx, W, H, samples, paintSample, surface, tag) {
+    const n = Math.max(1, Math.round(samples));
+    const pre = tag || 'ta';
+
+    /** A pooled canvas with a known-clean context: no transform, no filter, full alpha. */
+    const clean = (name) => {
+      const cv = surface(pre + name, W, H);
+      const c = cv.getContext('2d');
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.globalCompositeOperation = 'source-over';
+      c.globalAlpha = 1;
+      c.filter = 'none';
+      c.clearRect(0, 0, W, H);
+      return { cv, c };
+    };
+
+    if (n < 2) {
+      const only = clean('Sample');
+      paintSample(only.c, 0);
+      destCtx.drawImage(only.cv, 0, 0);
+      return;
+    }
+
+    // Balanced groups: sizes differ by at most one, so no group enters the accumulator at
+    // a much smaller weight than the rest. An unbalanced tail group would reintroduce the
+    // very cutoff this exists to avoid, for its own share of the picture.
+    const groups = Math.max(1, Math.round(Math.sqrt(n)));
+    const sizes = [];
+    for (let g = 0; g < groups; g++) {
+      sizes.push(Math.floor(n / groups) + (g < n % groups ? 1 : 0));
+    }
+
+    const accum = clean('Accum');
+    accum.c.globalCompositeOperation = 'lighter';
+
+    let i = 0;
+    for (const size of sizes) {
+      if (!size) continue;
+      const group = clean('Group');
+      group.c.globalCompositeOperation = 'lighter';
+      group.c.globalAlpha = 1 / size;
+      for (let j = 0; j < size; j++) {
+        const sample = clean('Sample');
+        paintSample(sample.c, i + j);
+        group.c.drawImage(sample.cv, 0, 0);
+      }
+      // The group holds the MEAN of its members, so it carries `size` of the `n` samples.
+      accum.c.globalAlpha = size / n;
+      accum.c.drawImage(group.cv, 0, 0);
+      i += size;
+    }
+
+    destCtx.drawImage(accum.cv, 0, 0);
+  }
+
   return {
     // easing
     EASING_PRESETS, NAMED, bezier, ease, cloneEasing,
+    // motion blur
+    temporalAverage,
     // tracks
     evalTrack, sortKeys, addKey, removeKey, moveKey, retimeKey,
     // keyable properties

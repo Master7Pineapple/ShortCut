@@ -689,30 +689,14 @@ const TextDraw = (() => {
     if (t1 > dur) { t1 = dur; t0 = Math.max(0, dur - shutter); }
     const span = t1 - t0;
 
-    // Each sample is painted cleanly (source-over) into `sample`, then ADDED into `accum`
-    // at 1/samples. The addition matters: compositing the samples straight onto the target
-    // with source-over at 1/n converges to 1-(1-1/n)^n (~63%), which visibly washes the
-    // text out. Additive accumulation of premultiplied samples is a true temporal average,
-    // so fully overlapping pixels come back to full opacity.
-    const sample = offscreen('mbSample', W, H);
-    const sctx = sample.getContext('2d');
-    const accum = offscreen('mbAccum', W, H);
-    const actx = accum.getContext('2d');
-    actx.clearRect(0, 0, W, H);
-
-    actx.save();
-    actx.globalCompositeOperation = 'lighter';
-    actx.globalAlpha = 1 / samples;
-    for (let i = 0; i < samples; i++) {
+    // The averaging itself is `Anim.temporalAverage` - shared with transitions, and
+    // grouped rather than naively scaled by 1/samples. That grouping is what lets the
+    // GLOW and the DROP SHADOW blur: both live almost entirely below alpha 16/255, which
+    // a straight 1/samples accumulation quantises to nothing. See the comment there.
+    Anim.temporalAverage(ctx, W, H, samples, (sctx, i) => {
       const st = t0 + (i / (samples - 1)) * span;
-      const sm = measure(sctx, clip, W, H, st);
-      sctx.clearRect(0, 0, W, H);
-      paint(sctx, clip, W, H, sm);
-      actx.drawImage(sample, 0, 0);
-    }
-    actx.restore();
-
-    ctx.drawImage(accum, 0, 0);
+      paint(sctx, clip, W, H, measure(sctx, clip, W, H, st));
+    }, offscreen, 'mb');
     return m;
   }
 

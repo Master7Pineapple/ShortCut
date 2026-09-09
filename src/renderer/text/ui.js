@@ -15,6 +15,13 @@ const TextUI = (() => {
   let host = null;          // { container, onEdit, onChanged, getClip, getLocalTime, seekLocal, log }
   let fonts = [];
   let openSections = { content: true, font: true, fill: false, effects: false, anim: true, keys: false, presets: false };
+  // The preset picked in each box, remembered ACROSS rebuilds.
+  //
+  // Picking a preset applies it, and applying it rebuilds the whole panel - which built a
+  // fresh <select> sitting back on "Choose a saved preset...". Every button that acted on
+  // "the preset selected above" therefore saw an empty value and did nothing, which is why
+  // Delete looked broken: there was never anything selected by the time it ran.
+  let lastPreset = { style: '', anim: '', full: '' };
   let editing = false;      // true between pointerdown and pointerup of one gesture
 
   // ------------------------------------------------------------- small utils
@@ -772,7 +779,12 @@ const TextUI = (() => {
       for (const name of names) {
         const o = el('option'); o.value = name; o.textContent = name; sel.appendChild(o);
       }
+      // Put the box back on whatever was picked last time, so the panel rebuilding under
+      // an applied preset does not lose track of which one it was.
+      if (lastPreset[k.kind] && names.includes(lastPreset[k.kind])) sel.value = lastPreset[k.kind];
+      else lastPreset[k.kind] = '';
       sel.addEventListener('change', async () => {
+        lastPreset[k.kind] = sel.value;
         if (!sel.value) return;
         const data = await host.loadLibraryPreset(k.kind, sel.value);
         if (!data) { host.log('Could not read preset "' + sel.value + '".'); return; }
@@ -797,6 +809,9 @@ const TextUI = (() => {
         const data = TextModel.extractPreset(k.kind, card);
         data.name = name;
         nameInput.value = '';
+        // Select what was just saved, so Delete and Export act on it without the author
+        // having to go and pick it out of the list first.
+        lastPreset[k.kind] = name;
         await host.saveLibraryPreset(k.kind, name, data);
       };
       nameInput.addEventListener('keydown', (e) => {
@@ -815,8 +830,10 @@ const TextUI = (() => {
       const del = el('button', 'mini', 'Delete');
       del.title = 'Delete the preset selected above';
       del.addEventListener('click', async () => {
-        if (!sel.value) { host.log('Pick a saved preset above first.'); return; }
-        await host.deleteLibraryPreset(k.kind, sel.value);
+        const name = sel.value || lastPreset[k.kind];
+        if (!name) { host.log('Pick a saved preset above first.'); return; }
+        lastPreset[k.kind] = '';
+        await host.deleteLibraryPreset(k.kind, name);
       });
 
       const exp = el('button', 'mini', 'Export');
@@ -832,6 +849,9 @@ const TextUI = (() => {
       imp.addEventListener('click', async () => {
         const data = await host.importPreset(k.kind);
         if (!data) return;
+        // An imported preset is not in the library, so nothing in the list describes the
+        // card any more - leaving a name selected would point Delete at the wrong file.
+        lastPreset[k.kind] = '';
         beginEdit();
         TextModel.applyPreset(card, data, { keepText: k.kind !== 'full' });
         endEdit();
@@ -840,11 +860,32 @@ const TextUI = (() => {
 
       acts.appendChild(del); acts.appendChild(exp); acts.appendChild(imp);
       box.appendChild(acts);
+
+      // Push this card's look onto every OTHER selected card, in one go.
+      //
+      // The panel's normal propagation carries only what changed during the current
+      // gesture (see cardDiff), which is what stops a multi-selection being flattened by
+      // an accidental nudge. That is the right default and the wrong thing when you
+      // actually DO mean "make these all look like this one" - hence an explicit button.
+      const n = host.selectedCardCount ? host.selectedCardCount() : 1;
+      const spread = el('button', 'mini tc-preset-spread',
+        'Apply to selected cards' + (n > 1 ? ' (' + n + ')' : ''));
+      spread.disabled = n < 2;
+      spread.title = n < 2
+        ? 'Select more than one text card to use this'
+        : 'Give all ' + n + ' selected cards this card\'s ' + k.label.toLowerCase() +
+          '. The wording and the word timings of each card stay their own.';
+      spread.addEventListener('click', () => {
+        if (host.applyToSelected) host.applyToSelected(k.kind, TextModel.extractPreset(k.kind, card), k.label);
+      });
+      box.appendChild(spread);
+
       wrap.appendChild(box);
     }
 
     wrap.appendChild(el('div', 'tc-hint',
-      'Style presets carry look only, animation presets carry layers/curves/keys, full cards carry both plus the text.'));
+      'Style presets carry look only, animation presets carry layers/curves/keys, full cards carry both plus the text. ' +
+      '"Apply to selected cards" never copies the wording or the word timings - only the look.'));
     return wrap;
   }
 

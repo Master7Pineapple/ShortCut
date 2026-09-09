@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are seventeen suites:
+There are eighteen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -49,6 +49,13 @@ There are seventeen suites:
   **absent** until something is keyed and is pruned away again when it is cleared, the
   property registry, that the clip inspector's strip is built entirely from it, and that
   `TextModel` re-exports the engine rather than carrying a second copy of it.
+- `tools/smoke-mblur.js` — the shutter and the preset bar: that a soft drop shadow and a
+  glow are *widened* by motion blur rather than eaten by it, that the result does not
+  depend on the sample count, that strength still drives the spread, that averaging a
+  constant is a no-op to within one 8-bit level (odd sample counts included) — and, for
+  the preset bar, that the panel remembers which preset is selected across the rebuild an
+  applied preset causes, that **Delete** therefore actually deletes, and that "Apply to
+  selected cards" reaches every follower, never copies the wording, and is one undo entry.
 - `tools/smoke-text.js` — text cards: easing, animation layers, keyframes, canvas
   painting, motion blur, presets and the render job shape.
 - `tools/smoke-text2.js` — the second round of text work: motion-blur shutter clamping,
@@ -1064,13 +1071,15 @@ differently in the two cases and the preview would stop matching the MP4.
 and over an opaque background.
 
 **Motion blur** is real temporal sampling, not a blur filter: the card is drawn at
-`samples` instants across the shutter and averaged. Two rules:
+`samples` instants across the shutter and averaged. The averaging is
+`Anim.temporalAverage()` — see "The shutter" below, which every motion-blurred thing in
+the app shares. Two rules:
 
 1. The averaging **must** be additive - each sample is painted into a scratch canvas, then
-   composited into an accumulator with `globalCompositeOperation = 'lighter'` at
-   `1/samples`. Compositing the samples straight onto the target with source-over at `1/n`
-   converges to `1-(1-1/n)^n` (~63%) and visibly washes the text out; a static-card test
-   guards this by requiring full opacity back.
+   composited into an accumulator with `globalCompositeOperation = 'lighter'`. Compositing
+   the samples straight onto the target with source-over at `1/n` converges to
+   `1-(1-1/n)^n` (~63%) and visibly washes the text out; a static-card test guards this by
+   requiring full opacity back.
 2. The shutter is **slid to stay inside the clip**, never centred past its ends. A centred
    shutter at `t=0` puts half its samples at negative time, where every animation clamps to
    its start state - those samples all stack in one place and punch a sharp, saturated copy
@@ -1113,6 +1122,58 @@ finished MP4. Do not "optimise" this back into an image format.
   cannot have changed. See below.
 - Cost when the cache misses: one PNG encode per frame per card. A 3 s card at 30 fps is
   90 encodes, a couple of seconds.
+
+### The shutter
+
+Three things in the app blur by sampling across time — text cards, the transition object,
+and the swipe's plate deform. All three call **`Anim.temporalAverage()`**, and there is
+exactly one implementation because the naive one is wrong in a way that is very hard to
+see.
+
+**The trap.** The obvious way to average `n` painted samples is to composite each onto one
+accumulator with `lighter` at `globalAlpha = 1/n`. Canvas quantises every draw to 8 bits
+*before* adding it, so a pixel of alpha `a` contributes `round(a / n)` — which is **zero**
+for every pixel with `a < n/2`. At 16 samples everything below alpha 8/255 disappears; at
+32 samples, everything below 16/255.
+
+A glyph sits at alpha 255 and sails through, so the text smeared correctly and looked
+fine. A **glow** and a **drop shadow** live almost entirely in that faint range, so they
+were not blurred — they were deleted, and deleted harder the more samples you asked for.
+The symptom was a card whose glow and shadow did not react to motion blur at all: turning
+the sample count up made them *worse*, and the blurred shadow came out **narrower** than
+the un-blurred one.
+
+**The fix** is to average in two levels. The samples are split into roughly `sqrt(n)`
+balanced groups; each group averages its own members at `1/groupSize`, then enters the
+accumulator weighted by how many samples it holds. The weights still sum to exactly one —
+this is the same mean, not a fudge — but the smallest alpha any quantisation sees is about
+`1/sqrt(n)` instead of `1/n`. At 32 samples that is a 3/255 cutoff instead of 16/255.
+
+Measured on a card with a 60px drop shadow, sliding, at 16 samples and strength 2:
+
+| | shadow body (columns ≥ alpha 100) | glow spread (columns ≥ alpha 2) |
+| --- | --- | --- |
+| no motion blur | 109 | 256 |
+| old, 16 samples | 68 — *narrower than unblurred* | 277 |
+| old, 32 samples | 100, and falling | 259 — *collapses again* |
+| now, 16 samples | 126 | 297 |
+| now, 32 samples | 126 | 299 |
+
+Two properties worth keeping, both asserted in `tools/smoke-mblur.js`:
+
+- **Sample count is a quality knob, not a look knob.** How much shadow there is must not
+  change when you ask for more samples. It used to change by 20%.
+- **Strength still drives the spread.** More shutter means more smear, on the glow and the
+  shadow as much as on the glyphs.
+
+The grouping costs one thing: the average is exact to within **one 8-bit level** rather
+than exactly exact, because the group weights are rounded per draw and a sample count that
+does not divide evenly (31 into 6 groups) can land a single level low. One part in 255 on
+a flat field is a fair price for everything below alpha 16 coming back.
+
+`temporalAverage()` takes the caller's own canvas pool (`offscreen` in `text/draw.js`,
+`surface` in `transitions.js`) and a `tag`, so nothing allocates a canvas per frame and
+two callers cannot collide on one scratch surface.
 
 ### The bake cache
 
@@ -1194,8 +1255,8 @@ hands it canvases.
   `deformSamples` times, each copy offset and scaled a little differently, and the copies
   are averaged. Two rules, both the same ones the text cards' motion blur lives by:
 
-  1. The averaging is **additive** - each copy is composited with `lighter` at
-     `1/samples`. Source-over at `1/n` converges to `1-(1-1/n)^n` (~63%) and visibly
+  1. The averaging is **additive**, through `Anim.temporalAverage()` like every other
+     motion blur here. Source-over at `1/n` converges to `1-(1-1/n)^n` (~63%) and visibly
      washes the picture out; there is a flat-white-plate test for exactly that.
   2. The offsets run **symmetrically about zero** (`u` in -0.5..0.5), so the picture
      smears in place. Running them from 0 outwards moves the average off its own centre
@@ -1455,6 +1516,26 @@ audio preset drops a duck's `voiceTrack` — a track id means nothing in another
 an applied duck comes back needing a voice track chosen, and the log says so rather than
 silently ducking to nothing.
 
+**A picked preset has to be remembered across the rebuild it causes.** Applying a preset
+rebuilds the whole panel, which builds a *fresh* `<select>` sitting back on "Choose a
+saved preset...". Every button that acts on "the preset selected above" — Delete, in
+practice — therefore saw an empty value and did nothing, which is exactly what a broken
+button looks like. `lastPreset` in `text/ui.js` (and `lastAudioPreset` in `app.js`, which
+had the identical bug) holds the name across rebuilds and puts the box back on it. Saving
+selects what was just saved; importing clears the selection, because an imported preset is
+not in the library and leaving a name selected would aim Delete at the wrong file.
+
+**"Apply to selected cards"** sits at the bottom of each preset box. The panel's ordinary
+propagation carries only what *changed* during the current gesture (see `cardDiff`), which
+is what stops a multi-selection being flattened by an accidental nudge — the right default,
+and the wrong thing when you actually do mean "make these all look like this one". The
+button extracts that box's payload from the lead and applies it to every other selected
+card, as **one** undo entry, always with `keepText: true`: the wording and the word
+timings are content, and copying the lead's across a selection of captions would give
+thirty cards the same sentence. It is the same rule `TEXT_PEER_SKIP` enforces. The audio
+chain panel needs no such button — a chain applied there already mirrors onto every
+selected clip.
+
 **`window.prompt()` does not exist in Electron.** It returns nothing and silently does
 nothing, which is why saving a preset appeared to work and then never showed up in the
 list. The preset panel uses an inline name field instead - do not "simplify" it back to a
@@ -1659,6 +1740,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
+| Anything that blurs by sampling across time | `Anim.temporalAverage()` — never a hand-rolled `lighter` at `1/samples` accumulator, see "The shutter" |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
 
