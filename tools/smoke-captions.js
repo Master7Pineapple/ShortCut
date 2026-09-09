@@ -205,6 +205,77 @@
       pm.items.length === 1 && pm.items[0].paint == null,
       JSON.stringify(pm.items.map((it) => it.text)));
 
+    // ============================== 4b. word timing and emphasis
+    // The transcript is word-level, so a caption can land on the syllable. The times go
+    // on the card in the CARD's own base (seconds from the clip's start), which is the
+    // same `t` every paint pass already runs on.
+    const wt = Captions.groupPhrases(W([
+      ['alpha', 10.0, 10.5], ['beta', 10.5, 11.0], ['gamma', 11.0, 11.5],
+    ]), { maxWords: 3, minDur: 0 })[0];
+    const wtCard = Captions.phraseCard(base, wt, {
+      wordReveal: true, wordEmphasis: true, emphasisColor: '#ff0000',
+      emphasisScale: 1.3, emphasisRise: 10, emphasisAttack: 0.05, popIn: false,
+    });
+    ok('word times are stored relative to the CARD, not to the source',
+      JSON.stringify(wtCard.words.map((x) => [x.start, x.end])) === '[[0,0.5],[0.5,1],[1,1.5]]',
+      JSON.stringify(wtCard.words));
+    ok('and they are carried even with both effects off, so turning one on needs no regenerate',
+      (Captions.phraseCard(base, wt, {}).words || []).length === 3);
+
+    const wtClip = { in: 0, out: 2, card: wtCard };
+    const shown = (t) => TextDraw.measure(cctx, wtClip, 1080, 1920, t).items;
+    const s1 = shown(0.25), s2 = shown(0.75), s3 = shown(1.25);
+    ok('reveal: only the words already spoken are painted',
+      s1.length === 1 && s2.length === 2 && s3.length === 3,
+      [s1.length, s2.length, s3.length].join(','));
+    ok('emphasis: the word being said is the one that grows',
+      s2[1].scale > 1.2 && s2[0].scale === 1,
+      s2.map((i) => i.text + '=' + i.scale.toFixed(2)).join(' '));
+    ok('and it is the one that changes colour',
+      /rgb\(255,\s*0,\s*0\)/.test(String(s2[1].paint)) && !s2[0].paint,
+      s2.map((i) => i.text + '=' + i.paint).join(' '));
+    ok('a word settles back to normal once the next one starts',
+      s3[0].scale === 1 && s3[1].scale === 1 && s3[2].scale > 1.2,
+      s3.map((i) => i.text + '=' + i.scale.toFixed(2)).join(' '));
+    ok('emphasis lifts the word as well as growing it', s2[1].dy < 0, s2[1].dy);
+    // The bake crops to the union of the painted bounds across the clip, so the room a
+    // grown word needs has to be in the bounds at every t - not only while one is hot.
+    // Compared with reveal OFF in both, so the same three words are painted either way -
+    // otherwise the emphasised card is simply narrower for having fewer words up.
+    const boundsWith = (emph) => {
+      const c2 = JSON.parse(JSON.stringify(wtCard));
+      c2.wordFx = Object.assign({}, c2.wordFx, { reveal: false, emphasis: emph });
+      return TextDraw.measure(cctx, { in: 0, out: 2, card: c2 }, 1080, 1920, 0.75).bounds;
+    };
+    const bq = boundsWith(true), bc = boundsWith(false);
+    ok('the painted bounds reserve room for the growth, so the bake cannot crop it',
+      bq.w > bc.w && bq.h > bc.h,
+      Math.round(bq.w) + 'x' + Math.round(bq.h) + ' vs ' + Math.round(bc.w) + 'x' + Math.round(bc.h));
+
+    // Reveal and the typewriter compose rather than fight: both are per-unit states and
+    // they multiply, exactly as the animation layers do.
+    const both = JSON.parse(JSON.stringify(wtCard));
+    both.anims = Captions.phraseCard(base, wt, { popIn: true, popDur: 0.3 }).anims;
+    const bi = TextDraw.measure(cctx, { in: 0, out: 2, card: both }, 1080, 1920, 0.75).items;
+    ok('word reveal and the typewriter layer compose', bi.length === 2,
+      bi.map((i) => i.text).join(','));
+
+    // ============================== 4c. building from a saved preset
+    const preset = { kind: 'full', text: 'ignored', style: Object.assign(
+      TextModel.defaultStyle(), { fontFamily: 'Impact', fontSize: 44, y: 0.2 }),
+      animEnabled: true, anims: [], keys: {} };
+    const pBase = TextModel.applyPreset(TextModel.defaultCard(''), preset, { keepText: true });
+    const pCard = Captions.phraseCard(pBase, ph[0], { fromPreset: true, fontSize: 200, color: '#00ff00' });
+    ok('a preset supplies the look and the caption rows stop applying',
+      pCard.style.fontSize === 44 && pCard.style.fontFamily === 'Impact',
+      pCard.style.fontSize + ' ' + pCard.style.fontFamily);
+    ok('the wording is still the caption’s, never the preset’s',
+      pCard.text === ph[0].text, pCard.text);
+    ok('the safe zone still places it by default',
+      near(pCard.style.y, 0.73), pCard.style.y);
+    const pKeep = Captions.phraseCard(pBase, ph[0], { fromPreset: true, presetPlacement: true });
+    ok('unless the preset’s own placement is kept', near(pKeep.style.y, 0.2), pKeep.style.y);
+
     // ================================================ 5. generating onto the timeline
     markClean(); newProject();   // markClean first: a dirty project would raise a modal
     const vT = state.tracks.find((t) => t.type === 'video');

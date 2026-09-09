@@ -399,6 +399,67 @@
     ok('undo keeps recording after a previous drag', undoStack.length === u1 + 1,
       'undo grew by ' + (undoStack.length - u1));
 
+    // ================================================ editing several cards at once
+    // The panel stays single-card: it reads the LEAD and writes the lead, and the delta
+    // is mirrored onto the rest of the selection. Only what actually changed travels, so
+    // selecting five differently-styled cards and nudging one property does not flatten
+    // four of them to the lead's look.
+    markClean(); newProject();
+    const m1 = addTextCard('one');   m1.card.style.fontSize = 100; m1.card.style.fill.color = '#ff0000';
+    const m2 = addTextCard('two');   m2.card.style.fontSize = 50;  m2.card.style.fill.color = '#00ff00';
+    const m3 = addTextCard('three'); m3.card.style.fontSize = 70;
+    state.selection = new Set([m1.id, m2.id, m3.id]);
+    renderInspector();
+    const cards = selectedTextClips();
+    ok('several selected text cards all reach the panel', cards.length === 3, String(cards.length));
+    ok('the panel opens instead of refusing a multi-selection',
+      !document.querySelector('#textPanel').hidden);
+    ok('and says how many it is editing',
+      /3 cards/.test(document.querySelector('#textCardMeta').textContent),
+      document.querySelector('#textCardMeta').textContent);
+
+    const lead = selectedTextClip();
+    ok('the lead is the first card in timeline order', lead === cards[0]);
+    lead.card.style.fontSize = 123;
+    const nChanged = syncTextPeers();
+    ok('one changed property propagates as ONE change', nChanged === 1, String(nChanged));
+    ok('every selected card gets it',
+      cards.every((c) => c.card.style.fontSize === 123),
+      cards.map((c) => c.card.style.fontSize).join(','));
+    ok('and nothing else is flattened - the other looks survive',
+      m1.card.style.fill.color === '#ff0000' && m2.card.style.fill.color === '#00ff00',
+      [m1, m2, m3].map((c) => c.card.style.fill.color).join(','));
+    ok('the wording is never copied across',
+      [m1, m2, m3].map((c) => c.card.text).join(',') === 'one,two,three',
+      [m1, m2, m3].map((c) => c.card.text).join(','));
+
+    // Word timings and the keyword highlight are content too - a caption's own - so they
+    // must not travel either, or every card would be timed to the lead's words.
+    lead.card.words = [{ w: 'x', start: 0, end: 1 }];
+    lead.card.highlight = { color: '#123456', words: [0] };
+    snapshotTextEdit();
+    lead.card.style.rotate = 5;
+    syncTextPeers();
+    ok('word times and the keyword highlight stay with their own card',
+      !cards[1].card.words && !cards[1].card.highlight && cards[1].card.style.rotate === 5,
+      JSON.stringify({ w: !!cards[1].card.words, h: !!cards[1].card.highlight }));
+
+    // An array is one change, not a per-index reconciliation.
+    snapshotTextEdit();
+    lead.card.anims = [TextModel.defaultAnim('zoom', 'in')];
+    syncTextPeers();
+    ok('an animation layer list propagates whole',
+      cards.every((c) => c.card.anims.length === 1 && c.card.anims[0].type === 'zoom'),
+      cards.map((c) => c.card.anims.length).join(','));
+    ok('and each card gets its own copy, not a shared array',
+      cards[0].card.anims !== cards[1].card.anims);
+
+    // One card selected is the old behaviour exactly: nothing to mirror.
+    state.selection = new Set([m2.id]);
+    renderInspector();
+    ok('a single selection still edits just that card',
+      selectedTextClips().length === 1 && selectedTextClip() === m2);
+
     const failed = results.filter((r) => r.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {

@@ -385,6 +385,17 @@ Two things to keep straight:
 Failure in pass one is never fatal: no measurements simply means the single pass. It must
 not cost the export. Cancelling pass one, however, cancels the render.
 
+#### One chain over several clips
+
+A multi-selection — which is what a track head produces — has as many chains in it as it
+has audio clips. The panel edits the **first** and mirrors the whole `afx` array onto the
+rest, structural edits, parameter moves and applied presets alike.
+
+The whole array is copied rather than diffed (which is what the text panel does) because a
+chain carries no per-clip content: it is pure processing, so "these clips share this chain"
+is the only thing editing several at once could sensibly mean. It is deep-cloned per clip,
+so they do not end up sharing one array — undo could not tell them apart if they did.
+
 #### Editing the chain from the video half
 
 Importing a file with sound makes two clips, and the one people click is the **video**
@@ -753,6 +764,53 @@ The pop-in is not a new animation either: it is the **existing typewriter layer*
 `unit: 'word'` and `effect: 'pop'`. Captions animate through exactly the code a hand-made
 card animates through.
 
+#### Word timing and emphasis
+
+The whole reason the transcript is word-level rather than line-level. `card.words` is
+`[{ w, start, end }]` in **the card's own time base** — seconds from the start of the clip,
+which is the same `t` every paint pass already runs on, so nothing has to convert anything.
+`card.wordFx` turns it into two effects:
+
+- **reveal** — each word appears as it is spoken, instead of the phrase arriving whole;
+- **emphasis** — the word being said right now grows, lifts and changes colour, and settles
+  back as the next one starts.
+
+Both are per-unit states that **multiply into the typewriter's**, exactly as the animation
+layers multiply into each other, so a card can type in *and* have the spoken word lift out
+of it. The times are written onto every generated caption whether or not either effect is
+on, so switching one on later needs no regenerate.
+
+Two things to keep right:
+
+- `t_dtw` gives an **instant** per word, not a span, so emphasis ramps up over `attack` and
+  back down as the next word starts — a hard on/off switch would strobe.
+- An emphasised word is bigger than the text that measured it. `animatedBounds()` samples
+  the paint across the clip, but a word shorter than its sampling step could peak between
+  two samples, so the extra room is **reserved in `pad`** rather than discovered by
+  sampling. Miss that and the bake crops the growth off.
+
+Colour blends from the card's own fill toward the emphasis colour, which needs a colour to
+blend *from* — a gradient fill has none, so there the emphasis colour is applied outright
+once it is more on than off.
+
+#### Building captions from a preset
+
+`state.captions.preset` names a saved **`full` text preset** (the same library the text
+panel saves to), and every generated caption is built from it. A preset is a *look* — style,
+animation layers, keyframes — so it supplies those and nothing else: the wording, the word
+timings and the keyword highlight stay the caption's own, which is the rule
+`TextModel.applyPreset(card, p, { keepText: true })` already followed.
+
+Placement is the one thing captions still insist on: the safe zone exists to keep text off
+the platform UI, and a preset authored for a title card knows nothing about that. Tick
+**Keep the preset's position** to use the preset's own `x`/`y` instead.
+
+Presets are loaded lazily and cached, because `generateCaptions()` is synchronous — that is
+what keeps the whole pass one undo entry — so the Generate button awaits
+`ensureCaptionPreset()` before calling it. A preset that is named but not in the cache falls
+back to the built-in look **and says so**, rather than silently generating thirty cards in
+the wrong style.
+
 #### Generating
 
 Cards land on a video track flagged `captions: true`, kept at the top so they sit above the
@@ -791,7 +849,9 @@ TextCard = {
   animEnabled,           // master switch (the A shortcut)
   anims: [ AnimLayer ],  // combinable animation layers
   keys: { opacity: [Key], x: [], y: [], scale: [], rotate: [] },
-  highlight              // optional per-word colour override: { color, words: [index] }
+  highlight,             // optional per-word colour override: { color, words: [index] }
+  words,                 // optional [{ w, start, end }] - spoken times, seconds into the clip
+  wordFx                 // optional { reveal, emphasis, color, scale, rise, attack }
 }
 
 AnimLayer = {
@@ -809,6 +869,28 @@ Key = { t, v, ease }     // t is seconds into the clip
 
 Keyable properties are `opacity`, `x`, `y`, `scale`, `rotate` and `glow` (a multiplier
 over the whole glow effect, so a card can bloom up and back down).
+
+#### Editing several cards at once
+
+The panel itself stays **single-card**: it reads one card and writes one card, and knows
+nothing about the selection. `selectedTextClip()` hands it the **lead** — the first selected
+text clip in timeline order — and `syncTextPeers()` mirrors what changed onto the rest.
+
+Only the properties that **actually changed** travel. `cardDiff()` walks the lead's card
+against a snapshot taken at the start of the gesture and copies just those paths. Applying
+the lead's whole card would be far simpler and quite wrong: selecting five differently
+styled cards and nudging the size by one pixel would flatten four of them to the lead's
+look. Arrays (`anims`, gradient stops, a keyframe track) are leaves — adding an animation
+layer is one change to `anims`, not a per-index reconciliation — and each card gets its own
+deep copy rather than a shared array.
+
+`TEXT_PEER_SKIP` is what never propagates: `text`, `words` and `highlight`. All three are
+**content**, not look. Copying them would give every caption the lead's wording and the
+lead's word timings, which is the one thing a multi-selection of captions must not do.
+
+The header says *"N cards - editing all"* so it is never a surprise, and a fresh selection
+re-takes the baseline — otherwise the first edit would replay every difference between the
+old lead and the new one across the whole selection.
 
 #### The typewriter
 
@@ -1358,6 +1440,21 @@ the inspector shows framing and audio for a clicked A/V pair rather than "2 clip
 selected". A real multi-selection shows the count, and still offers Tighten, because
 Tighten works over as many link groups as are selected.
 
+### Selecting a track
+
+Clicking a **track head** selects every clip on that track, extended to link groups exactly
+as clicking a clip is. Shift adds a second track; a locked track selects nothing, since it
+is locked against editing.
+
+A track is deliberately **not** a third kind of selection — it *is* its clips. Tighten, the
+audio chain and Captions all already work over a selection, so this one handler is the
+entire feature and none of them had to learn what a track is. "Clean up this whole
+voice-over track" is one click instead of a marquee that has to catch every clip on one
+lane and nothing on the lane below.
+
+The controls on the head (`Shown`/`Audible`, `Lock`, `Del`) `stopPropagation()` on
+`mousedown`, so muting a track does not also select it.
+
 ### Close gaps
 
 `closeGaps()` pulls the selected clips together: the selection is taken as link groups
@@ -1453,6 +1550,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
+| A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
 | A transcript format | a parser in `src/captions.js` and a branch in `parseTranscript()` — everything downstream takes `[{w, start, end, conf}]` |
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
@@ -1488,7 +1586,8 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - Text cards cover the still-image and shape needs; the timeline still holds no images
   (the QuickBin will keep them, and an object transition will use one, but nothing puts a
   still on a track).
-- Only one text card is edited at a time (select exactly one to open the panel).
+- Several text cards can be edited at once: the panel shows the first and mirrors every
+  change onto the rest — see "Editing several cards at once".
 - Audio clips draw a waveform; video clips have no thumbnails.
 - Preview is nearest-frame accurate, not frame-exact; the render is the source of truth.
 - Video-track compositing is topmost-wins, not alpha blending.

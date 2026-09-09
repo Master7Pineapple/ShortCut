@@ -74,6 +74,71 @@ const TextDraw = (() => {
     return { color: h.color, words: new Set(h.words.map(Number)) };
   }
 
+  /**
+   * Per-word timing and emphasis, from `card.words` - the real times the words were
+   * spoken, in the card's OWN time base (seconds from the start of the clip), which is
+   * the same `t` every paint pass already runs on.
+   *
+   *   card.words  = [{ w, start, end }]        one entry per word, in reading order
+   *   card.wordFx = { reveal, emphasis, color, scale, rise, attack }
+   *
+   * This is what separates a caption from a title: a title's letters are staggered by a
+   * fixed interval (the typewriter layer), while a caption's words have to land on the
+   * syllable. The two compose - a card can have both - because this returns a state that
+   * multiplies into the typewriter's, exactly as the animation layers do.
+   */
+  function wordFxOf(card) {
+    const wf = card && card.wordFx;
+    const words = card && card.words;
+    if (!wf || !Array.isArray(words) || !words.length) return null;
+    if (!wf.reveal && !wf.emphasis) return null;
+    return {
+      words,
+      reveal: !!wf.reveal,
+      emphasis: !!wf.emphasis,
+      color: wf.color || '#ffd166',
+      scale: wf.scale == null ? 1.12 : wf.scale,
+      rise: wf.rise || 0,
+      attack: Math.max(0.001, wf.attack == null ? 0.08 : wf.attack),
+    };
+  }
+
+  const smooth = (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
+
+  /**
+   * One word's state at time `t`: is it out yet, and is it being said right now.
+   *
+   * `on` ramps up over `attack` and stays - a revealed word does not disappear again.
+   * `hot` ramps up as the word starts and back down as it ends, so the emphasis travels
+   * along the line with the voice instead of switching on and off.
+   */
+  function wordState(fx, i, t) {
+    const w = fx.words[i];
+    if (!w) return { on: 1, hot: 0 };
+    const a = fx.attack;
+    const on = fx.reveal ? smooth((t - w.start) / a) : 1;
+    if (!fx.emphasis) return { on, hot: 0 };
+    const end = Math.max(w.end, w.start + a);
+    // A word shorter than two ramps peaks in the middle rather than never arriving.
+    const half = Math.min(a, (end - w.start) / 2);
+    const hot = Math.min(smooth((t - w.start) / half), smooth((end - t) / half));
+    return { on, hot: Math.max(0, hot) };
+  }
+
+  /** Blend two #rrggbb colours. Used to ease a word into its emphasis colour. */
+  function mixHex(a, b, k) {
+    const p = (h) => {
+      const s2 = String(h).replace('#', '');
+      return s2.length === 3
+        ? s2.split('').map((c) => parseInt(c + c, 16))
+        : [parseInt(s2.slice(0, 2), 16), parseInt(s2.slice(2, 4), 16), parseInt(s2.slice(4, 6), 16)];
+    };
+    const A = p(a), B = p(b);
+    if (A.some(isNaN) || B.some(isNaN)) return b;
+    const c = A.map((v, i) => Math.round(v + (B[i] - v) * Math.max(0, Math.min(1, k))));
+    return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+  }
+
   /** Split a line into typewriter units, keeping whitespace so positions stay right. */
   function splitUnits(line, unit) {
     if (unit === 'word') return line.split(/(\s+)/).filter((s) => s.length);
@@ -213,6 +278,12 @@ const TextDraw = (() => {
 
     const tws = typewriterStates(card, t, dur);
     const hi = highlightOf(card);
+    const fx = wordFxOf(card);
+    // A line is one fillText unless something needs the words apart. Splitting places
+    // each word at its own measured offset and loses the kerning between them, so only a
+    // card that actually highlights, reveals or emphasises words pays for it.
+    const perWord = !!hi || !!fx;
+    const baseColor = st.fill.type === 'solid' ? st.fill.color : null;
     const items = [];
 
     // Word index in reading order across the whole card - what `card.highlight.words`
@@ -224,7 +295,31 @@ const TextDraw = (() => {
       if (!inWord) { inWord = true; wordN++; }
       return wordN - 1;
     };
-    const paintOf = (wi) => (hi && wi >= 0 && hi.words.has(wi) ? hi.color : null);
+    /**
+     * The look of one word: its own colour, and what the voice is doing to it.
+     *
+     * Precedence is emphasis over keyword over the card's fill, because emphasis is
+     * momentary and the other two are not - a keyword still lights up as it is said, then
+     * settles back to being a keyword.
+     */
+    const wordLook = (wi) => {
+      const keyed = hi && wi >= 0 && hi.words.has(wi) ? hi.color : null;
+      if (!fx || wi < 0) return { alpha: 1, scale: 1, dy: 0, paint: keyed };
+      const ws = wordState(fx, wi, t);
+      const rest = keyed || baseColor;
+      let paint = keyed;
+      if (fx.emphasis && ws.hot > 0.001) {
+        // Blending needs a colour to blend FROM. A gradient fill has none, so there the
+        // emphasis colour is applied outright once it is more on than off.
+        paint = rest ? mixHex(rest, fx.color, ws.hot) : (ws.hot > 0.5 ? fx.color : keyed);
+      }
+      return {
+        alpha: ws.on,
+        scale: 1 + (fx.scale - 1) * ws.hot,
+        dy: -fx.rise * ws.hot,
+        paint,
+      };
+    };
 
     if (!tws.length) {
       // With no highlight a line is ONE fillText, exactly as it always was: splitting it
@@ -232,7 +327,7 @@ const TextDraw = (() => {
       // between them. A highlighted card has to be per-word, so it pays that cost.
       lines.forEach((l, i) => {
         if (!l.length) return;
-        if (!hi) {
+        if (!perWord) {
           items.push({ text: l, x: lineX(i), y: lineY(i), w: widths[i], alpha: 1, dx: 0, dy: 0, scale: 1 });
           return;
         }
@@ -243,9 +338,12 @@ const TextDraw = (() => {
           prefix += u;
           const wi = nextWord(u, true);
           if (wi < 0) continue;
+          const lk = wordLook(wi);
+          if (lk.alpha <= 0.001) continue;      // not spoken yet
           items.push({
             text: u, x: ux, y, w: ctx.measureText(u).width,
-            alpha: 1, dx: 0, dy: 0, scale: 1, wordIndex: wi, paint: paintOf(wi),
+            alpha: lk.alpha, dx: 0, dy: lk.dy, scale: lk.scale,
+            wordIndex: wi, paint: lk.paint,
           });
         }
         inWord = false;
@@ -276,11 +374,15 @@ const TextDraw = (() => {
           if (wi < 0) continue;                 // whitespace: it spaces, it paints nothing
           const t2 = combineUnit(tws, k, total, unitPx);
           k++;
-          if (t2.alpha <= 0.001) continue;
+          // The two compose the way animation layers do: alpha and scale multiply,
+          // offsets add. So a card can type in AND have the spoken word lift out of it.
+          const lk = wordLook(wi);
+          const alpha = t2.alpha * lk.alpha;
+          if (alpha <= 0.001) continue;
           items.push({
             text: u, x: ux, y, w: ctx.measureText(u).width,
-            alpha: t2.alpha, dx: t2.dx, dy: t2.dy, scale: t2.scale,
-            wordIndex: wi, paint: paintOf(wi),
+            alpha, dx: t2.dx, dy: t2.dy + lk.dy, scale: t2.scale * lk.scale,
+            wordIndex: wi, paint: lk.paint,
           });
         }
         inWord = false;
@@ -296,6 +398,10 @@ const TextDraw = (() => {
     if (st.blur.on) pad += st.blur.amount * scale * 3;
     if (st.bg.on) pad += st.bg.padding * scale;
     if (tr.rotate) pad += Math.max(blockW, blockH) * 0.5; // rotation sweeps the corners out
+    // An emphasised word grows and lifts. animatedBounds() samples this function across
+    // the clip, but a word shorter than its sampling step could peak between two samples
+    // - so the room is reserved here rather than discovered there.
+    if (fx && fx.emphasis) pad += lineH * Math.max(0, fx.scale - 1) + Math.abs(fx.rise);
 
     // Union of the item boxes, which already include per-unit offsets and scaling.
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;

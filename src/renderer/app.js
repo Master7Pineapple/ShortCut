@@ -671,10 +671,89 @@ function addTextCard(text) {
   return clip;
 }
 
-/** The single selected text clip, or null. Drives the text editor panel. */
+/**
+ * Every selected text clip, in timeline order (top track first, then by start).
+ *
+ * `selectedClips()` already walks the tracks in display order, so the first entry is a
+ * stable, predictable choice of LEAD - the card the panel actually shows and edits.
+ */
+function selectedTextClips() {
+  return selectedClips().filter((x) => x.clip.kind === 'text').map((x) => x.clip);
+}
+
+/**
+ * The text clip the editor panel edits: the lead of the selection, or null.
+ *
+ * With several cards selected the panel still edits ONE card - the lead - and every
+ * property it changes is mirrored onto the rest by `syncTextPeers()`. Editing the lead
+ * and copying the delta is what keeps the panel itself single-card: it reads one card,
+ * writes one card, and knows nothing about the selection.
+ */
 function selectedTextClip() {
-  const sel = selectedClips().filter((x) => x.clip.kind === 'text');
-  return sel.length === 1 ? sel[0].clip : null;
+  const sel = selectedTextClips();
+  return sel.length ? sel[0] : null;
+}
+
+/**
+ * Properties that belong to a card rather than to its look, and so never propagate to
+ * the other selected cards. They are all CONTENT: the wording, the spoken word times,
+ * and which of those words are keywords - copying any of them across a multi-selection
+ * would give every caption the lead's text and the lead's timing.
+ */
+const TEXT_PEER_SKIP = new Set(['text', 'words', 'highlight']);
+
+/** Every path whose value differs, walking plain objects and treating arrays as leaves. */
+function cardDiff(cur, prev, out, prefix) {
+  for (const k of Object.keys(cur)) {
+    const path = prefix ? prefix + '.' + k : k;
+    if (TEXT_PEER_SKIP.has(path)) continue;
+    const a = cur[k];
+    const b = prev ? prev[k] : undefined;
+    const plain = (v) => v && typeof v === 'object' && !Array.isArray(v);
+    // An array is replaced whole - adding an animation layer or a gradient stop is one
+    // change to `anims`, not a per-index reconciliation nobody would benefit from.
+    if (plain(a) && plain(b)) cardDiff(a, b, out, path);
+    else if (JSON.stringify(a) !== JSON.stringify(b)) out.push([path, a]);
+  }
+  return out;
+}
+
+/** The lead card as it was when this gesture began, so the change can be isolated. */
+let textEditBase = null;
+
+function snapshotTextEdit() {
+  const lead = selectedTextClip();
+  textEditBase = lead ? JSON.parse(JSON.stringify(lead.card)) : null;
+}
+
+/**
+ * Mirror what just changed on the lead card onto the other selected cards.
+ *
+ * Only the properties that ACTUALLY changed are copied. Applying the lead's whole card
+ * would be far simpler and quite wrong: selecting five differently-styled cards and
+ * nudging the size by one pixel would flatten four of them to the lead's look. A diff
+ * against the start of the gesture means one nudge changes one property, everywhere.
+ */
+function syncTextPeers() {
+  const sel = selectedTextClips();
+  if (sel.length < 2 || !textEditBase) { snapshotTextEdit(); return 0; }
+  const lead = sel[0];
+  const changes = cardDiff(lead.card, textEditBase, []);
+  if (!changes.length) return 0;
+  for (const clip of sel.slice(1)) {
+    for (const [path, value] of changes) {
+      const parts = path.split('.');
+      const last = parts.pop();
+      let target = clip.card;
+      for (const k of parts) {
+        if (!target[k] || typeof target[k] !== 'object') target[k] = {};
+        target = target[k];
+      }
+      target[last] = value && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : value;
+    }
+  }
+  snapshotTextEdit();
+  return changes.length;
 }
 
 /** Text clips under the playhead, bottom track first so upper tracks draw last. */
@@ -839,8 +918,31 @@ function renderHeads() {
       '<button data-act="lock" class="' + (t.locked ? 'on' : '') + '" title="Lock track against editing">' + (t.locked ? 'Locked' : 'Lock') + '</button>' +
       '<button data-act="del" title="Delete this track and its clips">Del</button>' +
       '</div>';
+    /**
+     * Clicking the head selects everything on the track.
+     *
+     * A track is not a third kind of selection - it IS its clips. Tighten, the audio
+     * chain and Captions all work over a selection already, so selecting a track is the
+     * whole feature: "clean up this voice-over track" becomes one click rather than a
+     * marquee that has to catch every clip and nothing on the track below.
+     *
+     * Shift adds, exactly as it does on the timeline, so two tracks can be worked at
+     * once. The buttons stopPropagation so muting a track does not also select it.
+     */
+    d.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      if (t.locked) { log('Track ' + t.name + ' is locked.'); return; }
+      const ids = [];
+      for (const c of t.clips) for (const g of linkGroup(c)) ids.push(g.id);
+      setSelection(ids, e.shiftKey);
+      state.selTransition = null;
+      renderAll();
+    });
+
     d.querySelectorAll('button').forEach((b) => {
-      b.addEventListener('click', () => {
+      b.addEventListener('mousedown', (e) => e.stopPropagation());
+      b.addEventListener('click', (e) => {
+        e.stopPropagation();
         const act = b.dataset.act;
         pushUndo();
         if (act === 'hide') t.hidden = !t.hidden;
@@ -1308,9 +1410,18 @@ function renderInspector() {
   $('#textPanelHead').hidden = !textClip;
   $('#textPanel').hidden = !textClip;
   if (textClip) {
-    $('#textCardMeta').textContent =
-      fmtTc(textClip.start) + '  +' + (textClip.out - textClip.in).toFixed(2) + 's';
+    const cards = selectedTextClips();
+    $('#textCardMeta').textContent = cards.length > 1
+      ? cards.length + ' cards - editing all'
+      : fmtTc(textClip.start) + '  +' + (textClip.out - textClip.in).toFixed(2) + 's';
+    $('#textCardMeta').title = cards.length > 1
+      ? 'The panel shows the first card. Every change is applied to all ' +
+        cards.length + ' selected cards; the wording and the word timings stay their own.'
+      : '';
   }
+  // A fresh selection is a fresh gesture baseline, or the first edit would replay every
+  // difference between the old lead and the new one onto the whole selection.
+  snapshotTextEdit();
   if (typeof TextUI !== 'undefined') TextUI.refresh();
 
   if (!sel.length) { box.innerHTML = '<div class="empty">No clip selected.</div>'; return; }
@@ -1328,6 +1439,14 @@ function renderInspector() {
     // as many link groups as are selected, so it is offered here rather than being
     // reachable only one clip at a time.
     box.innerHTML = '<div class="empty">' + sel.length + ' clips selected.</div>';
+    // A multi-selection is what a track head produces, so the audio chain and Tighten
+    // both have to be reachable from one - "clean up this whole voice track" is the
+    // commonest thing anybody wants to do to a track.
+    const fxTargets = audioFxTargets(sel);
+    if (fxTargets.length) {
+      const lead = allClips().find((x) => x.clip === fxTargets[0]);
+      box.appendChild(audioFxPanel(fxTargets[0], lead ? lead.track.name : null, fxTargets.slice(1)));
+    }
     if (sel.some((x) => tightenAudioFor(x.clip))) box.appendChild(tightenPanel());
     return;
   }
@@ -1417,6 +1536,25 @@ function audioFxTarget(clip) {
   if (!mate) return null;
   const row = allClips().find((x) => x.clip === mate);
   return { clip: mate, viaLink: row ? row.track.name : 'linked audio' };
+}
+
+/**
+ * Every distinct audio clip a selection can put an effect chain on, in selection order.
+ *
+ * A multi-selection - which is what clicking a track head now produces - has as many
+ * chains in it as it has audio clips. The panel edits the FIRST and mirrors the whole
+ * chain onto the rest: unlike a text card, an `afx` chain is pure processing with no
+ * content in it, so "these clips share this chain" is the only thing multi-editing one
+ * could sensibly mean.
+ */
+function audioFxTargets(sel) {
+  const seen = new Set();
+  const out = [];
+  for (const { clip } of sel) {
+    const t = audioFxTarget(clip);
+    if (t && !seen.has(t.clip.id)) { seen.add(t.clip.id); out.push(t.clip); }
+  }
+  return out;
 }
 
 /**
@@ -1519,18 +1657,35 @@ function tightenPanel() {
  * Structural edits (add, remove, reorder, enable) snapshot and rebuild here; parameter
  * edits go through TextUI's own once-per-gesture snapshot.
  */
-function audioFxPanel(clip, viaLink) {
+function audioFxPanel(clip, viaLink, peers) {
   const el = TextUI.el;
   const box = el('div', 'afx-box');
   if (!Array.isArray(clip.afx)) clip.afx = [];
   AudioFX.normalizeClip(clip);
+  const others = (peers || []).filter((c) => c && c !== clip);
 
   const head = el('div', 'afx-head');
   head.appendChild(el('b', null, 'Audio effects'));
   head.appendChild(el('span', 'tc-hint', clip.afx.length ? clip.afx.length + ' in chain' : 'none'));
   box.appendChild(head);
 
-  if (viaLink) {
+  /**
+   * Give every other selected audio clip the same chain.
+   *
+   * The whole array is copied rather than diffed (which is what the text panel does)
+   * because a chain carries no per-clip content: two clips with the same chain are two
+   * clips processed the same way, which is exactly what was asked for. Deep-cloned, so
+   * the clips do not end up sharing one array and undo cannot tell them apart.
+   */
+  const mirror = () => {
+    for (const c of others) c.afx = JSON.parse(JSON.stringify(clip.afx));
+  };
+
+  if (others.length) {
+    box.appendChild(el('div', 'tc-hint afx-via',
+      'Editing ' + (others.length + 1) + ' audio clips' + (viaLink ? ' from ' + viaLink : '') +
+      '. They all get this chain.'));
+  } else if (viaLink) {
     // Say which clip is being edited. Silently editing something other than the clip the
     // user selected is exactly the kind of thing that gets blamed on the app later.
     box.appendChild(el('div', 'tc-hint afx-via',
@@ -1546,9 +1701,15 @@ function audioFxPanel(clip, viaLink) {
   const edit = (fn) => {
     pushUndo();
     fn();
+    mirror();
     markDirty();
     renderAll();
   };
+  // Parameter rows keep the panel's once-per-gesture undo but have to mirror too, or a
+  // slider would move the lead's compressor and leave the rest of the track behind.
+  const rowHooks = others.length
+    ? { onChanged: () => { mirror(); markDirty(); drawPreview(); } }
+    : undefined;
 
   // A clip's own track is not offered as a duck source: ducking to it would compress the
   // clip against its own track-mates, which buildArgs() drops for the same reason.
@@ -1613,7 +1774,9 @@ function audioFxPanel(clip, viaLink) {
           'Without a voice track this effect does nothing.'));
       }
     }
-    for (const spec of d.schema) body.appendChild(TextUI.control(spec, fx, { params: d.params }));
+    for (const spec of d.schema) {
+      body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+    }
     row.appendChild(body);
     box.appendChild(row);
   });
@@ -1638,7 +1801,7 @@ function audioFxPanel(clip, viaLink) {
   addRow.appendChild(add);
   box.appendChild(addRow);
 
-  box.appendChild(audioFxPresetBar(clip));
+  box.appendChild(audioFxPresetBar(clip, others.length ? mirror : null));
 
   // A level change should be audible immediately rather than at the next seek.
   box.addEventListener('input', () => syncMedia());
@@ -1664,7 +1827,7 @@ async function refreshAudioPresets(rebuild) {
  * as one undo entry. A duck's voice track is not carried, because a track id means
  * nothing in another project - see AudioFX.extractPreset().
  */
-function audioFxPresetBar(clip) {
+function audioFxPresetBar(clip, mirror) {
   const el = TextUI.el;
   const box = el('div', 'tc-preset-box');
 
@@ -1684,6 +1847,10 @@ function audioFxPresetBar(clip) {
   const apply = (data, what) => {
     pushUndo();
     const applied = AudioFX.applyPreset(clip, data);
+    // A preset applied to a multi-selection lands on every clip in it, like every other
+    // edit in this panel - otherwise the one place a whole chain arrives at once would
+    // be the one place that only touched the lead.
+    if (mirror) mirror();
     markDirty();
     renderAll();
     const ducks = applied.filter((f) => f.type === 'duck').length;
@@ -3185,6 +3352,57 @@ async function transcribeSelection(opts) {
 }
 
 /**
+ * The `full` text presets a caption can be built from.
+ *
+ * A preset is a LOOK - style, animation layers and keyframes - so a caption built from
+ * one is an ordinary text card wearing it. What the preset never supplies is content:
+ * the wording, the word timings and the keyword highlight are the caption's own, which
+ * is the same rule `TextModel.applyPreset(card, p, { keepText: true })` already follows.
+ *
+ * Names are listed for the picker; the data is loaded lazily and cached, because
+ * generateCaptions() is synchronous and must not wait on a file read per card.
+ */
+let capPresetNames = [];
+const capPresetCache = new Map();
+
+async function refreshCaptionPresets() {
+  try {
+    const all = await window.api.listPresets();
+    capPresetNames = (all && all.full) || [];
+  } catch (e) { capPresetNames = []; }
+  return capPresetNames;
+}
+
+async function ensureCaptionPreset(name) {
+  if (!name) return null;
+  if (capPresetCache.has(name)) return capPresetCache.get(name);
+  let d = null;
+  try { d = await window.api.loadPreset('full', name); } catch (e) { d = null; }
+  capPresetCache.set(name, d);
+  return d;
+}
+
+/**
+ * The card every caption starts from, and whether it came from a preset.
+ *
+ * Synchronous on purpose - it reads the cache `ensureCaptionPreset()` filled. A preset
+ * that is named but not loaded falls back to the built-in look and says so, rather than
+ * silently generating thirty cards in the wrong style.
+ */
+function captionBaseCard() {
+  const name = state.captions.preset || '';
+  const card = TextModel.defaultCard('');
+  if (!name) return { card, fromPreset: false };
+  const p = capPresetCache.get(name);
+  if (!p) {
+    log('Caption preset "' + name + '" is not loaded - using the built-in look.');
+    return { card, fromPreset: false };
+  }
+  TextModel.applyPreset(card, p, { keepText: true });
+  return { card, fromPreset: true };
+}
+
+/**
  * The caption track: one video track marked `captions: true`, kept at the top so
  * captions sit above the footage.
  *
@@ -3268,7 +3486,8 @@ function generateCaptions() {
   }
 
   const track = captionTrack(true);
-  const base = TextModel.defaultCard('');
+  const { card: base, fromPreset } = captionBaseCard();
+  const cardOpts = Object.assign({}, o, { fromPreset });
   const made = [];
   for (const p of plan) {
     const clip = {
@@ -3283,7 +3502,7 @@ function generateCaptions() {
       srcW: 0, srcH: 0, fps: 0,
       panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
       linkId: null,
-      card: Captions.phraseCard(base, p.phrase, o),
+      card: Captions.phraseCard(base, p.phrase, cardOpts),
       // The tag is what makes a regenerate replace instead of double, and it is plain
       // JSON like everything else on a clip. It names the source these
       // words came from, so regenerating ONE clip's captions sweeps away nobody else's.
@@ -3297,6 +3516,7 @@ function generateCaptions() {
   markDirty();
   renderAll();
   log('Captions: ' + made.length + ' card(s) from ' + srcs.size + ' source(s)' +
+      (fromPreset ? ' using preset "' + state.captions.preset + '"' : '') +
       (old.length ? ', replacing ' + old.length + ' previous card(s).' : '.'));
   return { made: made.length, replaced: old.length, clips: made };
 }
@@ -3443,6 +3663,24 @@ function captionsPanelBody() {
 
   // ---- look
   box.appendChild(TextUI.section('capLook', 'Look', (body) => {
+    // A saved `full` text preset is the whole look in one pick. Chosen, it supplies the
+    // style and the animation layers and the rows below it stop applying - so say that
+    // rather than leaving them to look live and do nothing.
+    body.appendChild(C({
+      path: 'preset', label: 'Preset', type: 'select',
+      options: [{ value: '', label: '(built-in caption look)' }]
+        .concat(capPresetNames.map((n) => ({ value: n, label: n }))),
+    }));
+    if (o.preset) {
+      body.appendChild(C({
+        path: 'presetPlacement', label: "Keep the preset's position", type: 'check',
+      }));
+      body.appendChild(el('div', 'tc-hint',
+        'Built from the "' + o.preset + '" preset: its style, animation and keyframes. ' +
+        'The rows below do not apply. The wording, the word timings and the keyword ' +
+        'highlight all still belong to the caption. Unticked, the safe zone still places it.'));
+      return;
+    }
     const fonts = (TextUI.fonts && TextUI.fonts.length) ? TextUI.fonts : [o.fontFamily];
     body.appendChild(C({ path: 'fontFamily', label: 'Font', type: 'select', options: fonts }));
     body.appendChild(C({
@@ -3463,6 +3701,31 @@ function captionsPanelBody() {
       'The override is per word on the card, so it survives a save and can be edited by hand.'));
     body.appendChild(C({ path: 'highlight', label: 'Highlight', type: 'color' }));
     body.appendChild(C({ path: 'keywords', label: 'Keywords', type: 'area' }));
+  }));
+
+  // ---- word timing
+  box.appendChild(TextUI.section('capWord', 'Word timing', (body) => {
+    body.appendChild(el('div', 'tc-hint',
+      'The transcript is word-level, so a caption can land on the syllable instead of ' +
+      'arriving whole. Reveal makes each word appear as it is spoken; emphasis lights ' +
+      'the word being said right now and lets it settle back as the next one starts. ' +
+      'Both read the times stored on the card, so they can be switched on later without ' +
+      'regenerating.'));
+    body.appendChild(C({ path: 'wordReveal', label: 'Reveal word by word', type: 'check' }));
+    body.appendChild(C({ path: 'wordEmphasis', label: 'Emphasise the spoken word', type: 'check' }));
+    body.appendChild(C({ path: 'emphasisColor', label: 'Emphasis colour', type: 'color' }));
+    body.appendChild(C({
+      path: 'emphasisScale', label: 'Emphasis size', type: 'range',
+      min: 1, max: 1.8, step: 0.01, digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'emphasisRise', label: 'Emphasis lift', type: 'range',
+      min: 0, max: 60, step: 1, unit: 'px', digits: 0,
+    }));
+    body.appendChild(C({
+      path: 'emphasisAttack', label: 'Ease over', type: 'range',
+      min: 0.01, max: 0.4, step: 0.01, unit: 's', digits: 2,
+    }));
   }));
 
   // ---- fillers
@@ -3511,7 +3774,13 @@ function captionsPanelBody() {
     paint();
   });
 
-  genBtn.addEventListener('click', () => { generateCaptions(); paint(); });
+  genBtn.addEventListener('click', async () => {
+    // Loaded BEFORE generating: generateCaptions() is synchronous so that the whole pass
+    // stays one undo entry, which means the preset has to already be in the cache.
+    await ensureCaptionPreset(state.captions.preset);
+    generateCaptions();
+    paint();
+  });
   clrBtn.addEventListener('click', () => { clearCaptions(false); paint(); });
 
   paint();
@@ -4304,6 +4573,10 @@ window.api.transcribeState().then((st) => {
   if (capPanelPaint) capPanelPaint();
 }).catch(() => {});
 
+// The caption preset picker lists the same `full` presets the text panel saves, so a
+// look authored on one card is one pick away from being every caption's look.
+refreshCaptionPresets().then(() => renderCaptionsPanel()).catch(() => {});
+
 function toggleBin(show) {
   const hide = show == null ? !$('#quickBin').hidden : !show;
   $('#quickBin').hidden = hide;
@@ -4635,12 +4908,22 @@ TextUI.init({
   saveLibraryPreset: async (kind, name, data) => {
     await window.api.savePreset(kind, name, data);
     await TextUI.reloadPresets();
+    // The caption picker lists the same library, and it is a snapshot - without this a
+    // look saved here is invisible to captions until the app restarts. Re-saving over a
+    // name also has to drop the cached copy, or captions keep building from the old one.
+    capPresetCache.delete(name);
+    await refreshCaptionPresets();
+    renderCaptionsPanel();
     log('Saved ' + kind + ' preset "' + name + '".');
   },
   loadLibraryPreset: (kind, name) => window.api.loadPreset(kind, name),
   deleteLibraryPreset: async (kind, name) => {
     await window.api.deletePreset(kind, name);
     await TextUI.reloadPresets();
+    capPresetCache.delete(name);
+    if (state.captions.preset === name) state.captions.preset = '';
+    await refreshCaptionPresets();
+    renderCaptionsPanel();
     log('Deleted ' + kind + ' preset "' + name + '".');
   },
   exportPreset: async (kind, data) => {
@@ -4661,9 +4944,10 @@ TextUI.init({
     const c = selectedTextClip();
     if (c) seek(c.start + t);
   },
-  // The panel snapshots once per gesture, then reports the change.
-  onEdit: () => pushUndo(),
-  onChanged: () => { markDirty(); drawPreview(); },
+  // The panel snapshots once per gesture, then reports the change. With several cards
+  // selected the change is mirrored from the lead onto the rest - see syncTextPeers().
+  onEdit: () => { pushUndo(); snapshotTextEdit(); },
+  onChanged: () => { syncTextPeers(); markDirty(); drawPreview(); },
   log,
 }).then(() => {
   log('Loaded ' + TextUI.fonts.length + ' system fonts.');

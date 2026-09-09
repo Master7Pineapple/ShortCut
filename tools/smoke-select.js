@@ -223,6 +223,63 @@
       JSON.stringify(a4.clips.map((c) => [c.start.toFixed(3), (c.out - c.in).toFixed(3)])),
       v4.clips.length + ' video, ' + a4.clips.length + ' audio');
 
+    // ================================================ selecting a whole track
+    // A track is not a third kind of selection - it IS its clips. That is what makes
+    // Tighten, the audio chain and Captions all work on one from the day it is added,
+    // without any of them learning what a track is.
+    markClean(); newProject();
+    const tvT = state.tracks.find((t) => t.type === 'video');
+    const taT = state.tracks.find((t) => t.type === 'audio');
+    const tmk = (id, start, kind, link) => ({
+      id, src: 'C:/x/' + id + '.mp4', name: id, kind, start, in: 0, out: 3,
+      mediaDuration: 10, srcW: 0, srcH: 0, fps: 0,
+      panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: link || null,
+    });
+    taT.clips.push(tmk('ta1', 0, 'audio', 'L1'), tmk('ta2', 4, 'audio'), tmk('ta3', 8, 'audio'));
+    tvT.clips.push(tmk('tv1', 0, 'video', 'L1'));
+    renderAll();
+
+    const headOf = (track) =>
+      document.querySelectorAll('#trackHeads .track-head')[state.tracks.indexOf(track)];
+    const click = (elm, shift) => elm.dispatchEvent(
+      new MouseEvent('mousedown', { bubbles: true, button: 0, shiftKey: !!shift }));
+
+    click(headOf(taT));
+    ok('clicking a track head selects everything on it', state.selection.size === 4,
+      state.selection.size + ' selected');
+    ok('and it extends to link groups, like every other selection does',
+      state.selection.has('tv1'), [...state.selection].join(','));
+
+    state.selection.clear(); renderAll();
+    const lockB = [...headOf(taT).querySelectorAll('button')].find((b) => b.dataset.act === 'lock');
+    click(lockB);
+    ok('a control on the head does not also select the track', state.selection.size === 0,
+      state.selection.size + ' selected');
+    lockB.click();   // the toggle itself is a click handler, the guard above is on mousedown
+    ok('it still does its own job', taT.locked === true, String(taT.locked));
+
+    click(headOf(taT));
+    ok('a locked track selects nothing - it is locked against editing',
+      state.selection.size === 0, state.selection.size + ' selected');
+    taT.locked = false; renderAll();
+
+    click(headOf(taT));
+    click(headOf(tvT), true);
+    ok('shift adds a second track to the selection', state.selection.size === 4,
+      state.selection.size + ' selected');
+
+    click(headOf(taT));
+    ok('Tighten sees a track selection as its link groups',
+      tightenUnits().filter((u) => u.audio).length === 3,
+      String(tightenUnits().filter((u) => u.audio).length));
+    ok('and so does Captions, which reads the same units',
+      captionUnits().filter((u) => u.audio).length === 3);
+    renderInspector();
+    const trackInsp = document.querySelector('#inspector');
+    ok('the inspector offers the audio chain for the whole track',
+      !!trackInsp.querySelector('.afx-box'));
+    ok('and Tighten alongside it', !!trackInsp.querySelector('.tighten-box'));
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {

@@ -495,6 +495,64 @@
     ok('and the smoke run leaves the library as it found it',
       !after2.audiofx || after2.audiofx.indexOf(NAME) === -1);
 
+    // ================================================ one chain over many clips
+    // Clicking a track head selects every clip on it, so the panel has to be able to put
+    // one chain on all of them. Unlike a text card, an `afx` chain carries no content -
+    // it is pure processing - so "these clips share this chain" is the only thing editing
+    // several at once could sensibly mean, and the whole array is copied rather than
+    // diffed.
+    markClean(); newProject();
+    const mA = state.tracks.find((t) => t.type === 'audio');
+    const mmk = (id, start) => ({
+      id, src: 'C:/x/' + id + '.mp4', name: id, kind: 'audio', start, in: 0, out: 3,
+      mediaDuration: 10, srcW: 0, srcH: 0, fps: 0,
+      panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+    });
+    mA.clips.push(mmk('mc1', 0), mmk('mc2', 4), mmk('mc3', 8));
+    setSelection(['mc1', 'mc2', 'mc3'], false);
+    renderAll();
+    renderInspector();
+
+    const mBox = document.querySelector('#inspector');
+    ok('a multi-selection gets the audio chain panel', !!mBox.querySelector('.afx-box'));
+    ok('and it says how many clips it is about',
+      /3 audio clips/.test((mBox.querySelector('.afx-via') || {}).textContent || ''),
+      (mBox.querySelector('.afx-via') || {}).textContent);
+
+    const mAdd = mBox.querySelector('.afx-add select');
+    mAdd.value = 'gain';
+    mAdd.dispatchEvent(new Event('change', { bubbles: true }));
+    const mClips = mA.clips;
+    ok('adding an effect adds it to every selected clip',
+      mClips.every((c) => (c.afx || []).length === 1), mClips.map((c) => c.afx.length).join(','));
+    ok('each clip gets its OWN chain, not a shared array',
+      mClips[0].afx !== mClips[1].afx && mClips[0].afx[0] !== mClips[1].afx[0]);
+
+    renderInspector();
+    const mNum = document.querySelector('#inspector .afx-fx-body input.tc-num');
+    mNum.dispatchEvent(new Event('focus', { bubbles: true }));
+    mNum.value = '6';
+    mNum.dispatchEvent(new Event('input', { bubbles: true }));
+    ok('a parameter change reaches every clip too',
+      mClips.every((c) => c.afx[0].params.db === 6), mClips.map((c) => c.afx[0].params.db).join(','));
+
+    const mU = undoStack.length;
+    renderInspector();
+    const mRemove = [...document.querySelectorAll('#inspector .afx-fx-btns button')]
+      .find((b) => b.textContent === '✕');
+    mRemove.click();
+    ok('removing one clears the chain on all of them',
+      mClips.every((c) => c.afx.length === 0), mClips.map((c) => c.afx.length).join(','));
+    ok('and it is one undo entry for the whole selection', undoStack.length === mU + 1,
+      mU + ' -> ' + undoStack.length);
+    undo();
+    // restore() replaces state.tracks wholesale, so the clip objects captured above are
+    // now the OLD ones - read the timeline again rather than the references.
+    const afterUndo = state.tracks.find((t) => t.type === 'audio').clips;
+    ok('which undo puts back everywhere at once',
+      afterUndo.length === 3 && afterUndo.every((c) => c.afx.length === 1),
+      afterUndo.map((c) => c.afx.length).join(','));
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {

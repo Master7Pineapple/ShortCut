@@ -51,6 +51,19 @@
     uppercase: false,
     popIn: true,          // per-word pop, built on the existing typewriter layer
     popDur: 0.28,
+    // A saved `full` text preset to build every caption from. '' = the built-in look.
+    // The preset supplies style and animation; the words, the timings and the highlight
+    // are the caption's own, because those are content and a preset is a look.
+    preset: '',
+    presetPlacement: false,   // keep the preset's x/y instead of the safe zone
+    // Word timing: each word appears as it is spoken, rather than the phrase arriving
+    // whole. Emphasis lights the word being said right now and lets it settle back.
+    wordReveal: false,
+    wordEmphasis: false,
+    emphasisColor: '#ffd166',
+    emphasisScale: 1.12,
+    emphasisRise: 0,
+    emphasisAttack: 0.08,
     // filler words fed back into Tighten
     cutFillers: false,
     fillers: 'um, uh, erm, ah, like, you know, i mean, sort of, kind of, basically',
@@ -360,22 +373,34 @@
     const o = Object.assign({}, DEFAULTS, opts || {});
     const card = JSON.parse(JSON.stringify(base));
     const zone = safeZone(o);
+    // `fromPreset` says the base card IS the look the user picked, so the panel's own
+    // font/size/colour rows must not paint over it. Placement is the one thing captions
+    // still insist on by default: the safe zone exists to keep text off the platform UI,
+    // and a preset authored for a title card knows nothing about that.
+    const preset = !!o.fromPreset;
 
     card.text = phrase.text;
     const st = card.style;
-    st.fontFamily = o.fontFamily;
-    st.fontSize = Math.max(8, Number(o.fontSize) || DEFAULTS.fontSize);
-    st.uppercase = !!o.uppercase;
-    st.align = 'center';
-    st.x = 0.5;
-    st.y = zone.y;
-    st.maxWidth = clamp(o.maxWidth, 0.1, 1);
-    st.fill = { type: 'solid', color: o.color, gradient: st.fill.gradient };
-    st.stroke = Object.assign({}, st.stroke, { on: true, color: '#000000', width: 8 });
-    st.shadow = Object.assign({}, st.shadow, { on: true, opacity: 0.75, blur: 22, distance: 6 });
+    if (!preset) {
+      st.fontFamily = o.fontFamily;
+      st.fontSize = Math.max(8, Number(o.fontSize) || DEFAULTS.fontSize);
+      st.uppercase = !!o.uppercase;
+      st.align = 'center';
+      st.x = 0.5;
+      st.maxWidth = clamp(o.maxWidth, 0.1, 1);
+      st.fill = { type: 'solid', color: o.color, gradient: st.fill.gradient };
+      st.stroke = Object.assign({}, st.stroke, { on: true, color: '#000000', width: 8 });
+      st.shadow = Object.assign({}, st.shadow, { on: true, opacity: 0.75, blur: 22, distance: 6 });
+    }
+    if (!preset || !o.presetPlacement) st.y = zone.y;
 
     card.animEnabled = true;
-    card.anims = o.popIn ? [{
+    if (preset) {
+      // The preset's own layers are the animation. Its timings were authored against
+      // whatever length that card was, and a caption is usually shorter, but every layer
+      // is anchored to a clip end or start - so they still land.
+      if (!Array.isArray(card.anims)) card.anims = [];
+    } else card.anims = o.popIn ? [{
       id: 'cap' + Math.random().toString(36).slice(2, 8),
       type: 'typewriter',
       mode: 'in',
@@ -395,6 +420,24 @@
     card.highlight = (phrase.hi && phrase.hi.length)
       ? { color: o.highlight, words: phrase.hi.slice() }
       : null;
+
+    // The words themselves, in the CARD's time base: seconds from the start of the clip,
+    // which is what every paint pass is already given. Word timing is the whole reason
+    // the transcript is word-level rather than line-level, so it is carried even when
+    // neither reveal nor emphasis is on - turning them on later needs no regenerate.
+    card.words = (phrase.words || []).map((w) => ({
+      w: w.w,
+      start: r3(Math.max(0, w.start - phrase.start)),
+      end: r3(Math.max(0, w.end - phrase.start)),
+    }));
+    card.wordFx = {
+      reveal: !!o.wordReveal,
+      emphasis: !!o.wordEmphasis,
+      color: o.emphasisColor,
+      scale: Number(o.emphasisScale) || 1,
+      rise: Number(o.emphasisRise) || 0,
+      attack: Math.max(0.001, Number(o.emphasisAttack) || DEFAULTS.emphasisAttack),
+    };
     return card;
   }
 
