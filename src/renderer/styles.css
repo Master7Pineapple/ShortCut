@@ -509,3 +509,22 @@ select, input[type=number], input[type=text] {
 #meterReadout i.over { color: #ff6b5e; }
 #meterReadout i.on { color: #6fdc8c; }
 #meterNote { margin: 5px 8px 0; }
+
+/* The visual effect stack. Deliberately its own classes rather than the audio chain's:
+   the two panels look alike, but `#inspector .afx-box` is how three suites find the audio
+   chain, and a visual stack answering to that selector made them find the wrong panel. */
+.fx-box { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.fx-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.fx-note { margin-bottom: 8px; line-height: 1.35; }
+.fx-fx { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; cursor: grab; }
+.fx-fx.off { opacity: 0.5; }
+.fx-fx.dragging { opacity: 0.45; cursor: grabbing; }
+.fx-fx.dragover { border-color: var(--accent); }
+.fx-fx-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #14161b; }
+.fx-fx-head b { flex: 1; font-weight: 600; }
+.fx-fx-btns { display: flex; gap: 3px; }
+.fx-fx-body { padding: 6px; }
+.fx-fx-body, .fx-fx input, .fx-fx select, .fx-fx button { cursor: auto; }
+.fx-fx .tc-section { margin-top: 6px; }
+.fx-add { margin-top: 4px; }
+.fx-add select { width: 100%; }

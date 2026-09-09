@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty suites:
+There are twenty-one suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -133,6 +133,17 @@ There are twenty suites:
   matches a job rebuilt after it, and — the headline — that a composited frame in a real
   ffmpeg render lands on the same pixels as the preview canvas. It also times both paths;
   the numbers below come from it. It reuses `smoke-layers.js`'s two fixtures.
+- `tools/smoke-fx.js` — the per-clip effect stack: each effect's output over
+  **transparency and over an opaque background** (the layer rule, asserted numerically),
+  the grade LUT against the curve computed by hand and a neutral grade as a pixel-exact
+  no-op, that a blur neither magnifies nor darkens the frame edge, that stack order
+  changes the picture, that keys live on the effect so two blurs on one clip animate
+  independently, that a four-effect stack paints the same picture at 1x and 4x
+  (preview = render, stated as an assertion), the model's normalisation and JSON
+  round-trip, the panel's one-undo-per-structural-edit, that an effect's `id` is not in
+  the render cache key while its parameters are — and, end to end, that a graded clip
+  comes out of a real ffmpeg render matching the preview canvas. Only the last section
+  needs a fixture: `flat_blue.mp4`, shared with `smoke-layers.js`.
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -196,6 +207,7 @@ tools/smoke.js            timeline-logic test suite (see Testing above)
 tools/smoke-preview.js    playback/compositing test suite
 tools/smoke-layers.js     alpha compositing + stills-on-the-timeline test suite
 tools/smoke-bakefirst.js  bake-first rendering: fast path, composite bake, parity
+tools/smoke-fx.js         the per-clip effect stack: each effect, order, keys, parity
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -204,6 +216,7 @@ src/renderer/index.html   DOM skeleton; every element the renderer touches has a
 src/renderer/styles.css   all styling; colors live in :root custom properties
 src/renderer/app.js       the editor: state, timeline, preview, editing ops, shortcuts
 src/renderer/anim.js      the keyframe engine: easing curves, tracks, the keyable registry
+src/renderer/fx.js        the visual effect stack: one draw per type, no ffmpeg half
 src/renderer/text/model.js  text cards: defaults, animation layers, how they compose with keys
 src/renderer/text/draw.js   text cards: all canvas painting (preview AND export)
 src/renderer/text/ui.js     text cards: the editor panel
@@ -216,7 +229,8 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
 files are plain `<script>` globals (`TextModel`, `TextDraw`, `TextUI`)
-loaded before `app.js`, and `anim.js` (`Anim`) is loaded before all of them. `TextUI` never touches `app.js` globals - it is wired up through
+loaded before `app.js`; `anim.js` (`Anim`) is loaded before all of them and `fx.js` (`FX`)
+straight after it, because every effect parameter reads its animated value through `Anim`. `TextUI` never touches `app.js` globals - it is wired up through
 the hooks object passed to `TextUI.init()` near the bottom of `app.js`.
 
 `app.js` is organised in ten numbered sections (search for `// ===`), in this order:
@@ -271,6 +285,8 @@ Clip = {
   zoom,                  // 1 = the largest crop that fits the output aspect
   volume,                // 0..2
   afx,                   // audio clips only - the effect chain, see the audio chain below
+  fx,                    // OPTIONAL - the visual effect stack, see "The effect stack";
+                         //   absent until an effect is added
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
   keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
@@ -346,10 +362,13 @@ ffmpeg can build *identically* and far faster still goes down the old chain. A s
 on the fast path when **both** of these hold:
 
 1. at most **one** picture clip (`kind:'video'` or `kind:'image'`) is visible across it;
-2. **no** clip contributing to it carries an effect stack (`clip.fx`, from step 7 on).
+2. **no** clip contributing to it carries a live effect (`FX.active(clip)` is empty).
 
 Anything else bakes. In practice that means real alpha compositing — two or more pictures
-stacked — and, from step 7, any effect at all.
+stacked — or any effect at all. `clipNeedsBake()` asks `FX.active()` rather than reading
+`clip.fx` itself, so a bypassed effect, or one of a type this build does not know, leaves
+the clip on the fast path — and the answer it gives can never disagree with the answer
+the draw path gives, because they are the same call.
 
 Text cards and transitions do **not** disqualify a span, and that is not a loophole. They
 are already drawn by one canvas implementation and baked from it, so the reason for the
@@ -411,6 +430,126 @@ by hand.
 
 Output presets are the four `<option>`s on `#preset` in `index.html`; quality presets are
 the `presets` map in `buildArgs()`. Both are one-line additions.
+
+### The effect stack
+
+`src/renderer/fx.js` is the visual effect engine, a plain `<script>` global called `FX`
+loaded after `anim.js`. A clip's stack lives on `clip.fx`:
+
+```js
+clip.fx = [ { id, type, enabled, params: {...}, keys: {...} }, ... ]   // absent until used
+```
+
+Plain JSON, ordered, and **absent by default** — `FX.normalizeClip()` deletes the array
+again once the last effect goes, so a project that uses no effects serialises exactly as
+it did before this existed.
+
+Five types ship in this step, and each one is **one function**:
+
+| Type | What it draws |
+| --- | --- |
+| `transform` | offset, scale, rotation, opacity, about a movable anchor point |
+| `round` | rounded corners and a drop shadow that follows them |
+| `inset` | crops the layer in from any edge, to transparency |
+| `blur` | a padded, non-magnifying gaussian |
+| `grade` | lift / gamma / gain, saturation, contrast, temperature |
+
+Adding a type is one entry in `FX.DEFS` — its label, its default parameters, its
+inspector schema and its `draw()`. The panel, the keyframe strips, the serialisation, the
+normalisation and the "add an effect" menu all build themselves from that entry.
+
+#### One implementation, because step 6 earned it
+
+Before step 6, every visual feature had to be written twice — a canvas draw for the
+preview and a matching ffmpeg filter for the export — and the README said so in three
+places because the two kept drifting. Step 6 made `compositeLayers()` the single draw path
+for the picture. So there is **no ffmpeg half of an effect**, and adding one would be a
+bug: `buildArgs()` never sees `clip.fx` do anything, because the baker has already drawn
+it by the time main runs.
+
+That is also why any effect at all takes a span off the fast path. There is nothing for
+ffmpeg to fall back on — a clip carrying an effect must be baked, or the export simply
+would not have it. See "The fast path, and exactly what leaves it".
+
+#### The unit rule: fractions of the frame, never pixels
+
+Every length in `fx.js` is a fraction of the frame; `pxMin(f, W, H)` turns it into pixels
+against whatever size is being painted. The preview paints at 540x960 or smaller and the
+export at 1080x1920, so a "12 px" corner radius would be twice as round in the viewer as
+in the file, and a "20 px" blur twice as soft. **Anything added here that takes a length
+must go through `pxMin()`.** `smoke-fx.js` paints a four-effect stack at 135x240 and at
+540x960 and asserts the two agree to within 12 levels of 255 — which is preview/render
+parity for this file, stated as one test.
+
+#### The layer rule, inherited from the text cards
+
+Every effect runs inside the clip's **own offscreen layer**, cleared to transparent, and
+only the finished layer is drawn onto the frame. `FX.render()` is the only way in, and it
+enforces this. It is not tidiness: a drop shadow, a blur or any additive pass composited
+straight onto the target would pick up whatever is underneath it, so the same effect would
+behave one way over video and another way over transparency. `smoke-fx.js` asserts it
+numerically — a shadowed, rounded layer drawn over blue must equal that same layer
+composited over blue arithmetically, and it does, exactly.
+
+A clip with **no** effects skips all of this: `FX.render()` hands the target straight to
+the painter and allocates nothing, so the compositing loop stays the single `drawImage`
+it has always been.
+
+#### Keyframes live on the effect
+
+`Anim.trackFor()` and `Anim.valueAt()` only ever touch a `.keys` object, so an `fx` entry
+is a keyframe holder exactly as a clip is. Every numeric parameter is therefore keyframable
+with no extra work — `FX.paramAt()` reads the animated value and falls back to the
+static one — and two blurs on one clip animate independently. Keys are times in
+**seconds into the clip**, the same axis a text card's keys use, so moving a clip moves its
+animation with it. See "Keyframes" above for why they are not on `clip.keys`.
+
+#### Order matters, so it is draggable
+
+The stack draws in array order, and the order is part of the picture: blur after grade is
+not blur before grade, because a grade lifts what a blur has already averaged together.
+Rows in the panel are drag-reorderable and carry the same job on arrow buttons — a drag
+is reachable from neither the keyboard nor a smoke suite.
+
+#### Two rules the panel keeps
+
+- A structural edit — add, remove, reorder, bypass — is **one** `pushUndo()` and a
+  full `renderAll()`. Parameter edits go through the clip inspector's own once-per-gesture
+  guard (`inspectorEdit` / `inspectorEditEnd` in `app.js`), which exists because
+  `TextUI.control()`'s built-in guard is bound to the *text* panel's hooks: a panel that
+  passes its own hooks replaces the guard along with them, and a burst of wheel-nudging
+  then pushed one undo entry per notch. `clipKeyPanel()` had that bug and now shares the
+  guard.
+- The panel uses `fx-*` classes, **not** the audio chain's `afx-*` ones, even though the
+  two look alike. `#inspector .afx-box` is how three suites find the audio chain, and a
+  visual panel answering to that selector made them find the wrong one.
+
+#### What does not get a stack, and where effects do not apply
+
+Effects are offered on **picture clips only** — `kind:'video'` and `kind:'image'`. A
+text card already owns a transform, an opacity, a rotation, a glow and a drop shadow in its
+own model, with its own keyframes and its own presets, so a second competing `transform`
+beside all of that would be a coin toss for the author every time; and `#textPanel` shares
+a scrolling column with `#inspector`, so a stack panel above it pushes the card editor off
+the bottom of the screen the moment a card is selected. `compositeLayers()` still runs a
+stack for any layer carrying one, text included, so widening `FX_KINDS` in `app.js` is all
+a later step needs to do.
+
+**Effects do not apply inside a transition window.** A transition owns its frame in both
+the preview (`drawTransitionFrame()`) and the render (transition windows are excluded from
+bake spans outright — see the fast path), and neither path is effect-aware. The two
+agree with each other, which is the invariant that matters, but the effect is simply not
+there for the length of the window. The panel says so on screen.
+
+#### The render cache
+
+`jobCacheKey()` hashes the whole job, and `buildJob()` carries `clip.fx` onto the job entry
+for one reason: a composited span's pixels depend on every effect on every clip under it,
+and leaving the stack out would mean turning up a blur hit the cached render of the old
+picture. The key strips each effect's `id` on the way in, for the same reason it strips a
+clip's — an id is identity handed out by `FX.create()`, not pixels, and leaving it in
+would mean two clips wearing the same grade never shared a cached render, and deleting an
+effect and adding an identical one back missed its own cache.
 
 ### The audio chain
 
@@ -1028,14 +1167,21 @@ black the clip out, while one that *adds* (offsets, rotation) must start at 0.
 returns, so one registration is all a property needs to become animatable, with the
 typable boxes, wheel-nudging and per-gesture undo every other control in the app has.
 
-**The registry is empty in this build, deliberately.** A keyframable property has to be
-honoured by the preview *and* the render, and today a clip's framing is baked into an
-ffmpeg `crop`/`scale` as a constant — animating it would break the one invariant this
-codebase cares about most. Step 6 makes the bake the single draw path and step 7's effect
-stack registers its parameters through the call above; the strip is already generic, only
-the list is empty. Text cards are not routed through the registry: their panel keyframes
-the card, which is a richer thing than a clip property, and it calls the same
-`TextUI.keyStrip()` the clip inspector does.
+**The registry is still empty in this build**, and that turned out to be the right answer
+rather than a temporary one. Step 4 guessed that step 7's effects would register their
+parameters through the call above. They do not, and they cannot: `registerClipProp()` is
+global and keyed by property name, while an effect parameter belongs to an *instance* —
+two blurs on one clip are two independent animations, and a single `clip.keys.radius`
+could never express that. So an effect keyframes on the effect.
+
+Nothing was lost in the swap. `Anim.trackFor()`, `valueAt()`, `pruneKeys()` and
+`sortKeys()` only ever touch a `.keys` object, so an `fx` entry is a keyframe holder for
+free, and the effect panel builds its strips with the same `TextUI.keyStrip()` the clip
+inspector uses. The clip-level registry stays as it is: generic, tested by
+`smoke-anim.js`, and waiting for the first property that genuinely belongs to a *clip*
+rather than to something on one. Text cards are not routed through it either — their
+panel keyframes the card, which is a richer thing than a clip property, and it calls the
+same `TextUI.keyStrip()`.
 
 ### Text cards
 
@@ -1842,7 +1988,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain |
-| An effect (filters, speed, fades) | a per-clip filter in `buildArgs()` + the matching canvas draw in `drawClip()` |
+| A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
 | A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
@@ -1865,7 +2011,13 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - Tighten only cuts into the selection's own link groups. Other clips shift with the
   ripple but are never sliced, text cards shift but are never cut, and a locked track is
   left entirely alone — see "Tighten".
-- No video effects or speed changes. **Audio** effects do exist — see "The audio chain".
+- Video clips and stills carry an ordered, keyframable effect stack: transform, rounded
+  corners and shadow, crop/inset, blur and a grade — see "The effect stack". Text cards
+  do not; they have their own richer animation model. There are still no speed changes.
+- An effect does not apply inside a transition window, in the preview or in the render —
+  see "The effect stack".
+- Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The
+  numbers are in "The fast path, and exactly what leaves it".
 - The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
   ducking, loudness) is applied on render. This is the one deliberate preview/render
   disagreement in the app, and the inspector says so on screen.

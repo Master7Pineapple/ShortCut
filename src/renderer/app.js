@@ -1540,9 +1540,230 @@ function renderInspector() {
   const fxTarget = audioFxTarget(c);
   if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   if (tightenAudioFor(c)) box.appendChild(tightenPanel());
+  const fx = clipFxPanel(c);
+  if (fx) box.appendChild(fx);
   const keys = clipKeyPanel(c);
   if (keys) box.appendChild(keys);
   syncFramingControls();
+}
+
+/**
+ * Once-per-gesture undo for the CLIP inspector's controls.
+ *
+ * `TextUI.control()` and `TextUI.keyStrip()` have this guard built in, but it is bound to
+ * the text panel's own `onEdit`. A panel that passes its own hooks - which every clip
+ * panel must, because it is editing timeline state rather than a card - replaces the
+ * guard along with the hook, and then a slider drag or a burst of wheel-nudging pushes
+ * one undo entry per notch instead of one per gesture. This is the same guard, owned by
+ * the clip inspector: opened on the first edit of a gesture and closed by whatever ends
+ * it - pointerup, a blur, or the wheel handler's own 400 ms idle timer.
+ */
+let inspectorGesture = false;
+function inspectorEdit() {
+  if (inspectorGesture) return;
+  inspectorGesture = true;
+  pushUndo();
+}
+function inspectorEditEnd() { inspectorGesture = false; }
+document.addEventListener('pointerup', inspectorEditEnd);
+document.addEventListener('pointercancel', inspectorEditEnd);
+
+/**
+ * Which clips are OFFERED an effect stack.
+ *
+ * Picture clips, and deliberately not text cards. Two reasons, and the second is the real
+ * one: a card already owns a transform, an opacity, a rotation, a glow and a drop shadow
+ * in its own model, with its own keyframes and its own preset system, so a second and
+ * competing `transform` effect beside all of that would be a coin toss for the author
+ * every time. And `#textPanel` shares a scrolling column with `#inspector`, so a stack
+ * panel above it pushes the card editor off the bottom of the screen the moment a card is
+ * selected - `tools/smoke-text2.js` caught that, which is what it is for.
+ *
+ * `compositeLayers()` still runs the stack for ANY layer that carries one, text included,
+ * so widening this set is all a later step needs to do.
+ */
+const FX_KINDS = new Set(['video', 'image']);
+
+/**
+ * The visual effect stack for the selected clip.
+ *
+ * Built entirely from `FX.DEFS`: the rows are `TextUI.control` over each type's schema,
+ * so every parameter is a slider AND a typable box AND scroll-adjustable AND resettable
+ * without any of that being written twice, and each numeric parameter gets the same
+ * `TextUI.keyStrip()` the clip's own keyframe panel uses. Adding an effect type is an
+ * entry in `FX.DEFS` and nothing else.
+ *
+ * ORDER MATTERS, so it is draggable as well as button-driven. Blur after grade is not
+ * blur before grade: the grade lifts what the blur has already averaged together. The
+ * arrows exist alongside the drag because a drag is not reachable from the keyboard and
+ * is not reachable from a smoke suite either.
+ *
+ * Structural edits (add, remove, reorder, bypass) snapshot and rebuild here as ONE undo
+ * entry; parameter edits go through the inspector's once-per-gesture guard above.
+ */
+function clipFxPanel(clip) {
+  if (!clip || !FX_KINDS.has(clip.kind)) return null;
+  const el = TextUI.el;
+  const box = el('div', 'fx-box');
+  FX.normalizeClip(clip);
+
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'Effects'));
+  const count = FX.active(clip).length;
+  head.appendChild(el('span', 'tc-hint',
+    !clip.fx ? 'none' : clip.fx.length + ' in stack' + (count < clip.fx.length ? ', ' + count + ' on' : '')));
+  box.appendChild(head);
+
+  box.appendChild(el('div', 'tc-hint fx-note',
+    'Drawn once, by the baker - the preview and the export run the same code. Any clip ' +
+    'carrying an effect is composited rather than handed to ffmpeg, so it renders slower ' +
+    'than a plain one. Effects do not apply inside a transition window.'));
+
+  // A structural change is one undo entry and a full rebuild.
+  const edit = (fn) => {
+    pushUndo();
+    fn();
+    FX.normalizeClip(clip);
+    markDirty();
+    renderAll();
+  };
+  const rowHooks = {
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
+    onChanged: () => { markDirty(); drawPreview(); },
+    rebuild: renderInspector,
+  };
+
+  const list = el('div', 'fx-list');
+  const stack = clip.fx || [];
+  let dragFrom = -1;
+
+  stack.forEach((fx, i) => {
+    const d = FX.DEFS[fx.type];
+    const row = el('div', 'fx-fx' + (fx.enabled === false ? ' off' : ''));
+    row.draggable = true;
+    row.addEventListener('dragstart', (e) => {
+      dragFrom = i;
+      row.classList.add('dragging');
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+    });
+    row.addEventListener('dragend', () => { dragFrom = -1; row.classList.remove('dragging'); });
+    row.addEventListener('dragover', (e) => { e.preventDefault(); row.classList.add('dragover'); });
+    row.addEventListener('dragleave', () => row.classList.remove('dragover'));
+    row.addEventListener('drop', (e) => {
+      e.preventDefault();
+      row.classList.remove('dragover');
+      const from = dragFrom;
+      if (from < 0 || from === i) return;
+      edit(() => { clip.fx.splice(i, 0, clip.fx.splice(from, 1)[0]); });
+    });
+
+    const bar = el('div', 'fx-fx-head');
+    const on = el('input');
+    on.type = 'checkbox';
+    on.checked = fx.enabled !== false;
+    on.title = 'Bypass this effect';
+    on.addEventListener('change', () => edit(() => { fx.enabled = on.checked; }));
+    bar.appendChild(on);
+    bar.appendChild(el('b', null, (i + 1) + '. ' + d.label));
+
+    const btns = el('div', 'fx-fx-btns');
+    const mk = (label, title, fn, disabled) => {
+      const b = el('button', 'mini', label);
+      b.title = title;
+      b.disabled = !!disabled;
+      b.draggable = false;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+    };
+    mk('▲', 'Draw this effect earlier in the stack', () => edit(() => {
+      clip.fx.splice(i - 1, 0, clip.fx.splice(i, 1)[0]);
+    }), i === 0);
+    mk('▼', 'Draw this effect later in the stack', () => edit(() => {
+      clip.fx.splice(i + 1, 0, clip.fx.splice(i, 1)[0]);
+    }), i === stack.length - 1);
+    mk('✕', 'Remove this effect', () => edit(() => { clip.fx.splice(i, 1); }));
+    bar.appendChild(btns);
+    row.appendChild(bar);
+
+    const body = el('div', 'fx-fx-body');
+    for (const spec of d.schema) {
+      body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+    }
+
+    // Every numeric parameter is keyframable, and the keys live on the EFFECT, not the
+    // clip - two blurs on one clip are two independent animations, which a single
+    // `clip.keys.radius` could never express. `Anim` only ever touches a `.keys` object,
+    // so an effect entry is a keyframe holder for free.
+    const numeric = Object.keys(d.params).filter((k) => typeof d.params[k] === 'number');
+    if (numeric.length) {
+      const dur = Math.max(0.001, clip.out - clip.in);
+      const keyHooks = Object.assign({}, rowHooks, {
+        dur,
+        getLocalTime: () => clamp(state.playhead - clip.start, 0, dur),
+        seekLocal: (t) => seek(clip.start + t),
+      });
+      body.appendChild(TextUI.section('fxkeys_' + fx.id, 'Keyframes', (kb) => {
+        kb.appendChild(el('div', 'tc-hint',
+          'Keys are times within the clip, so moving the clip moves its animation with it.'));
+        for (const k of numeric) {
+          const spec = Object.assign({}, Anim.propSpec(k), specForParam(d, k));
+          kb.appendChild(TextUI.keyStrip(k, Object.assign({}, keyHooks, {
+            spec,
+            getKeys: () => Anim.trackFor(fx, k, true),
+            // Clearing empties the track and prunes it away, so an effect that ends up
+            // with no keys serialises exactly as one that never had any.
+            clear: () => { Anim.trackFor(fx, k, true).length = 0; Anim.pruneKeys(fx); },
+            emptyHint: 'No keys - ' + k + ' holds the value above.',
+          })));
+        }
+      }));
+    }
+    row.appendChild(body);
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+
+  const addRow = el('div', 'fx-add');
+  const add = el('select');
+  const a0 = el('option');
+  a0.value = '';
+  a0.textContent = 'Add an effect...';
+  add.appendChild(a0);
+  for (const type of FX.TYPES) {
+    const o = el('option');
+    o.value = type;
+    o.textContent = FX.DEFS[type].label;
+    add.appendChild(o);
+  }
+  add.addEventListener('change', () => {
+    if (!add.value) return;
+    const type = add.value;
+    edit(() => {
+      if (!Array.isArray(clip.fx)) clip.fx = [];
+      clip.fx.push(FX.create(type));
+    });
+  });
+  addRow.appendChild(add);
+  box.appendChild(addRow);
+  return box;
+}
+
+/**
+ * A keyframe strip's slider range for one effect parameter, taken from the same schema
+ * row the static control uses - so the two cannot drift apart and offer different limits
+ * for the same number. `base` is the parameter's default, which is the right value for a
+ * first key on an empty track: a scale that starts at 0 would black the clip out.
+ */
+function specForParam(def, key) {
+  const row = def.schema.find((s) => s.path === 'params.' + key) || {};
+  return {
+    label: row.label || key,
+    min: row.min != null ? row.min : 0,
+    max: row.max != null ? row.max : 1,
+    step: row.step != null ? row.step : 0.01,
+    base: def.params[key],
+  };
 }
 
 /**
@@ -1570,8 +1791,8 @@ function clipKeyPanel(clip) {
     // Structural edits (add, delete, clear) rebuild the inspector; value edits do not,
     // or a slider would be torn out of the DOM halfway through a drag.
     rebuild: renderInspector,
-    onEdit: () => pushUndo(),
-    onEditEnd: () => {},
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
     onChanged: () => { markDirty(); drawPreview(); },
     getLocalTime: () => clamp(state.playhead - clip.start, 0, dur),
     seekLocal: (t) => seek(clip.start + t),
@@ -2532,6 +2753,25 @@ function layersAt(time) {
  *
  * Returns false when nothing at all painted, so the caller can leave what it had.
  */
+/**
+ * The effect stack's canvas pool.
+ *
+ * `FX` allocates nothing per frame; it asks for named surfaces and gets the same canvases
+ * back every time, exactly as `Anim.temporalAverage()` does. The names are namespaced by
+ * FX itself ('fxLayer', 'fxA', ...), and the pool is separate from `transSurface`'s
+ * because that one carries the transition's held-frame bookkeeping with it.
+ *
+ * A resize clears the canvas, which is what we want: the preview asks at 540x960 and the
+ * baker at 1080x1920, and a stale half-size picture must never survive the switch.
+ */
+const fxSurfaces = new Map();
+function fxSurface(name, w, h) {
+  let cv = fxSurfaces.get(name);
+  if (!cv) { cv = document.createElement('canvas'); fxSurfaces.set(name, cv); }
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  return cv;
+}
+
 function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
   cctx.save();
   cctx.globalCompositeOperation = 'source-over';
@@ -2539,17 +2779,25 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
   cctx.fillRect(0, 0, W, H);
   let painted = false;
   for (const c of layers) {
+    const local = time - c.start;
     if (c.kind === 'text') {
       // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
       // proportionally smaller card - the layout is identical, there is just less to paint.
-      TextDraw.draw(cctx, c, W, H, time - c.start, frameDur);
+      FX.render(cctx, W, H, c, local, fxSurface,
+        (tc) => TextDraw.draw(tc, c, W, H, local, frameDur));
       painted = true;
       continue;
     }
     const layer = srcFor(c);
     if (!layer) continue;      // still decoding: skip it, keep what is underneath
-    if (layer.tagName === 'CANVAS') cctx.drawImage(layer, 0, 0, W, H);
-    else drawClipTo(c, layer, cctx, W, H);
+    // With no effect stack this is the same single drawImage it has always been - FX.render
+    // hands the target straight to the painter and allocates nothing. With one, the clip is
+    // painted into its own transparent layer first, because an effect that composited
+    // directly onto the frame would behave differently over video than over transparency.
+    FX.render(cctx, W, H, c, local, fxSurface, (tc) => {
+      if (layer.tagName === 'CANVAS') tc.drawImage(layer, 0, 0, W, H);
+      else drawClipTo(c, layer, tc, W, H);
+    });
     painted = true;
   }
   cctx.restore();
@@ -4189,7 +4437,7 @@ async function openProject() {
     for (const tr of t.transitions) Trans.normalize(tr);
     // Fill in effect parameters a project saved before they existed, and drop effect
     // types this build does not know - the same job Trans.normalize does above.
-    for (const c of t.clips) AudioFX.normalizeClip(c);
+    for (const c of t.clips) { AudioFX.normalizeClip(c); FX.normalizeClip(c); }
   }
   preloadTransitionImages();
   state.selection.clear();
@@ -4245,6 +4493,11 @@ function buildJob(outPath, range) {
         // names as its voice source, so buildArgs() needs it to find the sidechain feed.
         trackId: t.id,
         afx: c.afx && c.afx.length ? JSON.parse(JSON.stringify(c.afx)) : undefined,
+        // The visual stack is carried for ONE reason: `jobCacheKey()` hashes the job, and
+        // a composited span's pixels depend on every effect on every clip under it. Leave
+        // it out and turning up a blur would hit the cached render of the old picture.
+        // ffmpeg never sees it - the baker has already drawn it by the time main runs.
+        fx: c.fx && c.fx.length ? JSON.parse(JSON.stringify(c.fx)) : undefined,
         visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
           t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
@@ -4323,6 +4576,11 @@ function jobCacheKey(job) {
     delete e.transRef;
     delete e.seqDir; delete e.bx; delete e.by; delete e.bw; delete e.bh;
     if (c.textClip) e.card = c.textClip.card;
+    // Same rule one level down: an effect's `id` is an identity handed out by FX.create()
+    // so the panel can address it, and it is different every time one is made. Leaving it
+    // in would mean two clips wearing the same grade never shared a cached render, and
+    // deleting an effect and adding it back would miss its own cache.
+    if (e.fx) e.fx = e.fx.map((f) => { const g = Object.assign({}, f); delete g.id; return g; });
     if (c.transRef) {
       // Everything a transition's pixels depend on: its settings and both clips' framing.
       const framing = (x) => ({ src: x.src, in: x.in, start: x.start, out: x.out,
@@ -4498,9 +4756,17 @@ async function bakeTransitions(job) {
  * getImageData, which once turned a four second title card into a ten minute render.
  */
 
-/** Does this clip carry anything the ffmpeg chain cannot express? (step 7 onward) */
+/**
+ * Does this clip carry anything the ffmpeg chain cannot express?
+ *
+ * From step 7 that means an effect stack, and it means ANY effect: there is no ffmpeg
+ * half of an effect to fall back on, so a clip carrying one has to be drawn by the
+ * baker or the export would simply not have it. A bypassed effect, or one of a type this
+ * build does not know, is not an effect - `FX.active()` decides, so the answer here and
+ * the answer the draw path gives can never disagree.
+ */
 function clipNeedsBake(c) {
-  return !!(c && Array.isArray(c.fx) && c.fx.some((f) => !f || f.enabled !== false));
+  return FX.active(c).length > 0;
 }
 
 /** Windows a transition owns, in timeline time. Those spans keep the existing chain. */
