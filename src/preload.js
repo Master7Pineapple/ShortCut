@@ -76,6 +76,8 @@ contextBridge.exposeInMainWorld('api', {
 
   sendInput: (ev) => ipcRenderer.invoke('debug:input', ev),   // test-only, see main.js
   buildArgs: (job, opts) => ipcRenderer.invoke('debug:buildArgs', { job, opts }), // test-only
+  ffmpegRun: (args) => ipcRenderer.invoke('debug:ffmpegRun', { args }),               // test-only
+  fileExists: (file) => ipcRenderer.invoke('debug:exists', { file }),                 // test-only
   writeTestFile: (file, data) => ipcRenderer.invoke('debug:writeFile', { file, data }),
   showItem: (p) => ipcRenderer.invoke('shell:showItem', p),
   setTitle: (t) => ipcRenderer.invoke('app:title', t),

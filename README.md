@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-three suites:
+There are twenty-four suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -166,6 +166,13 @@ There are twenty-three suites:
   after Record was pressed, and that the recording imports with its telemetry attached. It
   reuses `clip1.mp4` from `smoke.js`, copying it rather than writing a sidecar next to the
   shared fixture, and *skips* the live capture on a machine that offers no display.
+- `tools/smoke-longargs.js` — the command-line length ceiling: that a filtergraph too
+  long for a Windows command line still **renders** rather than failing with
+  `spawn ENAMETOOLONG`, that a short one is left inline so every other suite's assertions
+  about the argument list still hold, and that the temporary graph file is deleted after
+  the process closes. It drives the real spawn path, because the only honest way to test
+  a limit the OS enforces is to hand the OS a command line over it. No fixture: the input
+  is lavfi.
 - `tools/smoke-cursor.js` — the screen-recording treatment: that smoothing a straight
   path returns it *exactly* (a filter that bends a straight line is bending everything
   else too) while a jittery one comes back five times calmer, that lag is a shift of the
@@ -247,6 +254,7 @@ tools/smoke-fx.js         the per-clip effect stack: each effect, order, keys, p
 tools/smoke-recorder.js   the screen recorder: telemetry shape, alignment, degradation
 tools/smoke-cursor.js     pointer treatment: smoothing, ripples, selections, auto-zoom,
                           take splitting and the two coordinate spaces
+tools/smoke-longargs.js   the command-line ceiling and the filtergraph script file
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -406,6 +414,42 @@ the result into a single `ffmpeg` invocation:
 Every clip occurrence becomes its own ffmpeg input, so the same file can appear many
 times. That is simple and correct but costs one decoder per clip — if you need to render
 hundreds of clips, batching by source file is the optimisation to reach for.
+
+#### The command line has a ceiling, and big projects hit it
+
+Windows caps a whole command line at 32767 UTF-16 code units, and `spawn()` reports going
+over it as `ENAMETOOLONG` — which surfaces as *"Preview render failed: Error: spawn
+ENAMETOOLONG"* and says nothing at all about the cause.
+
+The cause is scale rather than a bug. Measured on the project that hit it — 156 clips, 85
+of them text cards, a 29 s range at 540x960:
+
+| | |
+| --- | --- |
+| argv entries | 545 |
+| total characters | 28579 |
+| `-filter_complex` alone | 17449 (61%) |
+| inputs | 86, most of them baked rawvideo scratch paths |
+
+Two things worth knowing from those numbers. **28579 is under the documented 32767 and was
+still refused** — the limit counts the executable path, the quoting and escaping Node puts
+around every argument, and the environment block, so the practical ceiling is meaningfully
+lower than the documented one. And the filtergraph is most of the weight, because the
+bake-first architecture gives every baked card its own input and its own overlay chain.
+
+`ffmpegSpawn()` in `main.js` moves the graph into a file — `-filter_complex_script` — when
+the arguments exceed `CMDLINE_BUDGET` (24000, deliberately not near the real limit). That
+project now renders, at about 11000 characters.
+
+It is applied **above the threshold only**, and that is deliberate: `buildArgs()` is
+unchanged and still emits the graph inline, because three suites read that argument to
+assert what each effect emits and `smoke-audiofx.js` asserts a clip with no effects
+produces a *byte-identical* argument list to the one that shipped before the audio chain
+existed. An ordinary render's command line is exactly what it always was, and
+`shortcut-last-ffmpeg-args.txt` still reproduces it by hand either way.
+
+The script file is deleted when the process closes, on the failure path too — one leaked
+graph is harmless, one per render forever is not.
 
 #### The fast path, and exactly what leaves it
 

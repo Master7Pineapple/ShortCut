@@ -1849,6 +1849,87 @@ function buildArgs(job, opts) {
   return args;
 }
 
+
+/**
+ * Spawn ffmpeg, moving the filtergraph into a file when the command line gets long.
+ *
+ * WHY THIS EXISTS. Windows caps a whole command line at 32767 UTF-16 code units, and
+ * `spawn()` reports going over it as `ENAMETOOLONG` - which surfaced as
+ * "Preview render failed: Error: spawn ENAMETOOLONG" on a real project and says nothing
+ * at all about the cause.
+ *
+ * The cause is scale, not a bug. Measured on the project that failed - 156 clips, 85 of
+ * them text cards, a 29 s range at 540x960:
+ *
+ *     545 argv entries, 28579 characters in total
+ *     -filter_complex alone: 17449 characters
+ *     86 inputs, most of them baked rawvideo scratch paths
+ *
+ * Note that 28579 is UNDER the documented 32767, and it was still refused. The limit
+ * counts the executable path, the quoting and escaping Node puts around every argument,
+ * and the environment block - so the practical ceiling is meaningfully lower than the
+ * number in the documentation, which is why the budget below is not set near it.
+ *
+ * THE FIX IS THE STANDARD ONE: `-filter_complex_script <file>`. ffmpeg reads the graph
+ * from disk, so the single largest argument - 61% of the total here - leaves the command
+ * line entirely, and the ceiling stops being about how many layers a short can have.
+ * That project now renders: 28579 characters becomes about 11000.
+ *
+ * It is applied ONLY above a threshold, and that is deliberate:
+ *
+ *   - `buildArgs()` is unchanged and still emits `-filter_complex` with the graph inline.
+ *     Three suites read that argument to assert what each effect emits, and
+ *     `smoke-audiofx.js` asserts a clip with no effects produces a BYTE-IDENTICAL
+ *     argument list to the one that shipped before the audio chain existed. Rewriting the
+ *     graph out of the args for every render would invalidate all of that for no gain.
+ *   - An ordinary render's command line stays exactly what it was, so the file dropped at
+ *     `shortcut-last-ffmpeg-args.txt` still reproduces it by hand.
+ *
+ * The threshold is well under the real limit because the limit counts the executable
+ * path, the quoting Node adds around each argument, and the environment block too -
+ * measuring the arguments alone and stopping at 32767 would still fail.
+ *
+ * The script file is written next to the render scratch and deleted when the process
+ * ends, on both the success and the failure paths - a graph left behind is harmless but
+ * they would accumulate one per render forever.
+ */
+const CMDLINE_BUDGET = 24000;
+
+function ffmpegSpawn(args, opts) {
+  let use = args;
+  let scriptFile = null;
+  let total = 0;
+  for (const a of args) total += String(a).length + 3;   // + quotes and a separator
+
+  const fi = args.indexOf('-filter_complex');
+  if (total > CMDLINE_BUDGET && fi >= 0 && args[fi + 1] != null) {
+    try {
+      const dir = app.getPath('temp');
+      scriptFile = path.join(dir, 'shortcut-fc-' + Date.now().toString(36) + '.txt');
+      // No BOM: ffmpeg reads the file as plain bytes and a BOM lands in the first filter
+      // name, which fails with a parse error that points at the wrong thing entirely.
+      fs.writeFileSync(scriptFile, String(args[fi + 1]), { encoding: 'utf8' });
+      use = args.slice();
+      use[fi] = '-filter_complex_script';
+      use[fi + 1] = scriptFile;
+    } catch (e) {
+      scriptFile = null;      // could not write it: try the long command line anyway
+      use = args;
+    }
+  }
+
+  const p = spawn(ffmpegPath, use, opts || { windowsHide: true });
+  // Named on the process so `smoke-longargs.js` can assert the file is gone afterwards.
+  // A leaked graph is harmless on its own, but one per render accumulates forever.
+  p.fcScript = scriptFile;
+  if (scriptFile) {
+    const drop = () => { try { fs.unlinkSync(scriptFile); } catch (e) { /* already gone */ } };
+    p.on('close', drop);
+    p.on('error', drop);
+  }
+  return p;
+}
+
 /**
  * Loudness pass one: decode the mix, read what loudnorm measured, hand it back.
  *
@@ -1866,7 +1947,7 @@ function measureLoudness(job) {
   if (!args) return Promise.resolve(null);
 
   return new Promise((resolve) => {
-    const p = spawn(ffmpegPath, args, { windowsHide: true });
+    const p = ffmpegSpawn(args);
     activeRender = p;                       // so Cancel can stop pass one too
     let log = '';
     p.stderr.on('data', (d) => {
@@ -1951,13 +2032,15 @@ ipcMain.handle('render:start', async (_e, job) => {
   } catch (e) {
     return { ok: false, error: 'Could not build render command: ' + e.message };
   }
-  // Dropped next to the temp dir so a failed render can be reproduced by hand.
+  // Dropped next to the temp dir so a failed render can be reproduced by hand. This is
+  // the graph INLINE even when `ffmpegSpawn()` goes on to hand ffmpeg a script file, so
+  // the reproduction is one self-contained command either way.
   try {
     fs.writeFileSync(path.join(app.getPath('temp'), 'shortcut-last-ffmpeg-args.txt'), args.join('\n'), 'utf8');
   } catch (e) { /* diagnostics only */ }
 
   return await new Promise((resolve) => {
-    const p = spawn(ffmpegPath, args, { windowsHide: true });
+    const p = ffmpegSpawn(args);
     activeRender = p;
     let log = '';
     p.stderr.on('data', (d) => {
@@ -2041,6 +2124,37 @@ ipcMain.handle('debug:buildArgs', (_e, { job, opts }) => {
   if (!process.env.SHORTCUT_SMOKE) return null;
   try { return { ok: true, args: buildArgs(job, opts) }; }
   catch (e) { return { ok: false, error: e.message }; }
+});
+
+/**
+ * Test-only: run ffmpeg through the REAL spawn path and report how it went.
+ *
+ * `smoke-longargs.js` uses it to reproduce the `ENAMETOOLONG` that a big project hit -
+ * the only way to test that failure is to actually hand the OS a command line over its
+ * limit, because it is the OS that refuses it. Reports whether the filtergraph was moved
+ * into a script file, so the suite can assert the threshold as well as the outcome.
+ */
+ipcMain.handle('debug:ffmpegRun', (_e, { args }) => {
+  if (!process.env.SHORTCUT_SMOKE) return null;
+  return new Promise((resolve) => {
+    let total = 0;
+    for (const a of args) total += String(a).length + 3;
+    const scripted = total > CMDLINE_BUDGET && args.indexOf('-filter_complex') >= 0;
+    let p;
+    try { p = ffmpegSpawn(args); }
+    catch (e) { return resolve({ ok: false, error: e.message, total, scripted }); }
+    let log = '';
+    p.stderr.on('data', (d) => { log += d.toString(); if (log.length > 40000) log = log.slice(-20000); });
+    const script = p.fcScript || null;
+    p.on('error', (err) => resolve({ ok: false, error: err.message, code: err.code, total, scripted, script }));
+    p.on('close', (code) => resolve({ ok: code === 0, code, total, scripted, script, log: log.slice(-1200) }));
+  });
+});
+
+/** Test-only: does a path exist? For asserting scratch files are cleaned up. */
+ipcMain.handle('debug:exists', (_e, { file }) => {
+  if (!process.env.SHORTCUT_SMOKE) return null;
+  try { return fs.existsSync(file); } catch (e) { return null; }
 });
 
 /** Test-only: write a file, so a smoke script can make its own fixtures. */
