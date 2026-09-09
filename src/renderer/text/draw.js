@@ -92,37 +92,69 @@ const TextDraw = (() => {
     const words = card && card.words;
     if (!wf || !Array.isArray(words) || !words.length) return null;
     if (!wf.reveal && !wf.emphasis) return null;
+    const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
     return {
       words,
       reveal: !!wf.reveal,
       emphasis: !!wf.emphasis,
       color: wf.color || '#ffd166',
-      scale: wf.scale == null ? 1.12 : wf.scale,
-      rise: wf.rise || 0,
-      attack: Math.max(0.001, wf.attack == null ? 0.08 : wf.attack),
+      scale: num(wf.scale, 1.12),
+      rise: num(wf.rise, 0),
+      attack: Math.max(0.001, num(wf.attack, 0.08)),
+      // Defaulted here, not only in the generator, so a card written before these
+      // existed still behaves - the values live on the clip and old ones lack them.
+      lead: Math.max(0, num(wf.lead, 0.06)),
+      hold: Math.max(0.05, num(wf.hold, 0.6)),
+      minHold: Math.max(0.02, num(wf.minHold, 0.14)),
+      pop: num(wf.pop, 1),
     };
   }
 
   const smooth = (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 
   /**
-   * One word's state at time `t`: is it out yet, and is it being said right now.
+   * One word's state at time `t`: is it out yet, is it being said right now, and how far
+   * through its entrance it is.
    *
-   * `on` ramps up over `attack` and stays - a revealed word does not disappear again.
-   * `hot` ramps up as the word starts and back down as it ends, so the emphasis travels
-   * along the line with the voice instead of switching on and off.
+   * `card.words` records what the transcript said, unaltered. What it does NOT record is
+   * how long a word should be LIT, and the difference is where every timing complaint
+   * came from. A word's stored `end` is the moment the next word starts, so it swallows
+   * whatever pause follows - measured on a real 173 s transcript, eleven words held for
+   * 0.9-1.26 s, which reads as the highlight lagging the voice. At the other end five
+   * words came back 40-60 ms long, which at 30 fps is one frame or none, so the word
+   * appeared never to light up at all.
+   *
+   * So the lit window is the word's own span, clamped into [minHold, hold]:
+   *
+   *   minHold  a DTW blip still reads as a highlight rather than a dropped frame
+   *   hold     past this it is a pause, not a word, and the emphasis lets go
+   *   lead     everything happens this much early. DTW marks sit on or just after the
+   *            onset, and a highlight that arrives exactly on the consonant feels late;
+   *            leading it slightly is what makes it land ON the beat.
+   *
+   * Overlapping the next word slightly (which minHold can cause) is deliberate: two
+   * words briefly warm reads as a highlight travelling along the line, whereas a word
+   * that never lights reads as a bug.
    */
   function wordState(fx, i, t) {
     const w = fx.words[i];
-    if (!w) return { on: 1, hot: 0 };
+    if (!w) return { on: 1, hot: 0, enter: 1 };
     const a = fx.attack;
-    const on = fx.reveal ? smooth((t - w.start) / a) : 1;
-    if (!fx.emphasis) return { on, hot: 0 };
-    const end = Math.max(w.end, w.start + a);
-    // A word shorter than two ramps peaks in the middle rather than never arriving.
-    const half = Math.min(a, (end - w.start) / 2);
-    const hot = Math.min(smooth((t - w.start) / half), smooth((end - t) / half));
-    return { on, hot: Math.max(0, hot) };
+    const start = w.start - fx.lead;
+    const enter = smooth((t - start) / a);
+    const on = fx.reveal ? enter : 1;
+    if (!fx.emphasis) return { on, hot: 0, enter };
+    // `2 * a` is a floor, not a preference: the emphasis peaks at the middle of its
+    // window, and a window shorter than two ramps peaks before the word has finished
+    // ARRIVING - so the pop is still shrinking the word at the very moment the emphasis
+    // wants it big, and the two cancel. Measured on a real transcript, that left 112
+    // short words visibly lit for a single frame. Half a window of `a` either side puts
+    // the peak exactly where the entrance ends.
+    const span = Math.min(Math.max(fx.hold, 2 * a), Math.max(fx.minHold, 2 * a, w.end - w.start));
+    const end = start + span;
+    const half = Math.min(a, span / 2);
+    const hot = Math.min(smooth((t - start) / half), smooth((end - t) / half));
+    return { on, hot: Math.max(0, hot), enter };
   }
 
   /** Blend two #rrggbb colours. Used to ease a word into its emphasis colour. */
@@ -313,9 +345,13 @@ const TextDraw = (() => {
         // emphasis colour is applied outright once it is more on than off.
         paint = rest ? mixHex(rest, fx.color, ws.hot) : (ws.hot > 0.5 ? fx.color : keyed);
       }
+      // The pop belongs to the word's own entrance, not to a uniform sweep across the
+      // line - that is the whole point of having real times. It multiplies with the
+      // emphasis, so a word can pop in and be lit at once.
+      const pop = fx.reveal && fx.pop !== 1 ? fx.pop + (1 - fx.pop) * ws.enter : 1;
       return {
         alpha: ws.on,
-        scale: 1 + (fx.scale - 1) * ws.hot,
+        scale: pop * (1 + (fx.scale - 1) * ws.hot),
         dy: -fx.rise * ws.hot,
         paint,
       };
@@ -401,7 +437,7 @@ const TextDraw = (() => {
     // An emphasised word grows and lifts. animatedBounds() samples this function across
     // the clip, but a word shorter than its sampling step could peak between two samples
     // - so the room is reserved here rather than discovered there.
-    if (fx && fx.emphasis) pad += lineH * Math.max(0, fx.scale - 1) + Math.abs(fx.rise);
+    if (fx) pad += lineH * Math.max(0, fx.scale - 1, fx.pop - 1) + Math.abs(fx.rise);
 
     // Union of the item boxes, which already include per-unit offsets and scaling.
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;

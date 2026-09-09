@@ -64,6 +64,12 @@
     emphasisScale: 1.12,
     emphasisRise: 0,
     emphasisAttack: 0.08,
+    // How long a word stays lit, and how early it happens. A word's recorded `end` is
+    // the moment the NEXT word starts, so it swallows the pause after it - these three
+    // turn that record into a window that tracks the voice. See TextDraw.wordState.
+    wordLead: 0.06,       // start this much early, so the highlight lands on the beat
+    wordHold: 0.60,       // longest a word stays lit; past this it is a pause, not a word
+    wordMinHold: 0.14,    // shortest, so a 40ms DTW blip still reads as a highlight
     // filler words fed back into Tighten
     cutFillers: false,
     fillers: 'um, uh, erm, ah, like, you know, i mean, sort of, kind of, basically',
@@ -394,13 +400,19 @@
     }
     if (!preset || !o.presetPlacement) st.y = zone.y;
 
+    // Word reveal replaces the uniform typewriter sweep rather than stacking with it:
+    // the whole point of real word times is that each word arrives when it is spoken,
+    // and a fixed stagger on top of that fights it. The pop carries over as the word's
+    // OWN entrance instead - see `wordFx.pop` below.
+    const revealing = !!o.wordReveal;
+
     card.animEnabled = true;
     if (preset) {
       // The preset's own layers are the animation. Its timings were authored against
       // whatever length that card was, and a caption is usually shorter, but every layer
       // is anchored to a clip end or start - so they still land.
       if (!Array.isArray(card.anims)) card.anims = [];
-    } else card.anims = o.popIn ? [{
+    } else card.anims = (o.popIn && !revealing) ? [{
       id: 'cap' + Math.random().toString(36).slice(2, 8),
       type: 'typewriter',
       mode: 'in',
@@ -431,12 +443,18 @@
       end: r3(Math.max(0, w.end - phrase.start)),
     }));
     card.wordFx = {
-      reveal: !!o.wordReveal,
+      reveal: revealing,
       emphasis: !!o.wordEmphasis,
       color: o.emphasisColor,
       scale: Number(o.emphasisScale) || 1,
       rise: Number(o.emphasisRise) || 0,
       attack: Math.max(0.001, Number(o.emphasisAttack) || DEFAULTS.emphasisAttack),
+      lead: Math.max(0, Number(o.wordLead) || 0),
+      hold: Math.max(0.05, Number(o.wordHold) || DEFAULTS.wordHold),
+      minHold: Math.max(0.02, Number(o.wordMinHold) || DEFAULTS.wordMinHold),
+      // The typewriter's `scaleFrom` becomes the word's own pop, so "Pop each word in"
+      // keeps meaning what it says once the words have real times of their own.
+      pop: revealing && o.popIn ? 0.55 : 1,
     };
     return card;
   }

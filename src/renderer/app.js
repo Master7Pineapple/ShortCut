@@ -3726,6 +3726,23 @@ function captionsPanelBody() {
       path: 'emphasisAttack', label: 'Ease over', type: 'range',
       min: 0.01, max: 0.4, step: 0.01, unit: 's', digits: 2,
     }));
+    body.appendChild(el('div', 'tc-hint',
+      'A word records the moment the NEXT word starts, so its span swallows the pause ' +
+      'after it. These three turn that record into a window that tracks the voice: lead ' +
+      'it slightly so it lands on the beat, let go after Hold at most rather than sitting ' +
+      'lit through a pause, and keep it up for At least so a very short word still reads.'));
+    body.appendChild(C({
+      path: 'wordLead', label: 'Lead the voice by', type: 'range',
+      min: 0, max: 0.3, step: 0.01, unit: 's', digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'wordHold', label: 'Hold at most', type: 'range',
+      min: 0.1, max: 2, step: 0.05, unit: 's', digits: 2,
+    }));
+    body.appendChild(C({
+      path: 'wordMinHold', label: 'Hold at least', type: 'range',
+      min: 0.02, max: 0.6, step: 0.01, unit: 's', digits: 2,
+    }));
   }));
 
   // ---- fillers

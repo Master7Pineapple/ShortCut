@@ -1,0 +1,107 @@
+{
+  "kind": "full",
+  "text": "100% AI.",
+  "style": {
+    "fontFamily": "Inter 28pt 28pt Black",
+    "fontSize": 96,
+    "letterSpacing": -3,
+    "lineHeight": 1.15,
+    "bold": true,
+    "italic": false,
+    "underline": false,
+    "strikethrough": false,
+    "uppercase": false,
+    "align": "center",
+    "x": 0.5,
+    "y": 0.73,
+    "maxWidth": 0.82,
+    "rotate": 0,
+    "opacity": 1,
+    "fill": {
+      "type": "solid",
+      "color": "#ffffff",
+      "gradient": {
+        "angle": 90,
+        "stops": [
+          {
+            "pos": 0,
+            "color": "#ffd166"
+          },
+          {
+            "pos": 1,
+            "color": "#ef476f"
+          }
+        ]
+      }
+    },
+    "stroke": {
+      "on": true,
+      "color": "#000000",
+      "width": 8
+    },
+    "shadow": {
+      "on": true,
+      "distance": 6,
+      "angle": 135,
+      "blur": 22,
+      "opacity": 0.75,
+      "color": "#000000"
+    },
+    "glow": {
+      "on": false,
+      "color": "#4f8cff",
+      "intensity": 3,
+      "size": 26,
+      "spread": 0.4,
+      "over": 0.5
+    },
+    "blur": {
+      "on": false,
+      "amount": 0
+    },
+    "bg": {
+      "on": false,
+      "color": "#000000",
+      "opacity": 0.5,
+      "padding": 26,
+      "radius": 18
+    }
+  },
+  "animEnabled": true,
+  "anims": [
+    {
+      "id": "capysrx3e",
+      "type": "typewriter",
+      "mode": "in",
+      "anchor": "start",
+      "start": 0,
+      "duration": 0.27,
+      "easing": {
+        "kind": "named",
+        "name": "backOut"
+      },
+      "motionBlur": {
+        "on": false,
+        "strength": 0.6,
+        "samples": 8
+      },
+      "params": {
+        "unit": "char",
+        "effect": "pop",
+        "distance": 0.6,
+        "overlap": 5.7,
+        "order": "forward",
+        "scaleFrom": 0.75
+      }
+    }
+  ],
+  "keys": {
+    "opacity": [],
+    "x": [],
+    "y": [],
+    "scale": [],
+    "rotate": [],
+    "glow": []
+  },
+  "name": "Full card preset"
+}

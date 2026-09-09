@@ -260,6 +260,62 @@
     ok('word reveal and the typewriter layer compose', bi.length === 2,
       bi.map((i) => i.text).join(','));
 
+    // ---- the three timing defects, each with the case that produced it.
+    // A word's recorded `end` is the moment the NEXT word starts, so it swallows the
+    // pause after it. Left alone the highlight sat lit for up to 1.26s on a real
+    // transcript, which reads as the emphasis lagging the voice.
+    // `held` ends where `later` starts, which is what parseWhisper produces across a
+    // pause: the word is 0.2s of speech carrying 1.8s of silence on its back.
+    const pauseCard = Captions.phraseCard(base, Captions.groupPhrases(W([
+      ['held', 0, 2.0], ['later', 2.0, 2.3],
+    ]), { maxWords: 2, minDur: 0 })[0], {
+      wordEmphasis: true, wordReveal: false, wordHold: 0.6, popIn: false,
+    });
+    const pauseClip = { in: 0, out: 3, card: pauseCard };
+    const hotAt = (clip, t, idx) => {
+      const it = TextDraw.measure(cctx, clip, 1080, 1920, t).items[idx];
+      return it ? it.scale : 0;
+    };
+    ok('a word records the pause after it as its own span',
+      near(pauseCard.words[0].end - pauseCard.words[0].start, 2.0, 0.01),
+      String(pauseCard.words[0].end));
+    ok('but the emphasis lets go after `hold` instead of sitting lit through it',
+      hotAt(pauseClip, 0.3, 0) > 1.0 && hotAt(pauseClip, 1.5, 0) <= 1.0001,
+      'at 0.3s ' + hotAt(pauseClip, 0.3, 0).toFixed(3) +
+      ', at 1.5s ' + hotAt(pauseClip, 1.5, 0).toFixed(3));
+
+    // A 40ms word is a DTW blip, and at 30fps it is one frame or none - five words on
+    // the same transcript never appeared to light up at all.
+    const blipCard = Captions.phraseCard(base, Captions.groupPhrases(W([
+      ['So', 0, 0.04], ['it', 0.04, 0.5],
+    ]), { maxWords: 2, minDur: 0 })[0], {
+      wordEmphasis: true, wordReveal: true, emphasisScale: 1.25, popIn: true,
+    });
+    const blipClip = { in: 0, out: 2, card: blipCard };
+    let litFrames = 0;
+    for (let f = 0; f < 60; f++) {
+      const it = TextDraw.measure(cctx, blipClip, 1080, 1920, f / 30).items[0];
+      if (it && it.text === 'So' && (it.scale > 1.04 || /^rgb/.test(String(it.paint)))) litFrames++;
+    }
+    ok('a 40ms word is still lit long enough to be seen at 30fps', litFrames >= 3,
+      litFrames + ' frame(s)');
+
+    // The pop and the emphasis both drive scale. A window shorter than two ramps peaks
+    // while the word is still arriving, so the pop shrinks it exactly when the emphasis
+    // wants it big and the two cancel - 112 short words came out lit for one frame.
+    ok('the emphasis peak lands after the entrance, so the pop cannot cancel it',
+      TextDraw.measure(cctx, blipClip, 1080, 1920, 0.08).items[0].scale > 1.0,
+      String(TextDraw.measure(cctx, blipClip, 1080, 1920, 0.08).items[0].scale.toFixed(3)));
+
+    // Word reveal replaces the uniform sweep rather than stacking with it.
+    const revCard = Captions.phraseCard(base, ph[0], { wordReveal: true, popIn: true });
+    ok('with word reveal on, no uniform typewriter layer is added',
+      revCard.anims.length === 0, String(revCard.anims.length));
+    ok('and the pop carries over as the word’s own entrance',
+      revCard.wordFx.pop < 1, String(revCard.wordFx.pop));
+    ok('with word reveal off, the typewriter layer is still how the pop happens',
+      Captions.phraseCard(base, ph[0], { wordReveal: false, popIn: true }).anims.length === 1);
+
     // ============================== 4c. building from a saved preset
     const preset = { kind: 'full', text: 'ignored', style: Object.assign(
       TextModel.defaultStyle(), { fontFamily: 'Impact', fontSize: 44, y: 0.2 }),

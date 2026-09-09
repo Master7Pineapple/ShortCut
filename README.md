@@ -776,14 +776,33 @@ which is the same `t` every paint pass already runs on, so nothing has to conver
   back as the next one starts.
 
 Both are per-unit states that **multiply into the typewriter's**, exactly as the animation
-layers multiply into each other, so a card can type in *and* have the spoken word lift out
-of it. The times are written onto every generated caption whether or not either effect is
-on, so switching one on later needs no regenerate.
+layers multiply into each other. The times are written onto every generated caption whether
+or not either effect is on, so switching one on later needs no regenerate.
 
-Two things to keep right:
+**What is recorded is not what is played, and that distinction is the whole section.**
+`card.words` holds what the transcript said, unaltered: a word's `end` is *the moment the
+next word starts*, so it swallows whatever pause follows it. Played back literally, that
+produced all three of the timing complaints this feature first shipped with. Measured over
+a real 173-second transcript (607 words, 218 cards):
 
-- `t_dtw` gives an **instant** per word, not a span, so emphasis ramps up over `attack` and
-  back down as the next word starts — a hard on/off switch would strobe.
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| the highlight lags the voice | 11 words held **0.9–1.26 s**, lit through the pause after them | `hold` (0.6 s) — past that it is a pause, not a word, and the emphasis lets go |
+| a spoken word never lights up | 5 words came back **40–60 ms** long: one frame at 30 fps, or none | `minHold` (0.14 s) — a DTW blip still reads as a highlight |
+| it feels a beat late | DTW marks sit on or just after the onset | `lead` (0.06 s) — everything happens slightly early, so it lands *on* the beat |
+
+Three more things to keep right:
+
+- **The emphasis window must be at least `2 × attack`.** The pop and the emphasis both drive
+  scale, and a window shorter than two ramps peaks while the word is still *arriving* — so
+  the pop is shrinking the word at the very moment the emphasis wants it big, and the two
+  cancel. That left **112 short words lit for a single frame**, which looks exactly like the
+  emphasis not working. Half a window of `attack` either side puts the peak precisely where
+  the entrance ends. It is a floor derived from `attack`, not another tunable.
+- **Word reveal replaces the uniform typewriter sweep, it does not stack with it.** The
+  point of having real times is that each word arrives when it is spoken; a fixed stagger on
+  top of that fights it. So the generator adds no typewriter layer when reveal is on, and
+  "Pop each word in" carries over as `wordFx.pop` — the word's *own* entrance.
 - An emphasised word is bigger than the text that measured it. `animatedBounds()` samples
   the paint across the clip, but a word shorter than its sampling step could peak between
   two samples, so the extra room is **reserved in `pad`** rather than discovered by
@@ -792,6 +811,9 @@ Two things to keep right:
 Colour blends from the card's own fill toward the emphasis colour, which needs a colour to
 blend *from* — a gradient fill has none, so there the emphasis colour is applied outright
 once it is more on than off.
+
+After the fix, over the same transcript: no word unlit, none lit for under two frames
+(minimum 3, median 6), and every peak within **47 ms** of its word's onset.
 
 #### Building captions from a preset
 
