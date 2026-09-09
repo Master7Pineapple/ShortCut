@@ -2492,20 +2492,68 @@ function activeVideoClip() {
  * `activeVideoClip()` has one: parking the playhead on the very end should hold the final
  * picture rather than fall off into black.
  */
-function activeLayers() {
+function activeLayers() { return layersAt(state.playhead); }
+
+/**
+ * The same thing at an arbitrary timeline time, which is what the composite baker walks.
+ *
+ * `atEnd` is only the viewer's courtesy - parking the playhead on the very last instant
+ * should hold the final picture rather than fall off into black. A bake asks for times
+ * strictly inside spans, so it never sees it.
+ */
+function layersAt(time) {
   const eps = 1e-6;
   const dur = projectDuration();
-  const atEnd = dur > 0 && state.playhead >= dur - eps;
+  const atEnd = dur > 0 && time >= dur - eps;
   const out = [];
   for (const t of state.tracks) {
     if (t.type !== 'video' || t.hidden) continue;
     for (const c of t.clips) {
       if (!isPictureClip(c) && c.kind !== 'text') continue;
-      const live = state.playhead >= c.start - eps && state.playhead < clipEnd(c) - eps;
+      const live = time >= c.start - eps && time < clipEnd(c) - eps;
       if (live || (atEnd && Math.abs(clipEnd(c) - dur) < 0.001)) out.push(c);
     }
   }
   return out.reverse();
+}
+
+/**
+ * Paint one composited frame - THE single draw path for the picture.
+ *
+ * The preview calls it with its held per-clip layer surfaces; the baker calls it with
+ * freshly seeked media elements at output resolution. Same order, same arithmetic, same
+ * pixels - which is the whole point of step 6: a visual feature is written here once and
+ * both the viewer and the export get it.
+ *
+ * `srcFor(clip)` hands back either a canvas already framed to WxH, or a raw media
+ * element to be framed by drawClipTo(), or null when the clip has no picture yet. A null
+ * layer is SKIPPED, never cleared - that is the black-flash rule, and it holds in the
+ * baker too, where a stubborn seek would otherwise punch a hole through the stack.
+ *
+ * Returns false when nothing at all painted, so the caller can leave what it had.
+ */
+function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
+  cctx.save();
+  cctx.globalCompositeOperation = 'source-over';
+  cctx.fillStyle = '#000';
+  cctx.fillRect(0, 0, W, H);
+  let painted = false;
+  for (const c of layers) {
+    if (c.kind === 'text') {
+      // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
+      // proportionally smaller card - the layout is identical, there is just less to paint.
+      TextDraw.draw(cctx, c, W, H, time - c.start, frameDur);
+      painted = true;
+      continue;
+    }
+    const layer = srcFor(c);
+    if (!layer) continue;      // still decoding: skip it, keep what is underneath
+    if (layer.tagName === 'CANVAS') cctx.drawImage(layer, 0, 0, W, H);
+    else drawClipTo(c, layer, cctx, W, H);
+    painted = true;
+  }
+  cctx.restore();
+  return painted;
 }
 
 /**
@@ -2723,26 +2771,8 @@ function drawPreview() {
   }
 
   const cctx = cache.getContext('2d');
-  const frameDur = 1 / state.out.fps;
-  let painted = false;
-  cctx.save();
-  cctx.globalCompositeOperation = 'source-over';
-  cctx.fillStyle = '#000';
-  cctx.fillRect(0, 0, P.w, P.h);
-  for (const c of layers) {
-    if (c.kind === 'text') {
-      // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
-      // proportionally smaller card - the layout is identical, there is just less to paint.
-      TextDraw.draw(cctx, c, P.w, P.h, state.playhead - c.start, frameDur);
-      painted = true;
-      continue;
-    }
-    const layer = layerFor(c, P);
-    if (!layer) continue;     // still decoding: skip it, keep what is underneath
-    cctx.drawImage(layer, 0, 0);
-    painted = true;
-  }
-  cctx.restore();
+  const painted = compositeLayers(cctx, P.w, P.h, layers, state.playhead,
+    (c) => layerFor(c, P), 1 / state.out.fps);
 
   // Nothing in the whole stack has a frame yet (every element mid-seek, on the very first
   // paint after an import). Leave the canvas exactly as it was rather than flash black.
@@ -4203,6 +4233,7 @@ function buildJob(outPath, range) {
       const tailCut = Math.max(0, cEnd - r.to);
 
       const entry = {
+        id: c.id,
         src: c.src,
         kind: c.kind,
         start: Math.max(0, c.start - r.from),
@@ -4286,6 +4317,8 @@ function jobCacheKey(job) {
   delete copy.preview;
   copy.clips = (job.clips || []).map((c) => {
     const e = Object.assign({}, c);
+    // Identity, not pixels: two identical cuts of the same source must key the same.
+    delete e.id;
     delete e.textClip;
     delete e.transRef;
     delete e.seqDir; delete e.bx; delete e.by; delete e.bw; delete e.bh;
@@ -4427,11 +4460,206 @@ async function bakeTransitions(job) {
   return dirs;
 }
 
-/** Bake every canvas-drawn overlay a job needs: text cards and transitions. */
+
+// ------------------------------------------------- the composite baker (bake-first)
+
+/**
+ * BAKE-FIRST RENDERING.
+ *
+ * Until step 6 every visual feature had to be written twice - a canvas draw for the
+ * preview and a matching ffmpeg filter for the export - and the two drifted, repeatedly.
+ * That is survivable for framing and transitions. It is not survivable for an effect
+ * stack. So the renderer now bakes the picture and ffmpeg only encodes: for each output
+ * frame of a disqualified span we seek the contributing elements, run the SAME
+ * `compositeLayers()` the viewer runs, at output resolution, and stream RGBA into
+ * frames.raw. ffmpeg overlays that one opaque full-frame layer and encodes.
+ *
+ * THE FAST PATH, exactly. A span still goes down the existing trim -> crop -> scale ->
+ * overlay chain when both of these hold:
+ *
+ *   1. at most ONE picture clip (kind 'video' or 'image') is visible across the span, and
+ *   2. no clip contributing to the span carries an effect stack (`clip.fx`, step 7 on).
+ *
+ * Anything else bakes. In practice that means real alpha compositing - two or more
+ * pictures stacked - and, from step 7, any effect.
+ *
+ * Text cards and transitions do NOT disqualify a span, and that is not a loophole: they
+ * are already baked from the one canvas implementation, so the stated reason for the fast
+ * path ("far faster, and the pixels are identical") applies to them word for word. A card
+ * is baked cropped to its painted bounds, which is a fraction of a full frame; folding it
+ * into a full-frame composite would cost 20-100x the bytes for the same picture. A
+ * transition additionally OWNS its window - its baked layer sits between tracks in the
+ * overlay chain, while a composite layer is appended last and would cover it - so a
+ * transition window is excluded from bake spans outright.
+ *
+ * The bake cache rules are unchanged and still load-bearing: a clip's position on the
+ * timeline is not in the key (`jobCacheKey`), and frames stay raw, never PNG - PNG
+ * encoding a large alpha-heavy frame costs 100-1500 ms against about 4 ms for
+ * getImageData, which once turned a four second title card into a ten minute render.
+ */
+
+/** Does this clip carry anything the ffmpeg chain cannot express? (step 7 onward) */
+function clipNeedsBake(c) {
+  return !!(c && Array.isArray(c.fx) && c.fx.some((f) => !f || f.enabled !== false));
+}
+
+/** Windows a transition owns, in timeline time. Those spans keep the existing chain. */
+function transitionWindows(job) {
+  return job.clips
+    .filter((c) => c.kind === 'trans')
+    .map((c) => ({ from: job.rangeFrom + c.start, to: job.rangeFrom + c.start + (c.out - c.in) }));
+}
+
+/** Would the frame at `t` have to be composited, rather than overlaid by ffmpeg? */
+function needsCompositeAt(t, windows) {
+  for (const w of windows) if (t >= w.from - 1e-6 && t < w.to + 1e-6) return false;
+  const layers = layersAt(t);
+  let pictures = 0;
+  for (const c of layers) {
+    if (isPictureClip(c)) pictures++;
+    if (clipNeedsBake(c)) return true;
+  }
+  return pictures >= 2;
+}
+
+/**
+ * The spans of a job that must be composited, in timeline time.
+ *
+ * Every clip edge and transition edge is a boundary; between two boundaries the visible
+ * stack is constant, so one midpoint sample decides the whole slice. Adjacent slices with
+ * the same answer are merged, which keeps a long two-layer sequence one bake rather than
+ * one bake per cut underneath it.
+ */
+function compositeSpans(job) {
+  const from = job.rangeFrom, to = job.rangeTo;
+  if (!(to > from)) return [];
+  const windows = transitionWindows(job);
+  const edges = new Set([from, to]);
+  for (const { clip } of allClips()) {
+    for (const e of [clip.start, clipEnd(clip)]) if (e > from + 1e-6 && e < to - 1e-6) edges.add(e);
+  }
+  for (const w of windows) {
+    for (const e of [w.from, w.to]) if (e > from + 1e-6 && e < to - 1e-6) edges.add(e);
+  }
+  const cuts = [...edges].sort((a, b) => a - b);
+  const spans = [];
+  for (let i = 0; i < cuts.length - 1; i++) {
+    const a = cuts[i], b = cuts[i + 1];
+    if (b - a < 1e-4) continue;
+    if (!needsCompositeAt((a + b) / 2, windows)) continue;
+    const last = spans[spans.length - 1];
+    if (last && Math.abs(last.to - a) < 1e-4) last.to = b;
+    else spans.push({ from: a, to: b });
+  }
+  return spans;
+}
+
+/**
+ * Bake every composited span into an opaque full-frame raw RGBA layer.
+ *
+ * Runs BEFORE bakeTextClips/bakeTransitions, because a clip whose whole visible extent
+ * falls inside a bake span is dropped from the job here - the composite already contains
+ * it, and leaving it in would decode it twice and paint it twice. A clip that straddles a
+ * span edge stays: the composite layer is appended last, so it wins inside its own window
+ * and the clip's own chain draws outside it.
+ */
+async function bakeComposite(job) {
+  const dirs = [];
+  const spans = compositeSpans(job);
+  if (!spans.length) return dirs;
+
+  const frame = document.createElement('canvas');
+  frame.width = job.width; frame.height = job.height;
+  const fctx = frame.getContext('2d');
+  const frameDur = 1 / job.fps;
+  const totalFrames = spans.reduce(
+    (n, sp) => n + Math.max(1, Math.round((sp.to - sp.from) * job.fps)), 0);
+  let done = 0;
+
+  for (const span of spans) {
+    const frames = Math.max(1, Math.round((span.to - span.from) * job.fps));
+    const slot = await window.api.textSeq();
+    dirs.push(slot.dir);
+
+    const BATCH = 4;                       // full-frame RGBA is bulky, so smaller batches
+    const frameBytes = job.width * job.height * 4;
+    const batch = new Uint8Array(frameBytes * BATCH);
+    let inBatch = 0;
+    const flush = async () => {
+      if (!inBatch) return;
+      await window.api.writeTextFrames(slot.dir,
+        inBatch === BATCH ? batch : batch.slice(0, inBatch * frameBytes));
+      inBatch = 0;
+    };
+
+    for (let i = 0; i < frames; i++) {
+      const t = span.from + i / job.fps;
+      const layers = layersAt(t);
+      // Park every contributing element on this exact frame first. A still has no clock
+      // and nothing to seek; a <video> gets the same bounded seek the transition baker
+      // uses, so a stubborn one costs a frame and never the render.
+      const pics = layers.filter(isPictureClip);
+      await Promise.all(pics.map((c) => {
+        const el = mediaFor(c);
+        if (el.tagName === 'IMG') return Promise.resolve();
+        el.muted = true;
+        return seekMedia(el, clamp(c.in + (t - c.start), 0, Math.max(0, c.mediaDuration - 0.03)));
+      }));
+
+      compositeLayers(fctx, job.width, job.height, layers, t,
+        (c) => { const el = mediaFor(c); return frameReady(el) ? el : null; }, frameDur);
+
+      batch.set(fctx.getImageData(0, 0, job.width, job.height).data, inBatch * frameBytes);
+      inBatch++;
+      if (inBatch === BATCH) await flush();
+
+      done++;
+      if (i % 4 === 0 || i === frames - 1) {
+        setStatus('Baking the composite... ' + done + ' / ' + totalFrames + ' frames');
+        $('#renderBar').style.width = (done / totalFrames * 100) + '%';
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    await flush();
+    await window.api.textSeqDone(slot.dir, frames);
+
+    job.clips.push({
+      id: null,
+      src: null,
+      kind: 'baked',
+      start: span.from - job.rangeFrom,
+      in: 0,
+      out: span.to - span.from,
+      panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
+      visible: true, audible: false,
+      seqDir: slot.dir, bx: 0, by: 0, bw: job.width, bh: job.height,
+    });
+    log('Baked ' + frames + ' composited frames (' + job.width + 'x' + job.height + ') for ' +
+      fmtTc(span.from) + ' - ' + fmtTc(span.to) + '.');
+  }
+
+  // Anything wholly inside a bake span is already in those pixels. Dropping it here is
+  // what makes the bake a saving rather than a surcharge: buildArgs() only opens an input
+  // for a clip that is still visible or audible, so its decoder goes with it.
+  const covered = (a, b) => spans.some((sp) => a >= sp.from - 1e-4 && b <= sp.to + 1e-4);
+  for (const e of job.clips) {
+    if (!e.visible || e.kind === 'baked' || e.kind === 'trans') continue;
+    const a = job.rangeFrom + e.start;
+    if (covered(a, a + (e.out - e.in))) {
+      e.visible = false;
+      delete e.textClip;    // its card is in the composite; there is nothing left to bake
+    }
+  }
+  return dirs;
+}
+
+/** Bake every canvas-drawn layer a job needs: the composite, text cards, transitions. */
 async function bakeOverlays(job) {
+  // The composite goes first: it decides which cards and clips are left to bake at all.
+  const c = await bakeComposite(job);
   const a = await bakeTextClips(job);
   const b = await bakeTransitions(job);
-  return a.concat(b);
+  return c.concat(a, b);
 }
 
 /**

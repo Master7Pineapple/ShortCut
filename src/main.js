@@ -1076,7 +1076,7 @@ function jobKey(job) {
   // whose name is random, so the hash would differ on every render (never a hit) while
   // stripping it out would let two different cards collide (a wrong hit). Refuse instead:
   // callers that want caching send `cacheKey`, computed before baking.
-  if ((job.clips || []).some((c) => c.kind === 'text')) return null;
+  if ((job.clips || []).some((c) => c.kind === 'text' || c.kind === 'baked')) return null;
 
   const copy = Object.assign({}, job);
   delete copy.outPath;
@@ -1204,6 +1204,12 @@ const r3 = (n) => Math.round(n * 1e6) / 1e6;
  * timeline position, cropped/panned to the output aspect, then overlaid with `enable`.
  * Clips arrive already sorted bottom track -> top track, so later overlays win.
  *
+ * Since step 6 this chain is the FAST PATH, not the whole story. Any span the renderer
+ * had to composite itself arrives as a single opaque `kind:'baked'` full-frame RGBA
+ * layer, appended last so it wins inside its own window. What disqualifies a span from
+ * the fast path is documented on bakeComposite() in app.js - in short, two or more
+ * stacked pictures, or any clip carrying an effect stack.
+ *
  * Audio: each audible clip is trimmed, run through its own effect chain (`clip.afx`),
  * levelled, delayed to its position, optionally sidechained to a voice track, then amixed
  * and - if the project asks for it - loudness-normalised. See buildAudioGraph() below.
@@ -1229,10 +1235,12 @@ function buildArgs(job, opts) {
     if (measure ? c.audible : (c.visible || c.audible)) inputs.push(c);
   }
   for (const c of inputs) {
-    if (c.kind === 'text' || c.kind === 'trans') {
+    if (c.kind === 'text' || c.kind === 'trans' || c.kind === 'baked') {
       // A raw RGBA stream straight from the canvas - see text:seq for why not PNG.
-      // Transitions bake the same way text does; the only difference is that a
-      // transition's layer is opaque and covers the full frame.
+      // Transitions and composited spans bake the same way text does; the difference is
+      // that their layer is opaque and covers the full frame. A 'baked' clip is the
+      // bake-first path (step 6): the renderer composited that span itself and ffmpeg
+      // only overlays and encodes it. See bakeComposite() in app.js.
       args.push('-f', 'rawvideo', '-pixel_format', 'rgba',
         '-video_size', c.bw + 'x' + c.bh,
         '-framerate', String(fps),
@@ -1377,6 +1385,28 @@ function buildArgs(job, opts) {
       fc.push(
         '[' + last + '][v' + i + ']overlay=' + Math.round(c.bx) + ':' + Math.round(c.by) +
         ':eof_action=pass:enable=' +
+        "'between(t," + r3(c.start) + ',' + r3(c.start + dur) + ")'[base" + (i + 1) + ']'
+      );
+      last = 'base' + (i + 1);
+      return;
+    }
+
+    if (c.kind === 'baked') {
+      // A composited span is already the finished frame at output size, so there is
+      // nothing to crop, pan or rescale - only a colour conversion to do, and that is the
+      // whole reason this has its own branch. The canvas hands over full-range RGB; a
+      // decoded video arrives as limited-range BT.709 and stays that way through
+      // format=yuva420p. Letting swscale guess turned a flat blend eleven 8-bit levels
+      // greener than the same blend in the preview, which is exactly the preview/export
+      // drift step 6 exists to end. State the conversion instead of inferring it.
+      fc.push(
+        '[' + idx + ':v]setpts=PTS-STARTPTS+' + r3(c.start) + '/TB' +
+        ',scale=' + width + ':' + height +
+        ':in_range=full:out_range=tv:out_color_matrix=bt709' +
+        ',setsar=1,format=yuva420p,fps=' + fps + '[v' + i + ']'
+      );
+      fc.push(
+        '[' + last + '][v' + i + ']overlay=0:0:eof_action=repeat:enable=' +
         "'between(t," + r3(c.start) + ',' + r3(c.start + dur) + ")'[base" + (i + 1) + ']'
       );
       last = 'base' + (i + 1);

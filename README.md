@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are nineteen suites:
+There are twenty suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -124,6 +124,15 @@ There are nineteen suites:
   timeline at the playhead, and that one undo restores an image clip exactly. It needs
   `flat_blue.mp4` and `half_red.png` in `%TEMP%\scut_test` (its header gives the two
   ffmpeg commands).
+- `tools/smoke-bakefirst.js` — bake-first rendering: that a plain clip still takes the
+  fast path and still emits the same trim/crop/scale/overlay chain with no rawvideo input
+  at all, that two stacked pictures (and, from step 7, any effect stack) disqualify a
+  span while a transition window does not, that the bake produces one opaque full-frame
+  layer appended last, that a clip wholly inside a bake span is dropped from the picture
+  chain while a straddling one keeps its own, that the key taken before the bake still
+  matches a job rebuilt after it, and — the headline — that a composited frame in a real
+  ffmpeg render lands on the same pixels as the preview canvas. It also times both paths;
+  the numbers below come from it. It reuses `smoke-layers.js`'s two fixtures.
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
   survives a new project), the audio waveforms (decode, slicing, the canvas on the lane),
   snapping (including the miss-beats-a-hit bug below), and the swipe's deform. It reads
@@ -186,6 +195,7 @@ package.json
 tools/smoke.js            timeline-logic test suite (see Testing above)
 tools/smoke-preview.js    playback/compositing test suite
 tools/smoke-layers.js     alpha compositing + stills-on-the-timeline test suite
+tools/smoke-bakefirst.js  bake-first rendering: fast path, composite bake, parity
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -294,16 +304,32 @@ must stay in agreement:
 
 **If you change one, change the other**, or the preview will lie about the output.
 
+This is now the *only* place the same picture is still described twice, and it survives on
+purpose: it is the fast path (below), and it is exercised by every suite that renders. A
+span that leaves the fast path is framed once, by `drawClipTo()`, for both the viewer and
+the export.
+
 ### Render pipeline
 
+**The renderer bakes the picture; ffmpeg encodes it.** That is the architecture as of
+step 6, and it is what stops every visual feature having to be written twice — once as a
+canvas draw and once as a matching ffmpeg filter. `compositeLayers()` in `app.js` is the
+single draw path: `drawPreview()` calls it with the viewer's held layer surfaces, and
+`bakeComposite()` calls it with freshly seeked media elements at output resolution, then
+streams the RGBA into `frames.raw`. ffmpeg overlays that one layer.
+
 `buildJob()` (renderer) flattens the timeline into a list of clips with absolute
-timings and `visible` / `audible` flags. `buildArgs()` (main) turns that into a single
-`ffmpeg` invocation:
+timings and `visible` / `audible` flags. `bakeOverlays()` then bakes what has to be baked
+— the composite first, then text cards, then transitions — and `buildArgs()` (main) turns
+the result into a single `ffmpeg` invocation:
 
 - a `color=black` base of the full project duration;
 - each visible video clip: `trim` → `setpts=PTS-STARTPTS+start/TB` → `crop` → `scale` →
   `fps`, then `overlay` onto the running base with `enable='between(t,start,end)'` and
   **`eof_action=repeat`** (see the note below);
+- each baked composite span: one `-f rawvideo -pixel_format rgba` input, `setpts` to its
+  position, then `scale` → `format=yuva420p` → `overlay`, appended **last** so it wins
+  inside its own window;
 - each audible clip: `atrim` → `asetpts` → `aformat` → **its own effect chain** →
   `volume` → `adelay`, then a single `amix`, optional loudness normalisation, and a
   limiter — see "The audio chain" below;
@@ -312,6 +338,61 @@ timings and `visible` / `audible` flags. `buildArgs()` (main) turns that into a 
 Every clip occurrence becomes its own ffmpeg input, so the same file can appear many
 times. That is simple and correct but costs one decoder per clip — if you need to render
 hundreds of clips, batching by source file is the optimisation to reach for.
+
+#### The fast path, and exactly what leaves it
+
+Baking is not free — it costs a seek and a `getImageData` per frame — so a span that
+ffmpeg can build *identically* and far faster still goes down the old chain. A span stays
+on the fast path when **both** of these hold:
+
+1. at most **one** picture clip (`kind:'video'` or `kind:'image'`) is visible across it;
+2. **no** clip contributing to it carries an effect stack (`clip.fx`, from step 7 on).
+
+Anything else bakes. In practice that means real alpha compositing — two or more pictures
+stacked — and, from step 7, any effect at all.
+
+Text cards and transitions do **not** disqualify a span, and that is not a loophole. They
+are already drawn by one canvas implementation and baked from it, so the reason for the
+fast path — far faster, pixels identical — applies to them word for word. A card is baked
+cropped to its painted bounds, which is a fraction of a full frame; folding it into a
+full-frame composite would cost 20–100× the bytes for the same picture. A transition
+additionally *owns* its window: its baked layer sits between tracks in the overlay chain,
+while a composite layer is appended last and would cover it, so transition windows are
+excluded from bake spans outright.
+
+`compositeSpans()` works this out by cutting the range at every clip and transition edge —
+between two edges the visible stack is constant, so one midpoint sample decides the whole
+slice — and merging adjacent slices that agree. A clip whose whole visible extent falls
+inside a bake span is then dropped from the picture chain, which is what makes baking a
+saving rather than a surcharge: `buildArgs()` only opens an input for a clip that is still
+visible or audible, so its decoder goes with it. A clip that *straddles* a span edge stays,
+and draws its own chain outside the window the baked layer wins.
+
+What it costs, measured by `tools/smoke-bakefirst.js` at 540×960, 30 fps, quality `fast`,
+over three seconds of timeline:
+
+| Path | Bake | Encode | Total |
+| --- | --- | --- | --- |
+| fast path only | 0 ms | 578 ms | **578 ms** |
+| one of the three seconds composited | 3296 ms | 804 ms | **4100 ms** |
+
+That is roughly 110 ms per composited frame, nearly all of it video seeks — which is why
+the fast path exists and why it is worth keeping honest.
+
+**The baked layer states its colour conversion.** The canvas hands over full-range RGB; a
+decoded video arrives as limited-range BT.709 and stays that way through `format=yuva420p`.
+Letting swscale guess put a flat blend eleven 8-bit levels greener than the same blend in
+the preview — the exact preview/export drift step 6 exists to end — so the baked chain
+carries `in_range=full:out_range=tv:out_color_matrix=bt709` explicitly. With it, the
+render and the preview agree to within two levels.
+
+**Frames stay raw, never PNG.** PNG-encoding a large alpha-heavy frame costs 100–1500 ms
+against about 4 ms for `getImageData`; that one line once turned a four second title card
+into a ten minute render. The bake cache rules are unchanged too: a clip's position on the
+timeline is **not** in the key (`jobCacheKey`), and the key is taken **before** baking —
+after it, each layer has a randomly named scratch dir, so a key computed then could never
+hit. `jobKey()` in main refuses to cache a job carrying a `text` or `baked` clip that
+arrives without one, rather than filing it under a key that would collide or never match.
 
 **Do not change `eof_action=repeat` back to `pass`.** A clip's length comes from the
 container duration, which frequently outruns the actual video stream — a file can hold
@@ -1807,11 +1888,12 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - Audio clips draw a waveform; video clips have no thumbnails.
 - Preview is nearest-frame accurate, not frame-exact; the render is the source of truth.
 - Video-track compositing is bottom-up alpha blending, in the preview and in the render
-  alike. The two agree on **who is on top** exactly; they agree on the blended *value* to
-  within about 4% of full scale, because ffmpeg blends through yuv420p while the canvas
-  blends in RGB. `tools/smoke-layers.js` asserts that tolerance rather than equality. It
-  is the clearest remaining case of the same picture being built twice, and step 6's
-  bake-first render is what removes it.
+  alike — and since step 6 it is blended **once**, in the renderer, and handed to ffmpeg
+  as finished pixels. The two now agree to within a couple of 8-bit levels rather than the
+  old ~4% of full scale, and what is left is the yuv420p encode itself, not two different
+  blends. `tools/smoke-bakefirst.js` asserts that parity against a real render.
+  `tools/smoke-layers.js` still asserts its older, looser tolerance - its render now goes
+  through the bake as well and passes comfortably inside it.
 - A transition still shows only its own two clips: `drawTransitionFrame()` owns the whole
   frame for the length of the window, so anything on a track above it is not composited
   over the transition in the preview. Text cards are, as before.
