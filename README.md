@@ -35,13 +35,20 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are sixteen suites:
+There are seventeen suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
   black inside a clip, across a cut, past the end of a short video stream, or after rapid
   scrubbing, and that real gaps *do* stay black. It needs `real1.mp4`/`real2.mp4` in
   `%TEMP%\scut_test` (its header comment gives the ffmpeg command).
+- `tools/smoke-anim.js` — the keyframe engine (`Anim`): every easing preset anchored at
+  both ends and finite throughout, track evaluation and its edge cases (no keys, one key,
+  keys outside the clip's range, an unsorted track, two keys at the same time), that
+  evaluating a track never reorders it, add/remove/move/retime, that `clip.keys` stays
+  **absent** until something is keyed and is pruned away again when it is cleared, the
+  property registry, that the clip inspector's strip is built entirely from it, and that
+  `TextModel` re-exports the engine rather than carrying a second copy of it.
 - `tools/smoke-text.js` — text cards: easing, animation layers, keyframes, canvas
   painting, motion blur, presets and the render job shape.
 - `tools/smoke-text2.js` — the second round of text work: motion-blur shutter clamping,
@@ -167,7 +174,8 @@ src/renderer/index.html   DOM skeleton; every element the renderer touches has a
                           three columns: #left (viewer only), #right (work area), #inspectorCol
 src/renderer/styles.css   all styling; colors live in :root custom properties
 src/renderer/app.js       the editor: state, timeline, preview, editing ops, shortcuts
-src/renderer/text/model.js  text cards: defaults, easing curves, animation + keyframe maths
+src/renderer/anim.js      the keyframe engine: easing curves, tracks, the keyable registry
+src/renderer/text/model.js  text cards: defaults, animation layers, how they compose with keys
 src/renderer/text/draw.js   text cards: all canvas painting (preview AND export)
 src/renderer/text/ui.js     text cards: the editor panel
 src/renderer/transitions.js transitions: every pixel of all three types (preview AND export)
@@ -179,7 +187,7 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
 files are plain `<script>` globals (`TextModel`, `TextDraw`, `TextUI`)
-loaded before `app.js`. `TextUI` never touches `app.js` globals - it is wired up through
+loaded before `app.js`, and `anim.js` (`Anim`) is loaded before all of them. `TextUI` never touches `app.js` globals - it is wired up through
 the hooks object passed to `TextUI.init()` near the bottom of `app.js`.
 
 `app.js` is organised in ten numbered sections (search for `// ===`), in this order:
@@ -235,6 +243,7 @@ Clip = {
   volume,                // 0..2
   afx,                   // audio clips only - the effect chain, see the audio chain below
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
+  keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
   captions               // generated captions only - { gen: true, src } - see below
 }
@@ -859,6 +868,75 @@ these are project settings, not timeline state, so moving one snapshots no undo 
 dirties nothing. Only **Generate** and **Clear** touch the timeline, and each is one undo
 entry.
 
+### Keyframes
+
+`src/renderer/anim.js` is the keyframe engine, a plain `<script>` global called `Anim`
+loaded before everything else in the renderer. All of it used to live inside
+`text/model.js`, where it worked and could only ever animate a text card; the extraction
+is deliberately behaviour-preserving, and `TextModel` now re-exports `ease`, `bezier`,
+`NAMED`, `EASING_PRESETS`, `cloneEasing` and `evalTrack` as **aliases** rather than
+keeping a second implementation. That is the whole acceptance test for the move:
+`smoke-text.js`, `smoke-text2.js` and `smoke-typewriter.js` pass unedited.
+
+`Anim` owns four things:
+
+```js
+Key   = { t, v, ease }   // t is seconds into the CLIP, not the timeline
+Track = [ Key, ... ]     // kept sorted by t
+
+Anim.ease(easing, t)              // 0..1 -> 0..1, bezier or named
+Anim.evalTrack(keys, t)           // the value at t, or null when the track is empty
+Anim.addKey(keys, t, v?, ease?)   // v omitted = pin the value the track already shows
+Anim.removeKey(keys, i)
+Anim.moveKey(keys, i, v)          // change a VALUE; order cannot change
+Anim.retimeKey(keys, i, t)        // change a TIME, re-sort, return the new index
+```
+
+Four rules the tracks live by, each of which has a test:
+
+- **A track holds at both ends.** Before the first key it is the first value, after the
+  last key it is the last. Keys sitting outside the clip's own range therefore still
+  produce a sensible slice of the curve inside it.
+- **Easing belongs to the key on the LEFT of a span** — it is the curve travelled to
+  *reach* the next key, so the final key's easing is never used.
+- **An unsorted track evaluates correctly and is not reordered.** `evalTrack` sorts a
+  copy; a paint pass must never rewrite the author's data underneath it. Order is written
+  in exactly one place, `Anim.sortKeys()`, called by the editing functions.
+- **`retimeKey` returns the key's new index**, because dragging a key past its neighbour
+  reorders the track and a caller holding the old index would then edit the wrong key.
+
+#### Keys on an ordinary clip
+
+Any clip may carry `clip.keys = { prop: Track, ... }` — the same shape a text card has
+had all along. It is **optional and absent by default**: `Anim.trackFor(clip, prop, true)`
+creates it on demand and `Anim.pruneKeys(clip)` deletes it again once the last key goes,
+so a project that uses no keyframes serialises byte-for-byte as it did before this
+existed. Reading is one call, `Anim.valueAt(clip, prop, t, fallback)`, which never has to
+know whether `keys` is there. Keys are plain JSON, because undo is `JSON.stringify` of
+the track list and that is also the `.scut` file.
+
+Which properties are **offered** on a clip is a registry, not a list:
+
+```js
+Anim.registerClipProp({ prop, label, min, max, step, base, when(clip) });
+```
+
+`base` is the value a first key takes on an empty track, and it is not cosmetic: a
+property that *multiplies* (opacity, scale, glow) must start at 1 or adding a key would
+black the clip out, while one that *adds* (offsets, rotation) must start at 0.
+`clipKeyPanel()` in `app.js` builds a strip for everything `Anim.clipPropsFor(clip)`
+returns, so one registration is all a property needs to become animatable, with the
+typable boxes, wheel-nudging and per-gesture undo every other control in the app has.
+
+**The registry is empty in this build, deliberately.** A keyframable property has to be
+honoured by the preview *and* the render, and today a clip's framing is baked into an
+ffmpeg `crop`/`scale` as a constant — animating it would break the one invariant this
+codebase cares about most. Step 6 makes the bake the single draw path and step 7's effect
+stack registers its parameters through the call above; the strip is already generic, only
+the list is empty. Text cards are not routed through the registry: their panel keyframes
+the card, which is a richer thing than a clip property, and it calls the same
+`TextUI.keyStrip()` the clip inspector does.
+
 ### Text cards
 
 A text card is a clip of `kind: 'text'` whose whole definition lives in `clip.card`:
@@ -870,7 +948,7 @@ TextCard = {
   style: { ... },        // TextModel.defaultStyle() - font, fill, shadow, glow, blur, ...
   animEnabled,           // master switch (the A shortcut)
   anims: [ AnimLayer ],  // combinable animation layers
-  keys: { opacity: [Key], x: [], y: [], scale: [], rotate: [] },
+  keys: { opacity: [Key], x: [], y: [], scale: [], rotate: [], glow: [] },
   highlight,             // optional per-word colour override: { color, words: [index] }
   words,                 // optional [{ w, start, end }] - spoken times, seconds into the clip
   wordFx                 // optional { reveal, emphasis, color, scale, rise, attack }
@@ -886,11 +964,14 @@ AnimLayer = {
   params                 // per-type: direction/distance, zoom amount, typewriter unit, ...
 }
 
-Key = { t, v, ease }     // t is seconds into the clip
+Key = { t, v, ease }     // t is seconds into the clip - see "Keyframes" above
 ```
 
 Keyable properties are `opacity`, `x`, `y`, `scale`, `rotate` and `glow` (a multiplier
-over the whole glow effect, so a card can bloom up and back down).
+over the whole glow effect, so a card can bloom up and back down). The keys themselves,
+and the easing curves an `AnimLayer` uses, are `Anim`'s — see "Keyframes" above. Unlike
+an ordinary clip, a card's `keys` object always exists with all six tracks in it, because
+`defaultCard()` has always made it that way and the presets round-trip that shape.
 
 #### Editing several cards at once
 
@@ -1562,9 +1643,10 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | --- | --- |
 | A text style property | `defaultStyle()` in `text/model.js`, one line in `STYLE_SCHEMA` in `text/ui.js`, and its use in `TextDraw.paint()` |
 | A new animation type | `ANIM_TYPES` + a `case` in `evalAnims()` (`text/model.js`), and its params in `animEntry()` (`text/ui.js`) |
-| An easing preset | one entry in `EASING_PRESETS`, or a function in `NAMED` for curves a bezier cannot express |
+| An easing preset | one entry in `EASING_PRESETS`, or a function in `NAMED` for curves a bezier cannot express — both in `anim.js` |
 | A typewriter unit effect | a `case` in `unitTransform()` (`text/draw.js`) and an option in the `params.effect` select (`text/ui.js`) |
-| A keyframable property | `KEYABLE` in `text/model.js`, read it out in `evalCard`, and give it a slider range in `keyframeTrack()` |
+| A keyframable **card** property | `KEYABLE` in `text/model.js`, read it out in `evalCard`, and a spec in `Anim.PROP_SPECS` for its slider range |
+| A keyframable **clip** property | one `Anim.registerClipProp({...})` call — the inspector strip builds itself; then read it back with `Anim.valueAt(clip, prop, t, fallback)` |
 | A toolbar button | `index.html` (`#toolbar`) + one `addEventListener` in section 10 |
 | A timeline-wide editing op | a function in `app.js` §7 + a button in `index.html` + one `addEventListener` in section 10 + a row in `SHORTCUTS` and the `keydown` handler |
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |

@@ -612,26 +612,53 @@ const TextUI = (() => {
 
   // ---------------------------------------------------------- keyframe UI
 
-  function keyframeTrack(card, prop, clipDur) {
+  /**
+   * One property's keyframe strip: add / clear, and a row per key with its time, value,
+   * a seek button and a delete button.
+   *
+   * Generic on purpose. It knows nothing about text cards - it is handed a track, a
+   * property name and a set of hooks, so the clip inspector builds the same strip for a
+   * clip's own `clip.keys` with the same typable boxes, wheel-nudging and undo behaviour.
+   * All key editing goes through `Anim`, so the UI is never a second implementation of
+   * what a track means.
+   *
+   * opts = {
+   *   getKeys()      the track array (created on demand by the caller)
+   *   clear()        empty it - the caller owns whether that deletes the array or the key
+   *   dur            clip length, the time axis
+   *   spec           Anim.propSpec() result: label, min, max, step, base
+   *   onEdit/onEditEnd/onChanged/rebuild/getLocalTime/seekLocal
+   * }
+   */
+  function keyStrip(prop, opts) {
+    const beginEdit = opts.onEdit || gBeginEdit;
+    const endEdit = opts.onEditEnd || gEndEdit;
+    const changed = opts.onChanged || gChanged;
+    const rebuildFn = opts.rebuild || rebuild;
+    const getLocalTime = opts.getLocalTime || (() => host.getLocalTime());
+    const seekLocal = opts.seekLocal || ((t) => host.seekLocal(t));
+    const spec = opts.spec || Anim.propSpec(prop);
+    const clipDur = opts.dur;
+
     const row = el('div', 'tc-kf');
-    const keys = card.keys[prop] || (card.keys[prop] = []);
-    const head = el('div', 'tc-kf-head', '<b>' + prop + '</b>');
+    const keys = opts.getKeys();
+    const head = el('div', 'tc-kf-head', '<b>' + (spec.label || prop) + '</b>');
 
     const add = el('button', 'mini', '+ key');
     add.title = 'Add a keyframe at the playhead';
     add.addEventListener('click', () => {
-      const t = Math.max(0, Math.min(clipDur, host.getLocalTime()));
+      const t = Math.max(0, Math.min(clipDur, getLocalTime()));
       beginEdit();
-      const base = (prop === 'opacity' || prop === 'scale' || prop === 'glow') ? 1 : 0;
-      const existing = TextModel.evalTrack(keys, t);
-      keys.push({ t, v: existing == null ? base : existing, ease: TextModel.cloneEasing(TextModel.EASING_PRESETS.easeInOut) });
-      keys.sort((a, b) => a.t - b.t);
-      endEdit(); rebuild(); changed();
+      // An empty track starts from the property's neutral value; a track that already has
+      // keys pins the value it is currently showing, so adding a key never moves anything.
+      const existing = Anim.evalTrack(keys, t);
+      Anim.addKey(keys, t, existing == null ? spec.base : existing, Anim.EASING_PRESETS.easeInOut);
+      endEdit(); rebuildFn(); changed();
     });
     const clear = el('button', 'mini', 'Clear');
     clear.addEventListener('click', () => {
       if (!keys.length) return;
-      beginEdit(); card.keys[prop] = []; endEdit(); rebuild(); changed();
+      beginEdit(); opts.clear(); endEdit(); rebuildFn(); changed();
     });
     const acts = el('div', 'tc-kf-acts');
     acts.appendChild(add); acts.appendChild(clear);
@@ -639,17 +666,14 @@ const TextUI = (() => {
     row.appendChild(head);
 
     if (!keys.length) {
-      row.appendChild(el('div', 'tc-hint', 'No keys - this property follows the animation layers.'));
+      row.appendChild(el('div', 'tc-hint',
+        opts.emptyHint || 'No keys - this property follows the animation layers.'));
       return row;
     }
 
-    const range = prop === 'opacity' ? [0, 1, 0.01]
-      : prop === 'scale' ? [0.05, 4, 0.01]
-        : prop === 'glow' ? [0, 3, 0.01]
-          : prop === 'rotate' ? [-180, 180, 1]
-            : [-1, 1, 0.005];
+    const range = [spec.min, spec.max, spec.step];
 
-    keys.sort((a, b) => a.t - b.t);
+    Anim.sortKeys(keys);
     keys.forEach((k, i) => {
       const kr = el('div', 'tc-key');
       const t = el('input', 'tc-key-t');
@@ -658,6 +682,9 @@ const TextUI = (() => {
       t.addEventListener('focus', beginEdit);
       t.addEventListener('blur', endEdit);
       t.addEventListener('keydown', (e) => e.stopPropagation());
+      // Retiming can reorder the track, but re-sorting mid-typing would pull the field out
+      // from under the caret. The value is written now and the order settles on rebuild,
+      // which is exactly what evalTrack()'s sort-a-copy makes safe.
       t.addEventListener('input', () => { k.t = parseFloat(t.value) || 0; changed(); });
 
       const v = el('input', 'tc-key-v');
@@ -671,6 +698,7 @@ const TextUI = (() => {
         step: range[2], min: range[0], max: range[1],
         get: () => k.v,
         set: (nv) => { k.v = nv; v.value = nv; vo.value = Number(nv).toFixed(3); changed(); },
+        onEdit: beginEdit, onEditEnd: endEdit,
       };
       attachWheel(v, kWheel);
       attachWheel(vo, kWheel);
@@ -678,6 +706,7 @@ const TextUI = (() => {
         step: 0.02, min: 0, max: clipDur,
         get: () => k.t,
         set: (nt) => { k.t = nt; t.value = nt.toFixed(2); changed(); },
+        onEdit: beginEdit, onEditEnd: endEdit,
       });
       vo.addEventListener('focus', beginEdit);
       vo.addEventListener('blur', endEdit);
@@ -690,12 +719,12 @@ const TextUI = (() => {
 
       const goto = el('button', 'mini', '▶');
       goto.title = 'Move the playhead to this key';
-      goto.addEventListener('click', () => host.seekLocal(k.t));
+      goto.addEventListener('click', () => seekLocal(k.t));
 
       const del = el('button', 'mini', '×');
       del.title = 'Delete this key';
       del.addEventListener('click', () => {
-        beginEdit(); keys.splice(i, 1); endEdit(); rebuild(); changed();
+        beginEdit(); Anim.removeKey(keys, i); endEdit(); rebuildFn(); changed();
       });
 
       kr.appendChild(t); kr.appendChild(v); kr.appendChild(vo);
@@ -703,6 +732,16 @@ const TextUI = (() => {
       row.appendChild(kr);
     });
     return row;
+  }
+
+  /** The text card's own strip: the generic one pointed at `card.keys`. */
+  function keyframeTrack(card, prop, clipDur) {
+    if (!card.keys[prop]) card.keys[prop] = [];
+    return keyStrip(prop, {
+      dur: clipDur,
+      getKeys: () => card.keys[prop],
+      clear: () => { card.keys[prop] = []; },
+    });
   }
 
   // -------------------------------------------------------------- presets
@@ -1014,7 +1053,7 @@ const TextUI = (() => {
     init, refresh, reloadPresets, attachWheel,
     // Shared so the transition inspector gets the same typable + scrollable + resettable
     // rows without duplicating any of it.
-    control, section, el, curveEditor,
+    control, section, el, curveEditor, keyStrip,
     get fonts() { return fonts; },
   };
 })();

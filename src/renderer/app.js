@@ -1499,7 +1499,57 @@ function renderInspector() {
   const fxTarget = audioFxTarget(c);
   if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   if (tightenAudioFor(c)) box.appendChild(tightenPanel());
+  const keys = clipKeyPanel(c);
+  if (keys) box.appendChild(keys);
   syncFramingControls();
+}
+
+/**
+ * The generic keyframe strip for a clip.
+ *
+ * `Anim.clipPropsFor()` decides what is on offer, so this panel never names a property:
+ * anything registered through `Anim.registerClipProp()` grows a strip here, with the
+ * typable boxes, wheel-nudging and per-gesture undo that every other control in the app
+ * has. A text card is not routed through here - its own panel already keyframes the card
+ * itself, which is a richer thing than a clip property.
+ *
+ * Returns null when nothing is registered for this clip, which is the case in this build:
+ * a keyframable property must be honoured by the preview AND the render, and until step 6
+ * makes the bake the single draw path a clip's framing is a constant in an ffmpeg crop.
+ * Step 7's effect stack is what fills the registry.
+ */
+function clipKeyPanel(clip) {
+  if (!clip || clip.kind === 'text') return null;
+  const props = Anim.clipPropsFor(clip);
+  if (!props.length) return null;
+  const dur = clip.out - clip.in;
+
+  const hooks = {
+    dur,
+    // Structural edits (add, delete, clear) rebuild the inspector; value edits do not,
+    // or a slider would be torn out of the DOM halfway through a drag.
+    rebuild: renderInspector,
+    onEdit: () => pushUndo(),
+    onEditEnd: () => {},
+    onChanged: () => { markDirty(); drawPreview(); },
+    getLocalTime: () => clamp(state.playhead - clip.start, 0, dur),
+    seekLocal: (t) => seek(clip.start + t),
+  };
+
+  return TextUI.section('clipkeys', 'Keyframes', (b) => {
+    b.appendChild(TextUI.el('div', 'tc-hint',
+      'Keys are times within the clip, so moving the clip moves its animation with it.'));
+    for (const spec of props) {
+      b.appendChild(TextUI.keyStrip(spec.prop, Object.assign({}, hooks, {
+        spec,
+        getKeys: () => Anim.trackFor(clip, spec.prop, true),
+        // Clearing empties the track and then prunes it away, so a clip that ends up with
+        // no keys serialises exactly as one that never had any.
+        clear: () => { Anim.trackFor(clip, spec.prop, true).length = 0; Anim.pruneKeys(clip); },
+        emptyHint: 'No keys - ' + (spec.label || spec.prop) + ' holds its clip value.',
+      })));
+    }
+  });
 }
 
 /**

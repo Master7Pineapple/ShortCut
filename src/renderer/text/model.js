@@ -1,6 +1,10 @@
 'use strict';
 /**
- * Text card data model: defaults, easing curves, animation and keyframe evaluation.
+ * Text card data model: defaults, animation layers, and how they compose with keyframes.
+ *
+ * The easing curves and the keyframe track evaluation used to live here; they are now
+ * `Anim` (src/renderer/anim.js), which any clip can use, and this module re-exports them
+ * unchanged so a text card animates exactly as it always did.
  *
  * Pure functions only - no DOM, no canvas. `TextDraw` turns the state this produces into
  * pixels, `TextUI` edits it, and `app.js` stores it on clips of kind 'text'.
@@ -8,83 +12,12 @@
 const TextModel = (() => {
 
   // ------------------------------------------------------------------ easing
+  //
+  // Easing and keyframe evaluation live in `Anim` (src/renderer/anim.js) so that clips
+  // other than text cards can use them. These are straight aliases, not a second
+  // implementation - a text card must animate identically to anything else.
 
-  /** Solve a cubic bezier y for a given x, the same curve CSS `cubic-bezier()` uses. */
-  function bezier(x1, y1, x2, y2) {
-    const A = (a, b) => 1 - 3 * b + 3 * a;
-    const B = (a, b) => 3 * b - 6 * a;
-    const C = (a) => 3 * a;
-    const calc = (t, a, b) => ((A(a, b) * t + B(a, b)) * t + C(a)) * t;
-    const slope = (t, a, b) => 3 * A(a, b) * t * t + 2 * B(a, b) * t + C(a);
-    return (x) => {
-      if (x <= 0) return 0;
-      if (x >= 1) return 1;
-      let t = x;
-      // Newton-Raphson converges in a handful of steps for well-formed curves.
-      for (let i = 0; i < 8; i++) {
-        const d = slope(t, x1, x2);
-        if (Math.abs(d) < 1e-6) break;
-        const err = calc(t, x1, x2) - x;
-        if (Math.abs(err) < 1e-6) break;
-        t -= err / d;
-      }
-      return calc(t, y1, y2);
-    };
-  }
-
-  /** Named curves that a cubic bezier cannot express (overshoot / oscillation). */
-  const NAMED = {
-    linear: (t) => t,
-    bounce: (t) => {
-      const n = 7.5625, d = 2.75;
-      if (t < 1 / d) return n * t * t;
-      if (t < 2 / d) { t -= 1.5 / d; return n * t * t + 0.75; }
-      if (t < 2.5 / d) { t -= 2.25 / d; return n * t * t + 0.9375; }
-      t -= 2.625 / d; return n * t * t + 0.984375;
-    },
-    elastic: (t) => {
-      if (t === 0 || t === 1) return t;
-      const p = 0.3;
-      return Math.pow(2, -10 * t) * Math.sin((t - p / 4) * (2 * Math.PI) / p) + 1;
-    },
-    back: (t) => { const s = 1.70158; return t * t * ((s + 1) * t - s); },
-    backOut: (t) => { const s = 1.70158; t -= 1; return t * t * ((s + 1) * t + s) + 1; },
-    step: (t) => (t < 1 ? 0 : 1),
-  };
-
-  /** Preset menu: bezier presets first, then the named curves. */
-  const EASING_PRESETS = {
-    linear: { kind: 'named', name: 'linear' },
-    ease: { kind: 'bezier', p: [0.25, 0.1, 0.25, 1] },
-    easeIn: { kind: 'bezier', p: [0.42, 0, 1, 1] },
-    easeOut: { kind: 'bezier', p: [0, 0, 0.58, 1] },
-    easeInOut: { kind: 'bezier', p: [0.42, 0, 0.58, 1] },
-    easeInQuad: { kind: 'bezier', p: [0.55, 0.085, 0.68, 0.53] },
-    easeOutQuad: { kind: 'bezier', p: [0.25, 0.46, 0.45, 0.94] },
-    easeInExpo: { kind: 'bezier', p: [0.95, 0.05, 0.795, 0.035] },
-    easeOutExpo: { kind: 'bezier', p: [0.19, 1, 0.22, 1] },
-    softLand: { kind: 'bezier', p: [0.16, 1, 0.3, 1] },
-    back: { kind: 'named', name: 'back' },
-    backOut: { kind: 'named', name: 'backOut' },
-    bounce: { kind: 'named', name: 'bounce' },
-    elastic: { kind: 'named', name: 'elastic' },
-    step: { kind: 'named', name: 'step' },
-  };
-
-  const bezierCache = new Map();
-  /** Evaluate an easing descriptor at t in 0..1. */
-  function ease(easing, t) {
-    t = Math.max(0, Math.min(1, t));
-    if (!easing) return t;
-    if (easing.kind === 'named') return (NAMED[easing.name] || NAMED.linear)(t);
-    const p = easing.p || [0, 0, 1, 1];
-    const key = p.join(',');
-    let fn = bezierCache.get(key);
-    if (!fn) { fn = bezier(p[0], p[1], p[2], p[3]); bezierCache.set(key, fn); }
-    return fn(t);
-  }
-
-  const cloneEasing = (e) => JSON.parse(JSON.stringify(e || EASING_PRESETS.easeOut));
+  const { EASING_PRESETS, NAMED, bezier, ease, cloneEasing } = Anim;
 
   // ---------------------------------------------------------------- defaults
 
@@ -249,22 +182,7 @@ const TextModel = (() => {
   }
 
   /** Interpolate one keyframe track at time `t`. Returns null when the track is empty. */
-  function evalTrack(keys, t) {
-    if (!keys || !keys.length) return null;
-    const sorted = [...keys].sort((a, b) => a.t - b.t);
-    if (t <= sorted[0].t) return sorted[0].v;
-    const last = sorted[sorted.length - 1];
-    if (t >= last.t) return last.v;
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const a = sorted[i], b = sorted[i + 1];
-      if (t >= a.t && t <= b.t) {
-        const span = b.t - a.t;
-        const p = span <= 0 ? 1 : (t - a.t) / span;
-        return a.v + (b.v - a.v) * ease(a.ease, p);
-      }
-    }
-    return last.v;
-  }
+  const evalTrack = Anim.evalTrack;
 
   /**
    * Full transform for a card at local time `t`.
