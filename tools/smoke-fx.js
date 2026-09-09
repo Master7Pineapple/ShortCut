@@ -378,6 +378,78 @@
         typeof c.fx[0].params === 'object');
     }
 
+    // ==================================================== 10b. the per-effect shutter
+
+    {
+      // Absent by default and pruned away again, exactly like `keys`: a stack that uses
+      // no motion blur serialises as it did before this existed.
+      const c = { kind: 'video', fx: [FX.create('transform')] };
+      c.fx[0].mblur = { on: false, strength: 0.5, samples: 8 };
+      FX.normalizeClip(c);
+      ok('an untouched shutter prunes itself off the effect', !c.fx[0].mblur);
+
+      c.fx[0].mblur = { on: false, strength: 1.5, samples: 8 };
+      FX.normalizeClip(c);
+      ok('...but settings the author changed survive being switched off',
+        !!c.fx[0].mblur && c.fx[0].mblur.strength === 1.5);
+
+      c.fx[0].mblur = { on: true, strength: 99, samples: 900 };
+      FX.normalizeClip(c);
+      ok('strength and samples are clamped to something renderable',
+        c.fx[0].mblur.strength === 4 && c.fx[0].mblur.samples === 32,
+        JSON.stringify(c.fx[0].mblur));
+      ok('the shutter is plain JSON like everything else on a clip',
+        JSON.stringify(c) === JSON.stringify(JSON.parse(JSON.stringify(c))));
+
+      // An effect that paints the same picture at every instant has nothing to average,
+      // and blurring it would cost N passes to produce an identical frame.
+      ok('a static effect is not time-varying, so the shutter is refused',
+        FX.timeVarying(FX.create('grade')) === false);
+      const keyed = FX.create('grade');
+      Anim.addKey(Anim.trackFor(keyed, 'gain', true), 0, 1);
+      ok('one key is still not motion - there is nothing to sweep between',
+        FX.timeVarying(keyed) === false);
+      Anim.addKey(Anim.trackFor(keyed, 'gain', true), 1, 2);
+      ok('two keys are', FX.timeVarying(keyed) === true);
+      ok('an effect that reads the clock is time-varying with no keys at all',
+        FX.timeVarying(FX.create('select')) === true &&
+        FX.timeVarying(FX.create('ripple')) === true);
+      ok('mblurOf() answers null unless it is actually on',
+        FX.mblurOf({ mblur: { on: false } }) === null && FX.mblurOf({}) === null &&
+        !!FX.mblurOf({ mblur: { on: true, strength: 0.5, samples: 8 } }));
+
+      // And the picture: a keyframed transform swept across the shutter has to come out
+      // SOFTER than the same transform at one instant - that is the whole feature.
+      const moving = () => {
+        const f = FX.create('transform');
+        Anim.addKey(Anim.trackFor(f, 'x', true), 0, -0.4);
+        Anim.addKey(Anim.trackFor(f, 'x', true), 1, 0.4);
+        return f;
+      };
+      const edges = (stack) => {
+        const r = run(stack, 80, 80, null, paintBlock('#ff0000', 0.3), 0.5);
+        const d = r.ctx.getImageData(0, 0, 80, 80).data;
+        let partial = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] > 8 && d[i + 3] < 247) partial++;   // a softened, part-covered pixel
+        }
+        return partial;
+      };
+      const sharp = edges([moving()]);
+      const blurred = edges([Object.assign(moving(), {
+        mblur: { on: true, strength: 2, samples: 12 },
+      })]);
+      ok('THE SHUTTER: a moving effect comes out softened at its edges',
+        blurred > sharp * 1.5, 'partial pixels ' + sharp + ' -> ' + blurred);
+      ok('...and the effect underneath it is untouched, not smeared with it', (() => {
+        // A static grade below a blurred transform must still be the same flat colour.
+        const st = [Object.assign(moving(), { mblur: { on: true, strength: 2, samples: 8 } })];
+        const r = run(st, 40, 40, null, paintBlock('#ff0000'), 0.5);
+        const px = r.px(20, 20);
+        return px[0] > 200 && px[1] < 40;
+      })());
+    }
+
     // ============================================================ 11. the render path
     await importPaths([VID]);
     await sleep(1000);
@@ -469,11 +541,13 @@
       const undo1 = undoStack.length;
       const rows = document.querySelectorAll('#inspector .fx-box .fx-fx');
       ok('the panel draws one row per effect, in stack order', rows.length === 2);
-      ok('the rows are drag-reorderable', [...rows].every((r) => r.draggable));
-      // ...but the BODY is not, or a press on a slider's thumb would start a native
-      // HTML5 drag of the whole row instead of moving the value - which is exactly what
-      // it did until the body was exempted.
-      ok('the controls inside a row are NOT a drag handle for it',
+      // NOTHING in the panel is an HTML5 drag source. A draggable ancestor starts a
+      // native drag from a press anywhere inside it, so in a panel whose whole purpose is
+      // dragging values it could only ever be a way to lose one. Reordering is the arrows,
+      // which are also the only route a keyboard or this suite has.
+      ok('no row is a drag source', [...rows].every((r) => r.draggable === false),
+        [...rows].map((r) => r.draggable).join(','));
+      ok('and neither is anything inside one',
         [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')].every((b) => b.draggable === false),
         [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')].map((b) => b.draggable).join(','));
       // The arrows do the same job as the drag and are reachable from here.
@@ -501,6 +575,49 @@
       ok('a colour parameter gets a swatch but no keyframe strip',
         Object.keys(FX.DEFS.round.params).filter((k) => typeof FX.DEFS.round.params[k] === 'number').length ===
         Object.keys(FX.DEFS.round.params).length - 1);
+
+      // ---- rolling a row up ------------------------------------------------
+      //
+      // Purely how the panel looks, so it must not touch the document: no undo entry, no
+      // dirty flag, and nothing on the clip - `fxCollapsed` is a module-level Set keyed
+      // by effect id, because a collapsed row is not a fact about the edit.
+      {
+        renderInspector();
+        const before = JSON.stringify(live().fx);
+        const undoN = undoStack.length;
+        const row0 = document.querySelector('#inspector .fx-box .fx-fx');
+        const caret = row0.querySelector('.fx-caret');
+        ok('every effect row has a roll-up caret', !!caret);
+        ok('a row starts open', row0.querySelector('.fx-fx-body').hidden === false);
+        caret.click();
+        const rows2 = document.querySelectorAll('#inspector .fx-box .fx-fx');
+        ok('clicking the caret rolls the row up',
+          rows2[0].querySelector('.fx-fx-body').hidden === true);
+        ok('...and leaves the OTHER rows alone',
+          rows2[1].querySelector('.fx-fx-body').hidden === false);
+        ok('collapsing pushes no undo entry and changes nothing on the clip',
+          undoStack.length === undoN && JSON.stringify(live().fx) === before,
+          undoN + ' -> ' + undoStack.length);
+        ok('a rolled-up row still says what it is doing',
+          /keyed|bypassed|blur/.test(rows2[0].querySelector('.fx-fx-head').textContent) ||
+          rows2[0].querySelector('.fx-fx-head').textContent.length > 0);
+        // The state is keyed by effect id, so a rebuild has to preserve it.
+        renderInspector();
+        ok('the roll-up survives a panel rebuild',
+          document.querySelector('#inspector .fx-box .fx-fx .fx-fx-body').hidden === true);
+        const all = [...document.querySelectorAll('#inspector .fx-box .fx-head button')]
+          .find((b) => /Collapse all|Expand all/.test(b.textContent));
+        ok('a stack of more than one offers collapse/expand all', !!all);
+        all.click();
+        ok('...and it reaches every row',
+          [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')]
+            .every((b) => b.hidden === true));
+        [...document.querySelectorAll('#inspector .fx-box .fx-head button')]
+          .find((b) => /Expand all/.test(b.textContent)).click();
+        ok('expand all puts them all back',
+          [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')]
+            .every((b) => b.hidden === false));
+      }
 
       while (undoStack.length > undo0) undo();
       ok('undoing every panel edit leaves the clip with no stack at all',

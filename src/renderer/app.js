@@ -1612,6 +1612,21 @@ document.addEventListener('pointercancel', inspectorEditEnd);
 const FX_KINDS = new Set(['video', 'image']);
 
 /**
+ * Which effect rows are rolled up, by effect id.
+ *
+ * UI state, so it lives HERE and never on the clip. Undo is `JSON.stringify` of the track
+ * list and the same shape is the `.scut` file - a collapsed row is not a fact about the
+ * edit, and putting it on the effect would mean rolling a row up dirtied the project and
+ * showed up as a change in every undo snapshot.
+ *
+ * Keyed by `fx.id`, which is stable for the life of an effect and is exactly what the
+ * cache key strips out for being identity rather than pixels. Ids are never reused, so a
+ * deleted effect's entry is dead weight and nothing worse; the set is rebuilt every
+ * session anyway.
+ */
+const fxCollapsed = new Set();
+
+/**
  * The visual effect stack for the selected clip.
  *
  * Built entirely from `FX.DEFS`: the rows are `TextUI.control` over each type's schema,
@@ -1639,6 +1654,18 @@ function clipFxPanel(clip) {
   const count = FX.active(clip).length;
   head.appendChild(el('span', 'tc-hint',
     !clip.fx ? 'none' : clip.fx.length + ' in stack' + (count < clip.fx.length ? ', ' + count + ' on' : '')));
+  if ((clip.fx || []).length > 1) {
+    const anyOpen = clip.fx.some((f) => !fxCollapsed.has(f.id));
+    const all = el('button', 'mini', anyOpen ? 'Collapse all' : 'Expand all');
+    all.title = 'Roll every effect in this stack up or down. Nothing is edited.';
+    all.addEventListener('click', () => {
+      for (const f of clip.fx) {
+        if (anyOpen) fxCollapsed.add(f.id); else fxCollapsed.delete(f.id);
+      }
+      renderInspector();      // UI only: no pushUndo, no markDirty
+    });
+    head.appendChild(all);
+  }
   box.appendChild(head);
 
   box.appendChild(el('div', 'tc-hint fx-note',
@@ -1663,36 +1690,55 @@ function clipFxPanel(clip) {
 
   const list = el('div', 'fx-list');
   const stack = clip.fx || [];
-  let dragFrom = -1;
 
   stack.forEach((fx, i) => {
     const d = FX.DEFS[fx.type];
+    // DELIBERATELY NOT DRAGGABLE. Reordering is the arrow buttons and nothing else.
+    //
+    // The row used to be an HTML5 drag source, and in Chromium a draggable ancestor
+    // starts a native drag from a press anywhere inside it - so every attempt to drag a
+    // slider tore the whole row out as a drag image and the value never moved. That was
+    // patched by exempting the body, which fixed the sliders and left a drag affordance
+    // that was still easy to trigger by accident on the row's own padding, in a panel
+    // whose entire purpose is dragging values.
+    //
+    // The arrows already do the job, they are the only way a keyboard or a smoke suite
+    // could ever reorder a stack, and they cannot be triggered by accident. So the drag
+    // is gone rather than defended, and `smoke-fx.js` asserts that it stays gone.
     const row = el('div', 'fx-fx' + (fx.enabled === false ? ' off' : ''));
-    row.draggable = true;
-    row.addEventListener('dragstart', (e) => {
-      dragFrom = i;
-      row.classList.add('dragging');
-      if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-    });
-    row.addEventListener('dragend', () => { dragFrom = -1; row.classList.remove('dragging'); });
-    row.addEventListener('dragover', (e) => { e.preventDefault(); row.classList.add('dragover'); });
-    row.addEventListener('dragleave', () => row.classList.remove('dragover'));
-    row.addEventListener('drop', (e) => {
-      e.preventDefault();
-      row.classList.remove('dragover');
-      const from = dragFrom;
-      if (from < 0 || from === i) return;
-      edit(() => { clip.fx.splice(i, 0, clip.fx.splice(from, 1)[0]); });
-    });
 
     const bar = el('div', 'fx-fx-head');
+    const shut = fxCollapsed.has(fx.id);
+    const caret = el('button', 'mini fx-caret', shut ? '\u25b8' : '\u25be');
+    caret.title = shut ? 'Show this effect\u2019s controls' : 'Roll this effect up';
+    caret.addEventListener('click', () => {
+      // Purely how the panel looks: no snapshot, no dirty flag, no redraw of the picture.
+      if (fxCollapsed.has(fx.id)) fxCollapsed.delete(fx.id); else fxCollapsed.add(fx.id);
+      renderInspector();
+    });
+    bar.appendChild(caret);
     const on = el('input');
     on.type = 'checkbox';
     on.checked = fx.enabled !== false;
     on.title = 'Bypass this effect';
     on.addEventListener('change', () => edit(() => { fx.enabled = on.checked; }));
     bar.appendChild(on);
-    bar.appendChild(el('b', null, (i + 1) + '. ' + d.label));
+    const title = el('b', null, (i + 1) + '. ' + d.label);
+    // The title is the other half of the caret: a stack of rolled-up rows is a list, and
+    // a list you cannot click is a worse list.
+    title.classList.add('fx-title');
+    title.addEventListener('click', () => caret.click());
+    bar.appendChild(title);
+    // Rolled up, the row still has to say what it is doing - a bypassed or motion-blurred
+    // effect that looks identical to a plain one is how a stack stops being readable.
+    if (shut) {
+      const marks = [];
+      if (fx.enabled === false) marks.push('bypassed');
+      if (fx.keys && Object.keys(fx.keys).some((k) => fx.keys[k].length)) marks.push('keyed');
+      if (fx.mblur && fx.mblur.on) marks.push('blur');
+      if (fx.gen) marks.push(fx.gen);
+      if (marks.length) bar.appendChild(el('span', 'tc-hint', marks.join(' \u00b7 ')));
+    }
 
     const btns = el('div', 'fx-fx-btns');
     const mk = (label, title, fn, disabled) => {
@@ -1721,14 +1767,10 @@ function clipFxPanel(clip) {
     }
 
     const body = el('div', 'fx-fx-body');
-    // NOT draggable, and this is load-bearing rather than tidy. The row is `draggable`
-    // so the stack can be reordered, and in Chromium a draggable ancestor makes a native
-    // HTML5 drag start from a press anywhere inside it - including on a slider's thumb.
-    // The effect was that trying to drag a parameter's value tore the whole effect row
-    // out as a drag image, as if a file were being dropped into the window, and the value
-    // never moved. The buttons above have carried `draggable = false` for the same reason
-    // since they were written; the controls were simply missed. Setting it on the body
-    // covers every control in it, and every control any future effect type adds.
+    body.hidden = shut;
+    // Belt and braces now that the row is not a drag source either: an explicit `false`
+    // here means a future ancestor that becomes draggable cannot silently swallow the
+    // controls again, which is the bug this pair of lines exists to make impossible.
     body.draggable = false;
     for (const spec of d.schema) {
       body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
@@ -1766,6 +1808,29 @@ function clipFxPanel(clip) {
       }
       body.appendChild(prow);
     }
+
+    // The shutter, per effect. `TextUI.set()` needs the object to exist before a control
+    // can write into it, so it is created here the way `keyStrip()` creates empty tracks -
+    // and `FX.normalize()` prunes it away again when it is off and untouched, so a stack
+    // that uses no motion blur still serialises exactly as it did before this existed.
+    if (!fx.mblur) fx.mblur = Object.assign({}, FX.MBLUR);
+    const varying = FX.timeVarying(fx);
+    body.appendChild(TextUI.section('fxmb_' + fx.id, 'Motion blur', (mb) => {
+      mb.appendChild(el('div', 'tc-hint',
+        varying
+          ? 'Samples this effect across the shutter and averages them. Costs one extra ' +
+            'pass per sample, so it is the most expensive switch in the panel.'
+          : 'This effect paints the same picture at every instant, so the shutter has ' +
+            'nothing to average. Keyframe a parameter and it turns on.'));
+      mb.appendChild(TextUI.control(
+        { path: 'mblur.on', label: 'Motion blur', type: 'check' }, fx, { mblur: FX.MBLUR }, rowHooks));
+      mb.appendChild(TextUI.control(
+        { path: 'mblur.strength', label: 'Strength', type: 'range', min: 0, max: 2, step: 0.05, digits: 2 },
+        fx, { mblur: FX.MBLUR }, rowHooks));
+      mb.appendChild(TextUI.control(
+        { path: 'mblur.samples', label: 'Samples', type: 'range', min: 2, max: 32, step: 1 },
+        fx, { mblur: FX.MBLUR }, rowHooks));
+    }));
 
     // Every numeric parameter is keyframable, and the keys live on the EFFECT, not the
     // clip - two blurs on one clip are two independent animations, which a single
@@ -3036,7 +3101,7 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
       // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
       // proportionally smaller card - the layout is identical, there is just less to paint.
       FX.render(cctx, W, H, c, local, fxSurface,
-        (tc) => TextDraw.draw(tc, c, W, H, local, frameDur));
+        (tc) => TextDraw.draw(tc, c, W, H, local, frameDur), frameDur);
       painted = true;
       continue;
     }
@@ -3049,7 +3114,7 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
     FX.render(cctx, W, H, c, local, fxSurface, (tc) => {
       if (layer.tagName === 'CANVAS') tc.drawImage(layer, 0, 0, W, H);
       else drawClipTo(c, layer, tc, W, H);
-    });
+    }, frameDur);
     painted = true;
   }
   cctx.restore();
@@ -3569,6 +3634,9 @@ canvas.addEventListener('pointermove', (e) => {
   if (Mouse.drag) {
     const p = mousePointAt(e);
     Mouse.drag.x1 = p.x; Mouse.drag.y1 = p.y;
+    // Timed by the playhead like every other sample, so the band replays against the
+    // picture it was dragged over rather than against how fast the events arrived.
+    Mouse.drag.samples.push({ t: state.playhead, x: p.x, y: p.y });
     return;
   }
   mouseSample(e, ScreenTel.MOVE);
@@ -5728,10 +5796,17 @@ function stopMouseTake() {
       const built = Cursor.selectionKeys(sel, c, 'onrender');
       const fx = FX.create('select');
       fx.gen = 'onrender';
+      // The static values are the box as RELEASED, so bypassing the keys or deleting them
+      // leaves the shape that was drawn rather than a default rectangle somewhere else.
       fx.params.x = sel.x; fx.params.y = sel.y;
       fx.params.w = sel.w; fx.params.h = sel.h;
       fx.params.showFrom = built.t0;
-      fx.params.showTo = built.t1;
+      // The band is its own entrance, so the envelope's fade is short and the box holds
+      // for a couple of seconds after the drag - long enough to be looked at, and an
+      // ordinary parameter to drag out further.
+      fx.params.fadeIn = Cursor.DEFAULTS.select.fadeIn;
+      fx.params.showTo = Math.min(
+        built.t1 + Cursor.DEFAULTS.select.hold, Math.max(0.05, c.out - c.in));
       Cursor.applyGenerated(fx, built.keys, 'onrender');
       c.fx.push(fx);
       nSel++;
@@ -5746,7 +5821,14 @@ function stopMouseTake() {
 
 function mouseBeginSelection(e) {
   const p = mousePointAt(e);
-  Mouse.drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, t0: state.playhead };
+  // `samples` is the MOVING corner over time. One corner is pinned at the press and the
+  // other follows the pointer, so the committed effect can replay the band rather than
+  // appear whole at its final size - the way a desktop marquee behaves.
+  Mouse.drag = {
+    x0: p.x, y0: p.y, x1: p.x, y1: p.y,
+    t0: state.playhead,
+    samples: [{ t: state.playhead, x: p.x, y: p.y }],
+  };
 }
 
 function mouseEndSelection() {
@@ -5758,7 +5840,9 @@ function mouseEndSelection() {
   // that draws nothing and clutters the stack.
   if (rect.w < 0.02 || rect.h < 0.02) return;
   const t1 = Math.max(state.playhead, d.t0 + 0.1);
-  Mouse.sels.push(Object.assign({ t0: d.t0, t1 }, rect));
+  d.samples.push({ t: t1, x: d.x1, y: d.y1 });
+  Mouse.sels.push(Object.assign(
+    { t0: d.t0, t1, x0: d.x0, y0: d.y0, samples: d.samples }, rect));
 }
 
 /** The live selection rectangle, drawn over the viewer while it is being dragged. */

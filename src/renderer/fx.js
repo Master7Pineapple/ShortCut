@@ -391,6 +391,7 @@
     cursor: {
       label: 'Cursor (performed)',
       needs: 'mouse',
+      timeVarying: true,
       params: {
         size: Cursor.DEFAULTS.cursor.size,
         smooth: Cursor.DEFAULTS.cursor.smooth,
@@ -486,6 +487,7 @@
     ripple: {
       label: 'Click ripples',
       needs: 'mouse',
+      timeVarying: true,
       params: {
         size: Cursor.DEFAULTS.ripple.size,
         dur: Cursor.DEFAULTS.ripple.dur,
@@ -541,6 +543,7 @@
 
     select: {
       label: 'Window selection',
+      timeVarying: true,
       params: {
         x: 0.12, y: 0.32, w: 0.76, h: 0.3,
         style: 'brackets',
@@ -729,6 +732,71 @@
     return out;
   }
 
+  // ------------------------------------------------------------ per-effect shutter
+
+  const MBLUR = { on: false, strength: 0.5, samples: 8 };
+
+  /**
+   * Does this effect paint differently at a slightly different time?
+   *
+   * Only two things can make it: keyframes on its parameters, or a draw that reads the
+   * clock itself - a pointer moving along a take, a ripple expanding, a selection's
+   * envelope. A static grade painted eight times at eight instants is the same grade
+   * eight times, so blurring it would cost eight passes over eight million pixels to
+   * produce a pixel-identical frame. This is what stops that being possible to ask for
+   * by accident.
+   */
+  function timeVarying(entry) {
+    const d = DEFS[entry.type];
+    if (d && d.timeVarying) return true;
+    const k = entry.keys;
+    if (!k) return false;
+    for (const prop of Object.keys(k)) if (k[prop] && k[prop].length > 1) return true;
+    return false;
+  }
+
+  /** The effect's shutter settings, filled in and clamped. */
+  function mblurOf(entry) {
+    const m = entry && entry.mblur;
+    if (!m || !m.on) return null;
+    return {
+      on: true,
+      strength: clamp(m.strength, 0, 4),
+      samples: Math.max(2, Math.min(32, Math.round(clamp(m.samples, 2, 32)))),
+    };
+  }
+
+  /**
+   * Run ONE effect across the shutter and average the results.
+   *
+   * Motion blur is animation sampled across time and averaged, and the one correct
+   * averaging in this app lives in `Anim.temporalAverage()` - text cards, transition
+   * objects and the swipe's plate all go through it, because the naive
+   * `lighter`-at-`1/n` accumulator quantises every faint pixel to zero and annihilates
+   * exactly the soft things blur is supposed to smear. Nothing here re-implements it.
+   *
+   * The layer is copied ONCE before the sweep and each sample is the effect applied to
+   * that same copy at its own instant - which is what makes this the blur of the effect
+   * rather than a blur of everything under it. An effect earlier in the stack has
+   * already painted into the copy and comes through every sample identically, so it
+   * averages to itself and stays sharp.
+   */
+  function drawBlurred(L, entry, t, clip, frameDur, mb) {
+    const W = L.W, H = L.H, surface = L.surface;
+    const n = mb.samples;
+    const span = mb.strength * (frameDur > 0 ? frameDur : 1 / 30);
+    const before = take(L, 'fxMbSrc');
+    Anim.temporalAverage(L.c, W, H, n, (sctx, i) => {
+      const ti = n < 2 ? t : t + ((i / (n - 1)) - 0.5) * span;
+      const sub = clean(surface, 'fxMbSub', W, H);
+      sub.c.drawImage(before, 0, 0);
+      const subL = { cv: sub.cv, c: sub.c, W, H, surface };
+      DEFS[entry.type].draw(subL, paramsAt(entry, ti), ti, entry, clip);
+      reset(sub.c);
+      sctx.drawImage(sub.cv, 0, 0);
+    }, surface, 'fxMb');
+  }
+
   // --------------------------------------------------------------------- the stack
 
   let seq = 0;
@@ -758,6 +826,23 @@
       else if (v != null) params[k] = v;
     }
     fx.params = params;
+
+    // The shutter is absent by default and prunes itself away again, exactly like `keys`:
+    // a stack that uses no motion blur serialises as it did before this existed. It is
+    // kept when it is ON, and also when it is off but carries settings the author changed
+    // - toggling a blur off should not silently throw away the strength they dialled in.
+    if (fx.mblur && typeof fx.mblur === 'object') {
+      const m = {
+        on: !!fx.mblur.on,
+        strength: isFinite(Number(fx.mblur.strength)) ? clamp(fx.mblur.strength, 0, 4) : MBLUR.strength,
+        samples: Math.max(2, Math.min(32, Math.round(
+          isFinite(Number(fx.mblur.samples)) ? Number(fx.mblur.samples) : MBLUR.samples))),
+      };
+      const plain = !m.on && m.strength === MBLUR.strength && m.samples === MBLUR.samples;
+      if (plain) delete fx.mblur; else fx.mblur = m;
+    } else if (fx.mblur) {
+      delete fx.mblur;
+    }
     // A track for a parameter that no longer exists would evaluate into nothing. Dropping
     // it keeps `keys` honest and keeps the saved file free of dead weight - and `keys`
     // itself goes when the last track does, so an unkeyed effect serialises without it.
@@ -824,7 +909,7 @@
  * that read `clip.start` from here would be putting a clip's timeline position into its
  * own pixels, which is the one thing the render cache's key rules forbid.
  */
-  function render(target, W, H, clip, t, surface, paint) {
+  function render(target, W, H, clip, t, surface, paint, frameDur) {
     const entries = active(clip);
     if (!entries.length) { paint(target, W, H); return false; }
     const layer = clean(surface, 'fxLayer', W, H);
@@ -832,7 +917,12 @@
     paint(L.c, W, H);
     for (const e of entries) {
       try {
-        DEFS[e.type].draw(L, paramsAt(e, t), t, e, clip);
+        // Motion blur is per EFFECT and costs `samples` passes of that effect, so it is
+        // refused outright for one that cannot paint differently across the shutter -
+        // see `timeVarying()`.
+        const mb = mblurOf(e);
+        if (mb && timeVarying(e)) drawBlurred(L, e, t, clip, frameDur, mb);
+        else DEFS[e.type].draw(L, paramsAt(e, t), t, e, clip);
       } catch (err) {
         if (typeof console !== 'undefined') console.warn('FX ' + e.type + ' failed:', err);
       }
@@ -848,6 +938,7 @@
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
     pointerImage, preloadImages,
+    MBLUR, mblurOf, timeVarying,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
     roundRectPath, roundRectSub, pxMin, rgba,
   };

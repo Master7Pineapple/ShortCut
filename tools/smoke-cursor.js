@@ -421,13 +421,71 @@
       const r2 = Cursor.normRect(0.2, 0.1, 0.8, 0.7);
       ok('a selection drag normalises whichever corner it started from',
         JSON.stringify(r1) === JSON.stringify(r2) && near(r1.w, 0.6, 1e-9));
-      ok('a recorded selection becomes tagged keys on all four properties', (() => {
+      ok('a selection with no drag recorded is a static box, as it used to be', (() => {
         const built = Cursor.selectionKeys(
           Object.assign({ t0: 4, t1: 6 }, r1), { start: 2, in: 0 }, 'onrender');
         return built.t0 === 2 && built.t1 === 4 &&
           ['x', 'y', 'w', 'h'].every((k) => built.keys[k].length === 2 &&
             built.keys[k].every((q) => q.gen === 'onrender'));
       })());
+
+      // THE RUBBER BAND. One corner pinned at the press, the other following the pointer,
+      // replayed as keys - so the box grows the way it was dragged instead of appearing
+      // whole at its final size.
+      {
+        // Pinned at (0.2, 0.2); the free corner walks to (0.8, 0.6) over two seconds,
+        // sampled at 60 Hz because that is the rate pointer events actually arrive at -
+        // a sparser fixture would be testing the decimation against nothing.
+        const samples = [];
+        for (let i = 0; i <= 120; i++) {
+          const k = i / 120;
+          samples.push({ t: 4 + k * 2, x: 0.2 + k * 0.6, y: 0.2 + k * 0.4 });
+        }
+        const sel = Object.assign(
+          { t0: 4, t1: 6, x0: 0.2, y0: 0.2, samples },
+          Cursor.normRect(0.2, 0.2, 0.8, 0.6));
+        const built = Cursor.selectionKeys(sel, { start: 2, in: 0 }, 'onrender');
+
+        ok('the drag is replayed as many keys, not two',
+          built.keys.w.length > 5, built.keys.w.length + ' keys');
+        ok('...but decimated, so the strip stays editable',
+          built.keys.w.length <= samples.length / 2,
+          built.keys.w.length + ' keys from ' + samples.length + ' samples');
+        ok('the band starts at zero size, because the corners start together',
+          near(built.keys.w[0].v, 0, 1e-6) && near(built.keys.h[0].v, 0, 1e-6));
+        ok('...and ends at the size it was released at',
+          near(built.keys.w[built.keys.w.length - 1].v, 0.6, 1e-4) &&
+          near(built.keys.h[built.keys.h.length - 1].v, 0.4, 1e-4));
+
+        // The interesting one: half way through the drag the box is half the size. A
+        // static two-key version would report the FINAL size here, which is the bug.
+        const holder = { keys: built.keys };
+        const mid = (built.t0 + built.t1) / 2;
+        ok('THE POINT: half way through the drag the box is half drawn',
+          near(Anim.valueAt(holder, 'w', mid, 0), 0.3, 0.02) &&
+          near(Anim.valueAt(holder, 'h', mid, 0), 0.2, 0.02),
+          Anim.valueAt(holder, 'w', mid, 0).toFixed(3) + ' x ' +
+          Anim.valueAt(holder, 'h', mid, 0).toFixed(3));
+        ok('the easing between drag samples is LINEAR - it is a replay, not an animation',
+          built.keys.w.every((k) => k.ease && k.ease.kind === 'named' && k.ease.name === 'linear'),
+          JSON.stringify(built.keys.w[1].ease));
+        ok('and the track holds after release rather than needing a trailing key',
+          near(Anim.valueAt(holder, 'w', built.t1 + 5, 0), 0.6, 1e-4));
+
+        // Dragging up-and-left from the anchor: the rect flips sides, and x/y have to
+        // move for it rather than the width going negative.
+        const back = [];
+        for (let i = 0; i <= 20; i++) {
+          const k = i / 20;
+          back.push({ t: k, x: 0.5 - k * 0.4, y: 0.5 - k * 0.3 });
+        }
+        const flipped = Cursor.selectionKeys(
+          { t0: 0, t1: 1, x0: 0.5, y0: 0.5, samples: back, x: 0.1, y: 0.2, w: 0.4, h: 0.3 },
+          { start: 0, in: 0 }, 'onrender');
+        ok('dragging back past the anchor moves the corner, never a negative width',
+          flipped.keys.w.every((k) => k.v >= 0) &&
+          near(flipped.keys.x[flipped.keys.x.length - 1].v, 0.1, 1e-4));
+      }
     }
 
     // ============================================ 5. generator, not a black box

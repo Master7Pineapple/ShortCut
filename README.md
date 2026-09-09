@@ -141,7 +141,13 @@ There are twenty-three suites:
   independently, that a four-effect stack paints the same picture at 1x and 4x
   (preview = render, stated as an assertion), the model's normalisation and JSON
   round-trip, the panel's one-undo-per-structural-edit, that an effect's `id` is not in
-  the render cache key while its parameters are — and, end to end, that a graded clip
+  the render cache key while its parameters are, that **no row is a drag source** and
+  neither is anything inside one, that rolling a row up is pure UI - no undo entry, no
+  dirty flag, nothing on the clip - and survives a rebuild, and for the per-effect
+  shutter: that it prunes itself away when untouched but keeps settings the author
+  changed, that strength and samples are clamped, that a static or single-keyed effect is
+  refused it while a clock-reading one gets it for free, and that a swept moving effect
+  really does come out softer at its edges while the effect beneath it stays sharp — and, end to end, that a graded clip
   comes out of a real ffmpeg render matching the preview canvas. Only the last section
   needs a fixture: `flat_blue.mp4`, shared with `smoke-layers.js`.
 - `tools/smoke-bin.js` — the QuickBin (folders, importing, moving, deleting, and that it
@@ -567,12 +573,61 @@ static one — and two blurs on one clip animate independently. Keys are times i
 **seconds into the clip**, the same axis a text card's keys use, so moving a clip moves its
 animation with it. See "Keyframes" above for why they are not on `clip.keys`.
 
-#### Order matters, so it is draggable
+#### Order matters, and the arrows are how you change it
 
 The stack draws in array order, and the order is part of the picture: blur after grade is
 not blur before grade, because a grade lifts what a blur has already averaged together.
-Rows in the panel are drag-reorderable and carry the same job on arrow buttons — a drag
-is reachable from neither the keyboard nor a smoke suite.
+The ▲▼ buttons on each row move it.
+
+**Nothing in the panel is an HTML5 drag source, and that is deliberate.** The rows used to
+be draggable for reordering, and in Chromium a draggable ancestor starts a native drag
+from a press anywhere inside it — so every attempt to drag a *slider* tore the whole row
+out as a drag image and the value never moved. Exempting the body fixed the sliders and
+left a drag affordance that was still easy to trigger by accident on the row's own
+padding, in a panel whose entire purpose is dragging values. The arrows already did the
+job, they are the only route a keyboard or a smoke suite has, and they cannot be triggered
+by accident — so the drag is gone rather than defended, and `smoke-fx.js` asserts it stays
+gone.
+
+#### Rows roll up
+
+Each row has a caret, the title toggles it too, and a stack of more than one gets
+**Collapse all** / **Expand all** in the panel header. A rolled-up row still reports what
+it is doing — `bypassed`, `keyed`, `blur`, or the name of the generator that made it —
+because a stack of identical-looking closed rows is a worse list than an open one.
+
+Collapse state lives in `fxCollapsed`, a module-level `Set` keyed by effect id, and
+**never on the clip**. Undo is `JSON.stringify` of the track list and the same shape is
+the `.scut` file: a rolled-up row is not a fact about the edit, and putting it on the
+effect would mean tidying the panel dirtied the project and showed up as a change in every
+undo snapshot. Rolling a row up therefore pushes no undo entry, sets no dirty flag and
+does not redraw the picture — `smoke-fx.js` asserts all three.
+
+#### Motion blur, per effect
+
+Any effect can carry a shutter: `fx.mblur = {on, strength, samples}`, absent by default and
+pruned away again when it is off and untouched, exactly like `keys`. It sweeps **that one
+effect** across the shutter and averages the results through `Anim.temporalAverage()` —
+the same averaging text cards, transition objects and the swipe's plate go through, and
+for the same reason: the naive `lighter`-at-`1/n` accumulator quantises every faint pixel
+to zero and annihilates precisely the soft things a blur exists to smear.
+
+The layer is copied **once** before the sweep and each sample is that copy with the effect
+applied at its own instant. That is what makes it the blur of the effect rather than a
+blur of everything beneath it: an effect earlier in the stack has already painted into the
+copy, comes through every sample identically, and averages to itself — so it stays sharp
+while the one above it smears.
+
+`FX.timeVarying()` refuses the shutter for an effect that cannot paint differently across
+it — a static grade sampled eight times is the same grade eight times, and blurring it
+would cost eight passes over eight million pixels to produce a pixel-identical frame. Only
+two things qualify an effect: **more than one key** on some parameter, or a `draw()` that
+reads the clock itself (`cursor`, `ripple`, `select` are flagged `timeVarying`). The panel
+says so on the row rather than leaving a switch that quietly does nothing.
+
+It is the most expensive control in the panel — `samples` extra passes of that effect,
+every frame, in the preview and in the bake alike — so it is off by default and the hint
+says what it costs.
 
 #### Two rules the panel keeps
 
@@ -586,13 +641,8 @@ is reachable from neither the keyboard nor a smoke suite.
 - The panel uses `fx-*` classes, **not** the audio chain's `afx-*` ones, even though the
   two look alike. `#inspector .afx-box` is how three suites find the audio chain, and a
   visual panel answering to that selector made them find the wrong one.
-- **The row is `draggable`; its body is not.** In Chromium a draggable ancestor makes a
-  native HTML5 drag start from a press anywhere inside it, sliders included — so dragging
-  a parameter's value tore the whole effect row out as a drag image, as if a file were
-  being dropped into the window, and the value never moved. The buttons had carried
-  `draggable = false` from the start; the controls were simply missed. `body.draggable =
-  false` covers every control in the row and every control a future type adds, and
-  `smoke-fx.js` asserts it.
+- **Nothing is a drag source.** See "Order matters, and the arrows are how you change it"
+  below for why drag-to-reorder was removed rather than defended.
 
 #### What does not get a stack, and where effects do not apply
 
@@ -1186,6 +1236,29 @@ everything outside the box and composes with any of them.
 It is both **recorded and authorable**: a Shift-drag during a take writes tagged keys onto
 `x/y/w/h`, and a clip nobody ever performed over can carry one placed by hand. That is why
 it has no `needs`, unlike the two pointer effects.
+
+**The rubber band is the animation.** One corner is pinned where the drag began and the
+other follows the pointer, exactly the way a desktop marquee behaves — so the recorded box
+grows, shrinks and flips sides as it was actually dragged, instead of appearing whole at
+its final size. `Cursor.selectionKeys()` replays that: `sel.samples` is the moving corner
+over time, `sel.x0`/`sel.y0` the pinned one, and every sample becomes a key on all four
+properties.
+
+Three details that make the replay a replay:
+
+- **The easing between drag samples is `linear`.** These keys are a path, not a set of
+  poses: an ease on every pair would make the band accelerate and settle between each
+  sample and the next, which at 20 keys a second reads as a stutter.
+- **Samples are decimated to 20 Hz.** Pointer events arrive at 60–120 Hz, and four tracks
+  of 240 keys is a strip nobody can edit for a path that is straight between any two
+  neighbours anyway. First and last are always kept.
+- **No trailing key.** After the last key a track holds, which is `evalTrack()`'s own
+  rule, so the box simply stays at the size it was released at until the effect goes off
+  screen — `Cursor.DEFAULTS.select.hold` seconds later. A trailing key would be a key the
+  author has to delete.
+
+The static `params` are the box **as released**, so bypassing or deleting the keys leaves
+the shape that was drawn rather than a default rectangle somewhere else.
 
 Two things it gets right on purpose:
 
@@ -2463,6 +2536,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
 | Anything that blurs by sampling across time | `Anim.temporalAverage()` — never a hand-rolled `lighter` at `1/samples` accumulator, see "The shutter" |
+| An effect that should offer motion blur | nothing — every effect does. Flag the type `timeVarying: true` only if its `draw()` reads the clock without needing keyframes |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
 

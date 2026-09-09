@@ -537,8 +537,6 @@ select, input[type=number], input[type=text] {
 .fx-note { margin-bottom: 8px; line-height: 1.35; }
 .fx-fx { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; cursor: grab; }
 .fx-fx.off { opacity: 0.5; }
-.fx-fx.dragging { opacity: 0.45; cursor: grabbing; }
-.fx-fx.dragover { border-color: var(--accent); }
 .fx-fx-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #14161b; }
 .fx-fx-head b { flex: 1; font-weight: 600; }
 .fx-fx-btns { display: flex; gap: 3px; }
@@ -565,3 +563,8 @@ select, input[type=number], input[type=text] {
    click. */
 #preview.taking, canvas.taking { cursor: crosshair; }
 #btnMouse.on { background: #c2413c; color: #fff; }
+
+/* The effect row's roll-up caret, and the title that shares its job. */
+.fx-caret { min-width: 20px; padding: 0 4px; }
+.fx-fx-head .fx-title { cursor: pointer; flex: 1; }
+.fx-fx-head .fx-title:hover { color: var(--accent); }

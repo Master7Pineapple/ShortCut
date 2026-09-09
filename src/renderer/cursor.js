@@ -69,6 +69,10 @@
       punch: 1.35,       // pointer scale at the peak of a click
       punchDur: 0.22,    // seconds the punch takes
     },
+    select: {
+      hold: 2,           // seconds the box stays up after the drag is released
+      fadeIn: 0.08,      // short: the drag itself is the entrance
+    },
     ripple: {
       dur: 0.55,         // seconds one ring lives
       size: 0.09,        // final radius, fraction of the frame's shorter side
@@ -613,31 +617,68 @@
   /**
    * A recorded selection drag -> keyframe tracks for a `select` effect.
    *
-   * The rectangle is held for the whole of its own life, so the tracks are two keys per
-   * property and the ANIMATION is the effect's own entry/exit shaping rather than
-   * interpolation between them. Returned as tagged keys for the same reason auto-zoom's
-   * are: the author has to be able to nudge the box afterwards, and a box that can only
-   * be re-recorded is a box nobody will fix.
+   * THE RUBBER BAND IS THE ANIMATION, and replaying it is the point. One corner is
+   * pinned where the drag began and the opposite one follows the pointer, exactly the way
+   * a desktop marquee behaves - so the box grows, shrinks and flips sides as it was
+   * actually dragged, instead of appearing whole at its final size. `sel.samples` is that
+   * moving corner over time; `sel.x0`/`sel.y0` is the pinned one.
    *
-   * `t0`/`t1` come back in clip-local seconds alongside, because the effect also needs to
-   * know when to be on screen at all.
+   * The easing between drag samples is LINEAR, and that is not a detail. These keys are a
+   * replay of a path, not an animation between poses: an ease on every pair would make
+   * the band accelerate and settle between each sample and the next, which at 20 samples
+   * a second reads as a stutter.
+   *
+   * Samples are decimated to `MIN_GAP` - a two-second drag is 120 pointer events and
+   * four tracks of 120 keys is a strip nobody can edit, for a path that is straight
+   * between any two neighbours anyway. The first and last are always kept.
+   *
+   * After the last key the track HOLDS, which is `evalTrack()`'s own rule, so the box
+   * simply stays at the size it was released at for as long as the effect is on screen.
+   * No trailing key is needed and adding one would be a key the author has to delete.
+   *
+   * Tagged, for the same reason auto-zoom's keys are: a box that can only be re-performed
+   * is a box nobody will fix. `t0`/`t1` come back in clip-local seconds alongside, because
+   * the effect also needs to know when to be on screen at all.
+   *
+   * A `sel` with no samples - one built by hand, or by an older build - falls back to a
+   * static box, which is what it used to be.
    */
+  const MIN_GAP = 0.05;
   function selectionKeys(sel, clip, tag) {
     const start = num((clip || {}).start, 0);
     const L = (t) => Math.max(0, r4(t - start));
     const t0 = L(sel.t0), t1 = L(sel.t1);
-    const key = (v, t) => ({
-      t, v: r5(v), ease: Anim.cloneEasing(Anim.EASING_PRESETS.easeInOut), gen: tag || 'onrender',
+    const key = (v, t, linear) => ({
+      t,
+      v: r5(v),
+      ease: Anim.cloneEasing(linear
+        ? Anim.EASING_PRESETS.linear
+        : Anim.EASING_PRESETS.easeInOut),
+      gen: tag || 'onrender',
     });
-    return {
-      t0, t1,
-      keys: {
-        x: [key(sel.x, t0), key(sel.x, t1)],
-        y: [key(sel.y, t0), key(sel.y, t1)],
-        w: [key(sel.w, t0), key(sel.w, t1)],
-        h: [key(sel.h, t0), key(sel.h, t1)],
-      },
-    };
+
+    const keys = { x: [], y: [], w: [], h: [] };
+    const samples = Array.isArray(sel.samples) ? sel.samples : null;
+    if (!samples || samples.length < 2) {
+      for (const k of ['x', 'y', 'w', 'h']) keys[k] = [key(sel[k], t0), key(sel[k], t1)];
+      return { t0, t1, keys };
+    }
+
+    const kept = [];
+    let last = -Infinity;
+    samples.forEach((sm, i) => {
+      if (i === samples.length - 1 || sm.t - last >= MIN_GAP) { kept.push(sm); last = sm.t; }
+    });
+    for (const sm of kept) {
+      const r = normRect(sel.x0, sel.y0, sm.x, sm.y);
+      const t = L(sm.t);
+      keys.x.push(key(r.x, t, true));
+      keys.y.push(key(r.y, t, true));
+      keys.w.push(key(r.w, t, true));
+      keys.h.push(key(r.h, t, true));
+    }
+    for (const k of ['x', 'y', 'w', 'h']) Anim.sortKeys(keys[k]);
+    return { t0, t1, keys };
   }
 
   /** A drag, normalised so w/h are positive however it was dragged. */
