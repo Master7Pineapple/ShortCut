@@ -896,8 +896,19 @@ auto-zoom and step 14's click SFX authoring work instead of a computer-vision pr
 
 The recorder window is never shown: it would otherwise appear in its own recording. That
 means the editor window is the only UI, and it is behind whatever is being demonstrated —
-so `Ctrl+Shift+F9` stops a recording from any application. The panel's Stop button does
-the same thing when the editor is reachable.
+so **`Ctrl+Shift+F9` starts and stops a recording from any application**, and the panel's
+buttons do the same thing when the editor is reachable.
+
+It is one key rather than two on purpose. The moment you want to START recording is the
+moment you have already switched to the app you are demonstrating, so a key that only
+stopped meant every recording opened on a shot of ShortCut's own toolbar while the user
+went back to find the Record button. `toggleRecording()` in `app.js` therefore also
+resolves a source of its own when the panel has never been opened: the **primary**
+display, which is the only defensible default and the one that carries telemetry.
+Anything else — a second monitor, a single window — is a deliberate choice, and is made
+in the panel. Main fires the hotkey whether or not a recording is running and lets the
+renderer decide which half to run; main's copy of that state can only be staler than the
+panel's.
 
 #### The sidecar
 
@@ -2252,7 +2263,7 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `Ctrl+S` / `Ctrl+O` | Save / open project |
 | `Ctrl+R` | Render a preview of the range into the viewer |
 | `Ctrl+Shift+R` | Export a file to disk |
-| `Ctrl+Shift+F9` | Stop the screen recording (works while another app has focus) |
+| `Ctrl+Shift+F9` | Start / stop recording the screen (works while another app has focus) |
 | `P` | Play rendered spans / composite live |
 | `N` | Toggle snapping |
 | `B` | Show / hide the QuickBin |

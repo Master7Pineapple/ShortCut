@@ -40,7 +40,7 @@ contextBridge.exposeInMainWorld('api', {
   screenStart: (opts) => ipcRenderer.invoke('screen:start', opts),
   screenStop: () => ipcRenderer.invoke('screen:stop'),
   screenState: () => ipcRenderer.invoke('screen:state'),
-  onScreenHotkeyStop: (cb) => ipcRenderer.on('screen:hotkeyStop', () => cb()),
+  onScreenHotkeyToggle: (cb) => ipcRenderer.on('screen:hotkeyToggle', () => cb()),
   onScreenFailed: (cb) => ipcRenderer.on('screen:failed', (_e, m) => cb(m)),
 
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),

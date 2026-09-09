@@ -5437,12 +5437,44 @@ async function stopRecording() {
   return r;
 }
 
+/**
+ * The one gesture: start if idle, stop if recording.
+ *
+ * A toggle rather than two keys because the moment you want to START is the moment you
+ * have already switched to the app you are demonstrating - and a key that only stopped
+ * meant every recording opened on a shot of ShortCut's own toolbar while the user went
+ * back to find the Record button.
+ *
+ * It also has to work when the panel has never been opened, so it resolves a source of
+ * its own: the primary display, which is the only defensible default and the one that
+ * carries cursor telemetry. Anything else - a second monitor, a single window - is a
+ * deliberate choice and is made in the panel.
+ */
+async function toggleRecording() {
+  if (Rec.busy) return;
+  if (Rec.recording) { await stopRecording(); return; }
+  if (!Rec.pick) {
+    const list = await window.api.screenSources();
+    if (!Array.isArray(list) || !list.length) {
+      log('Nothing to record: ' + ((list && list.error) || 'no capturable screen was offered') + '.');
+      return;
+    }
+    Rec.sources = list;
+    Rec.pick = list.find((s) => s.type === 'screen' && s.primary && s.region) ||
+      list.find((s) => s.type === 'screen' && s.region) || list[0];
+    recPaintSources();
+  }
+  await startRecording();
+}
+
 $('#btnRecord').addEventListener('click', () => recOpen());
 $('#recClose').addEventListener('click', () => recClose());
 $('#recStart').addEventListener('click', () => startRecording());
 $('#recStop').addEventListener('click', () => stopRecording());
 // The hotkey is registered in main, because it has to fire while another app has focus.
-window.api.onScreenHotkeyStop(() => stopRecording());
+// It toggles, and it does not need the panel to have been opened first - see
+// toggleRecording().
+window.api.onScreenHotkeyToggle(() => toggleRecording());
 window.api.onScreenFailed((m) => {
   Rec.recording = false;
   if (Rec.timer) { clearInterval(Rec.timer); Rec.timer = null; }
@@ -5662,7 +5694,7 @@ const SHORTCUTS = [
   ['G', 'Close the gaps between the selected clips'],
   ['Drag on empty timeline', 'Window-select the clips the box touches'],
   ['I / O', 'Set the in / out mark for a ranged render'],
-  ['Ctrl+Shift+F9', 'Stop the screen recording (works from any app)'],
+  ['Ctrl+Shift+F9', 'Start / stop recording the screen (works from any app)'],
   ['X', 'Clear the in / out marks'],
   ['Alt+I / Alt+O', 'Trim the selected clip in / out to the playhead'],
   ['Ctrl+L / Ctrl+Shift+L', 'Link / unlink selected clips'],

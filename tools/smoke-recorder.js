@@ -318,6 +318,14 @@
         screens.map((s) => s.region && s.region.displayW).join(','));
       ok('a window carries no region, so it records picture only - the documented degradation',
         sources.filter((s) => s.type === 'window').every((s) => !s.region));
+      // The hotkey has to be able to start a recording with the panel never opened, so
+      // exactly one source has to be nominated as the default.
+      ok('exactly one source is marked primary, so the hotkey has a default to record',
+        sources.filter((s) => s.primary).length === 1,
+        sources.filter((s) => s.primary).map((s) => s.name).join(','));
+      ok('the primary source is a display, so the default recording carries telemetry',
+        (sources.find((s) => s.primary) || {}).type === 'screen' &&
+        !!(sources.find((s) => s.primary) || {}).region);
 
       const disp = screens.find((s) => s.region);
       if (!disp) {
@@ -379,6 +387,29 @@
           }
           const after = await window.api.screenState();
           ok('the recorder is idle again afterwards', after && after.recording === false);
+
+          // ------------------------------------------------ the hotkey, both halves
+          //
+          // Driven through toggleRecording() itself rather than through a synthetic key
+          // event: globalShortcut lives in main and fires while another application has
+          // focus, so there is no key to inject here. What is worth asserting is that
+          // ONE call starts and the next one stops, from a cold panel.
+          newProject();
+          Rec.pick = null;                       // as if the panel had never been opened
+          await toggleRecording();
+          ok('the hotkey starts a recording with the panel never opened', Rec.recording === true);
+          ok('...and it chose the primary display, so the recording has telemetry',
+            !!(Rec.pick && Rec.pick.primary && Rec.pick.region),
+            Rec.pick ? Rec.pick.name : 'nothing');
+          await sleep(1200);
+          await toggleRecording();
+          ok('the same key stops it', Rec.recording === false);
+          const idle = await window.api.screenState();
+          ok('and the capture really did stop, not just the panel\'s idea of it',
+            idle && idle.recording === false);
+          await sleep(400);
+          ok('the toggled recording landed on the timeline like any other import',
+            allClips().some((x) => x.clip.kind === 'video' && ScreenTel.hasTelemetry(x.clip)));
         }
       }
     }

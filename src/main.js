@@ -117,14 +117,20 @@ function createWindow() {
 
 app.whenReady().then(createWindow);
 
-// Stopping a recording needs a key that works while another app has focus - the editor
-// window is hidden behind whatever is being demonstrated, and on the screen being
-// recorded. The renderer owns the stop so the panel and the timeline stay in step; this
-// only pokes it.
+// Starting and stopping a recording both need a key that works while another app has
+// focus - the editor window is hidden behind whatever is being demonstrated, and on the
+// screen being recorded. One key TOGGLES, because the moment you want to start is the
+// moment you have already switched to the app you are demonstrating, and a key that only
+// stopped meant every recording began with a shot of ShortCut's own toolbar.
+//
+// The renderer owns both halves so the panel, the status line and the import stay in
+// step; this only pokes it. It fires whether or not a recording is running - deciding
+// which half to run is the renderer's job, and main's copy of that state can only be
+// staler than the panel's.
 app.whenReady().then(() => {
   try {
-    globalShortcut.register('CommandOrControl+Shift+F9', () => { if (rec) recSend('screen:hotkeyStop'); });
-  } catch (e) { /* another app holds the combination; the panel button still works */ }
+    globalShortcut.register('CommandOrControl+Shift+F9', () => recSend('screen:hotkeyToggle'));
+  } catch (e) { /* another app holds the combination; the panel buttons still work */ }
 });
 app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch (e) { /* ignore */ } });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
@@ -366,6 +372,7 @@ ipcMain.handle('screen:sources', async () => {
       fetchWindowIcons: false,
     });
     const displays = electronScreen.getAllDisplays();
+    const primaryId = String(electronScreen.getPrimaryDisplay().id);
     return sources.map((s) => {
       const d = s.display_id ? displays.find((x) => String(x.id) === String(s.display_id)) : null;
       return {
@@ -373,6 +380,10 @@ ipcMain.handle('screen:sources', async () => {
         name: s.name,
         type: s.id.startsWith('screen:') ? 'screen' : 'window',
         displayId: s.display_id || '',
+        // Which one the hotkey records when nobody has chosen: the primary display is
+        // the only defensible default, and having one is what lets Ctrl+Shift+F9 start a
+        // recording without the panel ever being opened.
+        primary: !!d && String(d.id) === primaryId,
         // A window's bounds are not knowable from here, so a window source records
         // WITHOUT telemetry - see the note on `screen:start`.
         region: d ? ScreenTel.regionOfDisplay(d) : null,
