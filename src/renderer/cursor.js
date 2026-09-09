@@ -10,12 +10,27 @@
  * The drawing half lives in `fx.js` (`cursor` and `ripple`), and the panel that drives
  * the generator lives in `app.js`.
  *
- * THE INPUT IS STEP 8'S TELEMETRY, AND IT IS OPTIONAL.
+ * TWO INPUTS, AND THEY ARE NOT THE SAME THING.
  *
- * Every entry point here takes a `clip.screen` and answers `null` / `[]` / "no zoom" for
- * a clip that has none. That is the contract the README states under "The screen
- * recorder": a recording from Screen Studio, OBS or a phone imports with no telemetry at
- * all and that is a permanent, supported state. Nothing in this file may throw on it.
+ *   `clip.screen`  step 8's SCREEN telemetry, sampled by the OS while a display was
+ *                  captured. Its x/y are fractions of the SOURCE frame, so they have to
+ *                  go through the clip's pan/zoom framing to become pixels. It drives
+ *                  AUTO-ZOOM and nothing else.
+ *
+ *   `clip.mouse`   an ON-RENDER take: the pointer the author performed over the finished
+ *                  9:16 picture. Its x/y are fractions of the OUTPUT FRAME, so they are
+ *                  already where they belong and must NOT be mapped. It drives the drawn
+ *                  CURSOR, the RIPPLES and the SELECTION boxes.
+ *
+ * Keeping them apart is the whole point of the split. A screen capture already contains a
+ * real cursor in its pixels; drawing a second one over it produced two pointers chasing
+ * each other, which is the bug this design removes. So a screen recording gets auto-zoom -
+ * which has no cursor in it - and a performed take gets the drawn pointer.
+ *
+ * BOTH ARE OPTIONAL. Every entry point answers `null` / `[]` / "no zoom" for a clip that
+ * has neither. That is the contract the README states under "The screen recorder": a
+ * recording from Screen Studio, OBS or a phone imports with no telemetry at all and that
+ * is a permanent, supported state. Nothing in this file may throw on it.
  *
  * TIME IS SOURCE TIME.
  *
@@ -40,6 +55,10 @@
   const RATE = 60;                    // the resampling grid, in samples per second
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, isFinite(Number(v)) ? Number(v) : lo));
   const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
+  // The same rounding `screen.js` writes a sidecar with, so a performed take and a
+  // recorded one carry numbers of the same precision and neither looks spuriously exact.
+  const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
+  const r5 = (x) => Math.round((Number(x) || 0) * 1e5) / 1e5;
 
   /** Every default in one place, so the panel, the effects and the suite agree. */
   const DEFAULTS = {
@@ -255,6 +274,25 @@
    * Returns a function, and also the crop it derived, because the auto-zoom generator
    * needs to know what is actually on screen rather than what is in the file.
    */
+  /**
+   * The mapper a given data source needs.
+   *
+   * A SOURCE-space point (screen telemetry) goes through the clip's framing, because it
+   * was recorded against the file. A FRAME-space point (an on-render take) is already a
+   * fraction of the output and is scaled straight up - putting it through the framing
+   * would move a pointer the author placed by eye on the finished picture.
+   *
+   * One function, so a caller cannot forget which kind it is holding: it asks the data.
+   */
+  function mapperFor(clip, holder, W, H) {
+    if (holder && holder.space === 'frame') {
+      const fn = (x, y) => ({ x: num(x, 0) * W, y: num(y, 0) * H });
+      fn.crop = { x: 0, y: 0, w: 1, h: 1 };
+      return fn;
+    }
+    return mapper(clip, W, H);
+  }
+
   function mapper(clip, W, H) {
     const c = clip || {};
     const sw = num(c.srcW, 0) || W, sh = num(c.srcH, 0) || H;
@@ -516,8 +554,103 @@
     return n;
   }
 
+  // ------------------------------------------------------------- on-render takes
+
+  /**
+   * An on-render take, as it lands on a clip:
+   *
+   *   clip.mouse = { events: [{t, x, y, type}], space: 'frame', clicks: true }
+   *
+   * `t` is SOURCE seconds - the same axis `clip.screen` uses, and for the same reason:
+   * it is the only timebase that survives trimming, splitting and dragging the clip
+   * afterwards. `x`/`y` are fractions of the OUTPUT FRAME, because that is what the
+   * author was looking at when they performed it.
+   *
+   * A take is recorded against the TIMELINE and can cross several clips, so it is split
+   * on import and each clip gets the piece that happened over it. That is what makes it
+   * behave like every other thing on a clip - one clip, one `mouse`, undo is
+   * `JSON.stringify` of the track list, and a clip carried to another project carries its
+   * pointer with it.
+   */
+  function makeTake(events, o) {
+    const s = o || {};
+    return {
+      events: (events || []).map((e) => ({
+        t: r4(e.t), x: r5(e.x), y: r5(e.y), type: e.type || MOVE,
+      })).sort((a, b) => a.t - b.t),
+      space: 'frame',
+      clicks: s.clicks !== false,
+    };
+  }
+
+  /**
+   * Cut a timeline-time take into per-clip, source-time takes.
+   *
+   * `clips` is `[{id, start, in, out}]` - whatever the caller has, as long as it names
+   * those four. A clip gets an entry only if something actually happened over it, so
+   * recording a pass that never crosses a clip leaves that clip alone rather than
+   * writing an empty take onto it.
+   *
+   * The boundary is half-open, `[start, end)`, exactly like `layersAt()`: a click landing
+   * precisely on a cut belongs to the clip that is coming in, not the one going out, and
+   * the two must not both claim it.
+   */
+  function splitTake(events, clips) {
+    const out = new Map();
+    for (const c of (clips || [])) {
+      const len = num(c.out, 0) - num(c.in, 0);
+      const a = num(c.start, 0), b = a + len;
+      const mine = [];
+      for (const e of (events || [])) {
+        if (e.t < a || e.t >= b) continue;
+        mine.push({ t: e.t - a + num(c.in, 0), x: e.x, y: e.y, type: e.type || MOVE });
+      }
+      if (mine.length) out.set(c.id, makeTake(mine));
+    }
+    return out;
+  }
+
+  /**
+   * A recorded selection drag -> keyframe tracks for a `select` effect.
+   *
+   * The rectangle is held for the whole of its own life, so the tracks are two keys per
+   * property and the ANIMATION is the effect's own entry/exit shaping rather than
+   * interpolation between them. Returned as tagged keys for the same reason auto-zoom's
+   * are: the author has to be able to nudge the box afterwards, and a box that can only
+   * be re-recorded is a box nobody will fix.
+   *
+   * `t0`/`t1` come back in clip-local seconds alongside, because the effect also needs to
+   * know when to be on screen at all.
+   */
+  function selectionKeys(sel, clip, tag) {
+    const start = num((clip || {}).start, 0);
+    const L = (t) => Math.max(0, r4(t - start));
+    const t0 = L(sel.t0), t1 = L(sel.t1);
+    const key = (v, t) => ({
+      t, v: r5(v), ease: Anim.cloneEasing(Anim.EASING_PRESETS.easeInOut), gen: tag || 'onrender',
+    });
+    return {
+      t0, t1,
+      keys: {
+        x: [key(sel.x, t0), key(sel.x, t1)],
+        y: [key(sel.y, t0), key(sel.y, t1)],
+        w: [key(sel.w, t0), key(sel.w, t1)],
+        h: [key(sel.h, t0), key(sel.h, t1)],
+      },
+    };
+  }
+
+  /** A drag, normalised so w/h are positive however it was dragged. */
+  function normRect(x0, y0, x1, y1) {
+    return {
+      x: Math.min(x0, x1), y: Math.min(y0, y1),
+      w: Math.abs(x1 - x0), h: Math.abs(y1 - y0),
+    };
+  }
+
   const API = {
     DEFAULTS, ACCENT, RATE,
+    makeTake, splitTake, selectionKeys, normRect, mapperFor,
     has, moves, clicksOf, grid, smoothAt, rawAt,
     ripplesAt, punchAt, mapper,
     segments, target, offsetFor, autoZoom,

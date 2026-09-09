@@ -470,6 +470,12 @@
       const rows = document.querySelectorAll('#inspector .fx-box .fx-fx');
       ok('the panel draws one row per effect, in stack order', rows.length === 2);
       ok('the rows are drag-reorderable', [...rows].every((r) => r.draggable));
+      // ...but the BODY is not, or a press on a slider's thumb would start a native
+      // HTML5 drag of the whole row instead of moving the value - which is exactly what
+      // it did until the body was exempted.
+      ok('the controls inside a row are NOT a drag handle for it',
+        [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')].every((b) => b.draggable === false),
+        [...document.querySelectorAll('#inspector .fx-box .fx-fx-body')].map((b) => b.draggable).join(','));
       // The arrows do the same job as the drag and are reachable from here.
       const upBtn = [...rows[1].querySelectorAll('button')].find((b) => b.textContent === '▲');
       upBtn.click();

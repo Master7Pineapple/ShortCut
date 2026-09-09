@@ -1713,9 +1713,58 @@ function clipFxPanel(clip) {
     bar.appendChild(btns);
     row.appendChild(bar);
 
+    // An effect on a clip that cannot feed it is not an error - a take can be recorded
+    // afterwards, and a clip can be replaced under a stack - but it must not be silent.
+    if (d.needs === 'mouse' && !clipHasTake(clip)) {
+      row.appendChild(el('div', 'tc-hint fx-warn',
+        'No mouse take on this clip, so this draws nothing. Record one with Mouse.'));
+    }
+
     const body = el('div', 'fx-fx-body');
+    // NOT draggable, and this is load-bearing rather than tidy. The row is `draggable`
+    // so the stack can be reordered, and in Chromium a draggable ancestor makes a native
+    // HTML5 drag start from a press anywhere inside it - including on a slider's thumb.
+    // The effect was that trying to drag a parameter's value tore the whole effect row
+    // out as a drag image, as if a file were being dropped into the window, and the value
+    // never moved. The buttons above have carried `draggable = false` for the same reason
+    // since they were written; the controls were simply missed. Setting it on the body
+    // covers every control in it, and every control any future effect type adds.
+    body.draggable = false;
     for (const spec of d.schema) {
       body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+    }
+
+    // An imported PNG pointer. A PATH, not the bytes: `clip.fx` is plain JSON that goes
+    // into every undo snapshot and into the .scut file, and an inlined image would put a
+    // megabyte of base64 into both. `FX.preloadImages()` is what makes a path safe to
+    // read from a synchronous draw - see its comment in fx.js.
+    if (fx.type === 'cursor') {
+      const prow = el('div', 'tc-row');
+      prow.appendChild(el('label', 'tc-label', 'PNG pointer'));
+      const nm = el('span', 'tc-hint',
+        fx.params.image ? String(fx.params.image).split(/[\/]/).pop() : 'built-in arrow');
+      nm.title = fx.params.image ||
+        'The built-in arrow is drawn as vectors, so it stays sharp at any resolution.';
+      prow.appendChild(nm);
+      const pick = el('button', 'mini', 'Choose...');
+      pick.draggable = false;
+      pick.addEventListener('click', async () => {
+        const f = await window.api.pickImage();
+        if (!f) return;
+        pushUndo();
+        fx.params.image = f;
+        await FX.preloadImages([clip]);
+        markDirty();
+        renderAll();
+      });
+      prow.appendChild(pick);
+      if (fx.params.image) {
+        const clr = el('button', 'mini', 'Clear');
+        clr.draggable = false;
+        clr.addEventListener('click', () => edit(() => { fx.params.image = ''; }));
+        prow.appendChild(clr);
+      }
+      body.appendChild(prow);
     }
 
     // Every numeric parameter is keyframable, and the keys live on the EFFECT, not the
@@ -1757,10 +1806,16 @@ function clipFxPanel(clip) {
   a0.value = '';
   a0.textContent = 'Add an effect...';
   add.appendChild(a0);
+  // An effect whose data the clip does not carry is offered but DISABLED, not hidden.
+  // Hiding it answers "why can I not find the cursor effect" with silence; disabling it
+  // with a reason on the row answers it on the spot. This is the gap that made the two
+  // pointer effects addable to any clip and then silently draw nothing.
   for (const type of FX.TYPES) {
     const o = el('option');
     o.value = type;
-    o.textContent = FX.DEFS[type].label;
+    const need = FX.DEFS[type].needs;
+    o.disabled = need === 'mouse' && !clipHasTake(clip);
+    o.textContent = FX.DEFS[type].label + (o.disabled ? '  - needs a mouse take' : '');
     add.appendChild(o);
   }
   add.addEventListener('change', () => {
@@ -1773,6 +1828,11 @@ function clipFxPanel(clip) {
   });
   addRow.appendChild(add);
   box.appendChild(addRow);
+  if (!clipHasTake(clip)) {
+    addRow.appendChild(el('div', 'tc-hint',
+      'The pointer and ripple effects need a performed mouse take on this clip - ' +
+      'record one with Mouse over the viewer. They are greyed out until then.'));
+  }
 
   const az = autoZoomPanel(clip);
   if (az) box.appendChild(az);
@@ -3466,8 +3526,14 @@ function loop() {
       renderPlayhead();
       syncMedia();
       scrollPlayheadIntoView();
+      // A take ends when its range does, rather than running on over whatever follows.
+      if (Mouse.recording && state.playhead >= Mouse.range.to - 1e-3) stopMouseTake();
     }
     drawPreview();
+    // AFTER the picture, and outside it: the selection rubber-band is an affordance for
+    // the person performing, not a layer. It is never composited and never baked - what
+    // gets baked is the `select` effect the drag turns into when the take is committed.
+    drawMouseOverlay(ctx, previewSize().w, previewSize().h);
     drawMeter();
   } catch (e) {
     // Reported once per distinct fault, so a persistent one does not flood the log at
@@ -3486,7 +3552,38 @@ requestAnimationFrame(loop);
 
 // Drag on the preview to reposition the crop frame.
 let framingDrag = null;
+
+// While a take is being performed the viewer is an input surface, not a framing control:
+// a drag has to move the pointer being recorded, never the clip's pan. These run BEFORE
+// the framing handlers and stop them.
+canvas.addEventListener('pointerdown', (e) => {
+  if (!Mouse.recording) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.shiftKey) { mouseBeginSelection(e); return; }
+  Mouse.down = true;
+  mouseSample(e, ScreenTel.DOWN);
+}, true);
+canvas.addEventListener('pointermove', (e) => {
+  if (!Mouse.recording) return;
+  if (Mouse.drag) {
+    const p = mousePointAt(e);
+    Mouse.drag.x1 = p.x; Mouse.drag.y1 = p.y;
+    return;
+  }
+  mouseSample(e, ScreenTel.MOVE);
+}, true);
+canvas.addEventListener('pointerup', (e) => {
+  if (!Mouse.recording) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (Mouse.drag) { mouseEndSelection(); return; }
+  Mouse.down = false;
+  mouseSample(e, ScreenTel.UP);
+}, true);
+
 canvas.addEventListener('mousedown', (e) => {
+  if (Mouse.recording) return;
   const c = activeVideoClip();
   if (!c) return;
   canvas.classList.add('dragging');
@@ -4690,13 +4787,12 @@ function buildJob(outPath, range) {
         // it out and turning up a blur would hit the cached render of the old picture.
         // ffmpeg never sees it - the baker has already drawn it by the time main runs.
         fx: c.fx && c.fx.length ? JSON.parse(JSON.stringify(c.fx)) : undefined,
-        // Telemetry itself stays off the job - it is thousands of samples and it
-        // describes the source, not the pixels. But a `cursor` or `ripple` effect DRAWS
-        // from it, and from step 9 that means the picture depends on something the key
-        // could not otherwise see: two cuts of the same file with different sidecars
-        // would share a cached render. A digest is enough, because a sidecar is written
-        // once and never edited - what changes is which one is attached.
-        screen: screenDigest(c),
+        // The take itself stays off the job - it is thousands of samples. But a `cursor`
+        // or `ripple` effect DRAWS from it, so the picture depends on something the key
+        // could not otherwise see: two cuts of one file with different takes would share
+        // a cached render. A digest is enough, because a take is recorded once and
+        // replaced wholesale - what changes is which one is attached.
+        mouse: mouseDigest(c),
         visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
           t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
@@ -4759,20 +4855,26 @@ function buildJob(outPath, range) {
  * copy, not an encode.
  */
 /**
- * The smallest thing that says WHICH telemetry a clip carries, for the render cache.
+ * The smallest thing that says WHICH on-render take a clip carries, for the render cache.
  *
- * `undefined` - so it serialises away entirely - unless the clip both has telemetry and
- * carries an effect that draws from it. A clip whose cursor effect is bypassed is a clip
- * whose pixels do not depend on the cursor, and it must key the same as one that never
- * had the effect at all.
+ * `undefined` - so it serialises away entirely - unless the clip both has a take and
+ * carries an enabled effect that draws from it. A clip whose cursor effect is bypassed is
+ * a clip whose pixels do not depend on the take, and it must key the same as one that
+ * never had the effect at all.
+ *
+ * Note what is NOT here any more: `clip.screen`. Screen telemetry no longer decides a
+ * single pixel - the two effects that read it now read `clip.mouse` instead, and
+ * auto-zoom bakes its answer into ordinary keyframes on `clip.fx`, which the job already
+ * carries. Telemetry went back to describing the source rather than the picture, so it
+ * went back out of the key.
  */
-function screenDigest(c) {
-  if (!ScreenTel.hasTelemetry(c)) return undefined;
+function mouseDigest(c) {
+  if (!Cursor.has(c && c.mouse)) return undefined;
   const uses = (c.fx || []).some((f) =>
-    f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'screen');
+    f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'mouse');
   if (!uses) return undefined;
-  const ev = c.screen.events;
-  return { n: ev.length, t0: ev[0].t, t1: ev[ev.length - 1].t, clicks: !!c.screen.clicks };
+  const ev = c.mouse.events;
+  return { n: ev.length, t0: ev[0].t, t1: ev[ev.length - 1].t, clicks: !!c.mouse.clicks };
 }
 
 function jobCacheKey(job) {
@@ -5137,6 +5239,11 @@ async function bakeComposite(job) {
 
 /** Bake every canvas-drawn layer a job needs: the composite, text cards, transitions. */
 async function bakeOverlays(job) {
+  // An imported PNG pointer that has not decoded yet would be baked as the fallback
+  // arrow, and that frame is in the file forever. The viewer can miss one and catch it
+  // 16 ms later; the export cannot, so it waits here. Nothing else in the bake is allowed
+  // to depend on a decode landing in time either - this is the one door.
+  await FX.preloadImages(allClips().map((x) => x.clip));
   // The composite goes first: it decides which cards and clips are left to bake at all.
   const c = await bakeComposite(job);
   const a = await bakeTextClips(job);
@@ -5442,6 +5549,231 @@ window.api.onRenderProgress((d) => {
 $('#btnImport').addEventListener('click', async () => importPaths(await window.api.pickMedia()));
 $('#btnImportFolder').addEventListener('click', async () => importPaths(await window.api.pickFolder()));
 
+
+// ---- the on-render mouse take -------------------------------------------
+//
+// The SECOND kind of recording, and the one the drawn pointer belongs to.
+//
+// A screen capture already contains a real cursor in its pixels, so drawing another one
+// over it gave two pointers chasing each other - the bug that split this feature in two.
+// A mouse take is performed over the FINISHED 9:16 picture, which has no pointer in it,
+// so the drawn one is the only one and the conflict is gone by construction rather than
+// patched over. Screen captures keep auto-zoom, which draws no cursor at all.
+//
+// WHAT IS RECORDED, AND IN WHAT SPACE
+//
+//   moves and clicks   -> `clip.mouse`, x/y as fractions of the OUTPUT FRAME
+//   Shift-drag boxes   -> a `select` effect per box, as tagged keyframes
+//
+// Frame fractions, not source fractions: the author is pointing at the composited
+// picture, so that is the space the data means. `Cursor.mapperFor()` is what keeps the
+// two straight - it asks the data which space it is in rather than trusting the caller.
+//
+// TIME COMES FROM THE PLAYHEAD, NOT THE CLOCK
+//
+// `state.playhead` is the authoritative time of the frame on screen, so a sample taken
+// during a stutter is timed by the frame it belongs to rather than by when the pointer
+// event happened to arrive. Step 8 needed a whole first-frame alignment pass to achieve
+// the same thing against a real encoder; here it is free, and it is exact.
+
+const Mouse = {
+  recording: false,
+  range: null,       // {from, to} in timeline seconds
+  events: [],        // {t, x, y, type} in TIMELINE time, frame-fraction coordinates
+  sels: [],          // finished Shift-drag selections, timeline time
+  drag: null,        // the selection being dragged right now
+  down: false,
+};
+
+/** Does this clip carry a performed take? The question every pointer effect asks. */
+function clipHasTake(clip) {
+  return !!(clip && Cursor.has(clip.mouse));
+}
+
+/** The pointer, as a fraction of the frame. Clamped: a drag off the edge still ends. */
+function mousePointAt(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: clamp((e.clientX - r.left) / Math.max(1, r.width), 0, 1),
+    y: clamp((e.clientY - r.top) / Math.max(1, r.height), 0, 1),
+  };
+}
+
+function mouseStatus(msg, kind) {
+  const b = $('#btnMouse');
+  if (b) b.classList.toggle('on', Mouse.recording);
+  if (msg) setStatus(msg, kind);
+}
+
+/**
+ * Start a take over the current range.
+ *
+ * The range must be PRE-RENDERED, and this refuses rather than limping: compositing a
+ * stack of clips, cards and effects live while also asking the author to perform a
+ * pointer against it drops frames, and a take performed against a stuttering picture is
+ * timed to a picture nobody will ever see again. A preview render of the range makes the
+ * viewer decode one finished MP4 instead, which is the whole reason preview renders
+ * exist. `state.usePreviewRender` has to be on for the same reason.
+ */
+function startMouseTake() {
+  if (Mouse.recording) return stopMouseTake();
+  if (Rec.recording) { setStatus('Stop the screen recording first.', 'err'); return; }
+  const dur = projectDuration();
+  if (dur <= 0) { setStatus('Nothing to perform over - the timeline is empty.', 'err'); return; }
+  const r = renderRange();
+  if (r.to - r.from <= 0.05) { setStatus('That range is empty - move the in/out marks.', 'err'); return; }
+
+  const covered = mouseRangeCovered(r);
+  if (!covered) {
+    setStatus('Render a preview of this range first (Preview render) - a take performed ' +
+      'against a live composite is timed to dropped frames.', 'err');
+    return;
+  }
+  if (!state.usePreviewRender) {
+    setStatus('Turn on "Use preview renders" so the viewer plays the rendered picture.', 'err');
+    return;
+  }
+
+  Mouse.recording = true;
+  Mouse.range = { from: r.from, to: r.to };
+  Mouse.events = [];
+  Mouse.sels = [];
+  Mouse.drag = null;
+  Mouse.down = false;
+  canvas.classList.add('taking');
+  seek(r.from);
+  play();
+  mouseStatus('Performing - move the pointer over the viewer, click, Shift-drag to ' +
+    'select. Esc or Mouse to stop.');
+}
+
+/** Is every part of the range covered by a valid rendered span? */
+function mouseRangeCovered(r) {
+  let t = r.from;
+  const bands = state.cacheBands.filter((b) => b.file).slice().sort((a, b) => a.from - b.from);
+  for (const b of bands) {
+    if (b.from > t + 0.05) return false;
+    if (b.to > t) t = b.to;
+    if (t >= r.to - 0.05) return true;
+  }
+  return t >= r.to - 0.05;
+}
+
+/** Record one sample at the playhead. Called from the canvas handlers below. */
+function mouseSample(e, type) {
+  if (!Mouse.recording) return;
+  const t = state.playhead;
+  if (t < Mouse.range.from - 1e-6 || t > Mouse.range.to + 1e-6) return;
+  const p = mousePointAt(e);
+  Mouse.events.push({ t, x: p.x, y: p.y, type: type || ScreenTel.MOVE });
+}
+
+/**
+ * Finish the take and write it onto the clips underneath it.
+ *
+ * ONE `pushUndo()` for the whole pass, however many clips it touches - a bulk operation
+ * is one undo entry. Re-performing REPLACES: the previous take on each clip is dropped
+ * and the previously generated `select` effects go with it, so a second attempt is a
+ * second attempt rather than two pointers on top of each other. Effects the author added
+ * by hand are left exactly where they are, the same rule auto-zoom keeps.
+ */
+function stopMouseTake() {
+  if (!Mouse.recording) return;
+  Mouse.recording = false;
+  canvas.classList.remove('taking');
+  pause();
+  if (Mouse.drag) { mouseEndSelection(); }
+
+  const events = Mouse.events.slice();
+  const sels = Mouse.sels.slice();
+  Mouse.events = [];
+  Mouse.sels = [];
+  if (!events.length) { mouseStatus('Nothing was performed - the take is discarded.', 'err'); return; }
+
+  // Only picture clips on visible tracks, and only ones the range actually crossed.
+  const targets = [];
+  for (const t of state.tracks) {
+    if (t.type !== 'video' || t.locked) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c)) continue;
+      if (clipEnd(c) <= Mouse.range.from + 1e-6 || c.start >= Mouse.range.to - 1e-6) continue;
+      targets.push(c);
+    }
+  }
+  if (!targets.length) { mouseStatus('No picture clip under that range.', 'err'); return; }
+
+  const takes = Cursor.splitTake(events, targets);
+  if (!takes.size) { mouseStatus('Nothing was performed over a clip.', 'err'); return; }
+
+  pushUndo();
+  let nClips = 0, nSel = 0;
+  for (const c of targets) {
+    const take = takes.get(c.id);
+    if (!take) continue;
+    nClips++;
+    c.mouse = take;
+
+    // The two pointer effects, added once and then left alone - re-performing must not
+    // stack a second pair on top of the author's tuned first pair.
+    if (!Array.isArray(c.fx)) c.fx = [];
+    for (const type of ['cursor', 'ripple']) {
+      if (!c.fx.some((f) => f && f.type === type)) c.fx.unshift(FX.create(type));
+    }
+
+    // Generated selections are replaced wholesale; hand-made ones are not touched.
+    c.fx = c.fx.filter((f) => !(f && f.type === 'select' && f.gen === 'onrender'));
+    for (const sel of sels) {
+      const mid = (sel.t0 + sel.t1) / 2;
+      if (mid < c.start || mid >= clipEnd(c)) continue;
+      const built = Cursor.selectionKeys(sel, c, 'onrender');
+      const fx = FX.create('select');
+      fx.gen = 'onrender';
+      fx.params.x = sel.x; fx.params.y = sel.y;
+      fx.params.w = sel.w; fx.params.h = sel.h;
+      fx.params.showFrom = built.t0;
+      fx.params.showTo = built.t1;
+      Cursor.applyGenerated(fx, built.keys, 'onrender');
+      c.fx.push(fx);
+      nSel++;
+    }
+    FX.normalizeClip(c);
+  }
+  markDirty();
+  renderAll();
+  mouseStatus('Take recorded onto ' + nClips + ' clip' + (nClips === 1 ? '' : 's') +
+    (nSel ? ' with ' + nSel + ' selection' + (nSel === 1 ? '' : 's') : '') + '.');
+}
+
+function mouseBeginSelection(e) {
+  const p = mousePointAt(e);
+  Mouse.drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, t0: state.playhead };
+}
+
+function mouseEndSelection() {
+  const d = Mouse.drag;
+  Mouse.drag = null;
+  if (!d) return;
+  const rect = Cursor.normRect(d.x0, d.y0, d.x1, d.y1);
+  // A Shift-click that never moved is not a selection; it would produce a zero-area box
+  // that draws nothing and clutters the stack.
+  if (rect.w < 0.02 || rect.h < 0.02) return;
+  const t1 = Math.max(state.playhead, d.t0 + 0.1);
+  Mouse.sels.push(Object.assign({ t0: d.t0, t1 }, rect));
+}
+
+/** The live selection rectangle, drawn over the viewer while it is being dragged. */
+function drawMouseOverlay(c, W, H) {
+  if (!Mouse.recording || !Mouse.drag) return;
+  const d = Mouse.drag;
+  const r = Cursor.normRect(d.x0, d.y0, d.x1, d.y1);
+  c.save();
+  c.strokeStyle = Cursor.ACCENT;
+  c.lineWidth = 2;
+  c.setLineDash([6, 5]);
+  c.strokeRect(r.x * W, r.y * H, r.w * W, r.h * H);
+  c.restore();
+}
+
 // ---- the screen recorder -------------------------------------------------
 //
 // The panel picks a source and starts the capture; main owns the capture itself and the
@@ -5655,6 +5987,10 @@ async function toggleRecording() {
   }
   await startRecording();
 }
+
+$('#btnMouse').addEventListener('click', () => {
+  Mouse.recording ? stopMouseTake() : startMouseTake();
+});
 
 $('#btnRecord').addEventListener('click', () => recOpen());
 $('#recClose').addEventListener('click', () => recClose());
@@ -5976,6 +6312,9 @@ document.addEventListener('keydown', (e) => {
     if (t) { t.muted = !t.muted; markDirty(); renderAll(); }
   }
   else if (e.key === 'F5') { location.reload(); }
+  // Esc stops a take FIRST and does nothing else: the person performing has both hands
+  // busy and the nearest exit has to be unambiguous, not also a deselect.
+  else if (e.key === 'Escape' && Mouse.recording) { stopMouseTake(); }
   else if (e.key === 'Escape') { $('#modal').hidden = true; $('#recModal').hidden = true; setSelection([], false); }
   else handled = false;
 

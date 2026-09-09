@@ -554,3 +554,14 @@ select, input[type=number], input[type=text] {
 .fx-az { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
 .fx-az .fx-add { display: flex; gap: 6px; }
 .fx-az .fx-add button { flex: 1; }
+
+/* An effect whose data the clip does not carry. Not an error - a take can be recorded
+   afterwards - but it must not draw nothing in silence, which is exactly what the two
+   pointer effects did before they said so. */
+.fx-warn { color: var(--warn, #e0b341); padding: 4px 6px 0; }
+
+/* The viewer while a mouse take is being performed: it is an input surface, not a
+   framing control, and the cursor shape is the only thing that says so before the first
+   click. */
+#preview.taking, canvas.taking { cursor: crosshair; }
+#btnMouse.on { background: #c2413c; color: #fff; }

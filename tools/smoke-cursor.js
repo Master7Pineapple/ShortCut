@@ -377,6 +377,59 @@
         Cursor.autoZoom({ events: [] }, flat, OPT).keys.scale.length === 0);
     }
 
+    // ==================================== 4b. cutting a take up across the clips
+
+    {
+      // A take is performed against the TIMELINE and can cross several clips, so it is
+      // split on import and each clip gets the piece that happened over it, in its own
+      // SOURCE time - the only axis that survives trimming and dragging afterwards.
+      const ev = [];
+      for (let i = 0; i <= 100; i++) ev.push({ t: i / 10, x: i / 100, y: 0.5, type: 'move' });
+      ev.push({ t: 3, x: 0.3, y: 0.5, type: 'down' }, { t: 7, x: 0.7, y: 0.5, type: 'down' });
+      ev.sort((a, b) => a.t - b.t);
+      const clips = [
+        { id: 'A', start: 0, in: 2, out: 7 },      // timeline 0..5, source 2..7
+        { id: 'B', start: 5, in: 0, out: 5 },      // timeline 5..10, source 0..5
+        { id: 'C', start: 40, in: 0, out: 5 },     // nowhere near the take
+      ];
+      const takes = Cursor.splitTake(ev, clips);
+      ok('a clip the take never crossed gets nothing at all, not an empty take',
+        !takes.has('C') && takes.size === 2);
+      ok('each clip keeps only what happened over it',
+        takes.get('A').events.every((e) => e.t >= 2 && e.t <= 7) &&
+        takes.get('B').events.every((e) => e.t >= 0 && e.t <= 5));
+      ok('timeline time became SOURCE time through the clip\'s in point', (() => {
+        // The click at timeline t=3 is 3 s into clip A, which starts 2 s into its source.
+        const hit = takes.get('A').events.find((e) => e.type === 'down');
+        return hit && near(hit.t, 5, 1e-6);
+      })());
+      ok('the boundary is half-open, so a sample on the cut belongs to ONE clip', (() => {
+        const atCut = ev.filter((e) => Math.abs(e.t - 5) < 1e-9).length;
+        const inA = takes.get('A').events.filter((e) => near(e.t, 7, 1e-9)).length;
+        const inB = takes.get('B').events.filter((e) => near(e.t, 0, 1e-9)).length;
+        return atCut > 0 && inA + inB === atCut;
+      })());
+      ok('a take is frame space, and says so',
+        takes.get('A').space === 'frame' && Cursor.has(takes.get('A')));
+      ok('a take is plain JSON', (() => {
+        const t = takes.get('A');
+        return JSON.stringify(t) === JSON.stringify(JSON.parse(JSON.stringify(t)));
+      })());
+
+      // A drag, whichever way it was dragged, is the same rectangle.
+      const r1 = Cursor.normRect(0.8, 0.7, 0.2, 0.1);
+      const r2 = Cursor.normRect(0.2, 0.1, 0.8, 0.7);
+      ok('a selection drag normalises whichever corner it started from',
+        JSON.stringify(r1) === JSON.stringify(r2) && near(r1.w, 0.6, 1e-9));
+      ok('a recorded selection becomes tagged keys on all four properties', (() => {
+        const built = Cursor.selectionKeys(
+          Object.assign({ t0: 4, t1: 6 }, r1), { start: 2, in: 0 }, 'onrender');
+        return built.t0 === 2 && built.t1 === 4 &&
+          ['x', 'y', 'w', 'h'].every((k) => built.keys[k].length === 2 &&
+            built.keys[k].every((q) => q.gen === 'onrender'));
+      })());
+    }
+
     // ============================================ 5. generator, not a black box
 
     {
@@ -442,23 +495,37 @@
         return { x: sx / (n || 1), y: sy / (n || 1), n };
       };
 
-      const scr = tel(path(4, 60, () => ({ x: 0.5, y: 0.5 })).concat(
-        [{ t: 2, x: 0.5, y: 0.5, type: 'down' }]).sort((a, b) => a.t - b.t));
+      // The two pointer effects read `clip.mouse` - a PERFORMED take in FRAME space -
+      // and no longer `clip.screen`. A screen capture already has a real cursor in its
+      // pixels, so drawing a second one over it was two pointers chasing each other.
+      const take = Cursor.makeTake(path(4, 60, () => ({ x: 0.5, y: 0.5 })).concat(
+        [{ t: 2, x: 0.5, y: 0.5, type: 'down' }]));
       const base = { kind: 'video', srcW: 1080, srcH: 1920, panX: 0.5, panY: 0.5, zoom: 1, in: 0, out: 4 };
 
-      const withTel = Object.assign({}, base, { screen: scr, fx: [FX.create('cursor')] });
-      withTel.fx[0].params.conceal = 0;
-      const drawn = mark(shoot(withTel, 1, 200, 356), 200, 356);
-      ok('the pointer is drawn where the telemetry says it is',
+      const withTake = Object.assign({}, base, { mouse: take, fx: [FX.create('cursor')] });
+      const drawn = mark(shoot(withTake, 1, 200, 356), 200, 356);
+      ok('the pointer is drawn where the take says it is',
         drawn.n > 20 && near(drawn.x, 100, 25) && near(drawn.y, 178, 25),
         drawn.n + ' px at ' + drawn.x.toFixed(0) + ',' + drawn.y.toFixed(0));
+
+      // FRAME space, not source space: a take is performed against the finished 9:16
+      // picture, so reframing the clip underneath must NOT move the pointer. Telemetry
+      // is the opposite, and `Cursor.mapperFor()` is what keeps the two apart.
+      const reframed = Object.assign({}, withTake, { panX: 0.05, zoom: 2.5 });
+      const moved = mark(shoot(reframed, 1, 200, 356), 200, 356);
+      ok('a performed pointer does NOT move when the clip is reframed',
+        near(moved.x, drawn.x, 1) && near(moved.y, drawn.y, 1),
+        moved.x.toFixed(1) + ',' + moved.y.toFixed(1) + ' vs ' + drawn.x.toFixed(1) + ',' + drawn.y.toFixed(1));
+      ok('...while screen telemetry still goes through the framing, as auto-zoom needs',
+        Math.abs(Cursor.mapperFor(reframed, { space: 'source' }, 200, 356)(0.5, 0.5).x -
+          Cursor.mapperFor(withTake, { space: 'source' }, 200, 356)(0.5, 0.5).x) > 1);
 
       // THE UNIT RULE. Every length in fx.js is a fraction of the frame, so the same
       // stack at two resolutions is the same picture scaled - which is what preview and
       // render agreeing means for this file.
       {
-        const small = mark(shoot(withTel, 1, 200, 356), 200, 356);
-        const big = mark(shoot(withTel, 1, 800, 1424), 800, 1424);
+        const small = mark(shoot(withTake, 1, 200, 356), 200, 356);
+        const big = mark(shoot(withTake, 1, 800, 1424), 800, 1424);
         // Position is the assertion; the area is a sanity check with a loose tolerance
         // on purpose. The count is of pixels that differ from the background by more than
         // a threshold, and a 9-pixel-wide pointer is far more antialiased edge, in
@@ -471,7 +538,7 @@
           '  px ' + (big.n / 16).toFixed(0) + ' vs ' + small.n);
       }
 
-      const ring = Object.assign({}, base, { screen: scr, fx: [FX.create('ripple')] });
+      const ring = Object.assign({}, base, { mouse: take, fx: [FX.create('ripple')] });
       ok('a ripple appears at the click and is gone before the next second',
         mark(shoot(ring, 2.1, 200, 356), 200, 356).n > 10 &&
         mark(shoot(ring, 1.5, 200, 356), 200, 356).n === 0);
@@ -499,14 +566,66 @@
         return early.n > 0 && late.n > 0 && late.far > early.far * 1.5;
       })());
 
-      // THE CONTRACT. No telemetry, no drawing - and identical pixels to no stack at all.
+      // THE CONTRACT. No take, no drawing - and identical pixels to no stack at all.
       const none = Object.assign({}, base, { fx: [FX.create('cursor'), FX.create('ripple')] });
       const a = shoot(none, 2, 120, 213).data;
       const b = shoot(Object.assign({}, base), 2, 120, 213).data;
       let same = true;
       for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) { same = false; break; }
-      ok('a clip with NO telemetry paints pixel-identically with the effects on',
-        same);
+      ok('a clip with NO take paints pixel-identically with the effects on', same);
+
+      // ---- the window selection ------------------------------------------
+      //
+      // Authorable by hand as well as recordable, so unlike the pointer it carries no
+      // `needs` - a clip that was never performed over can still be annotated.
+      ok('the selection effect needs nothing recorded', !FX.DEFS.select.needs);
+      const selOf = (params, t) => {
+        const c = Object.assign({}, base, { fx: [FX.create('select')] });
+        Object.assign(c.fx[0].params, { showFrom: 0, showTo: 4, fadeIn: 0.2, fadeOut: 0.2 }, params);
+        return mark(shoot(c, t, 200, 356), 200, 356);
+      };
+      ok('a selection draws inside its own window and not outside it',
+        selOf({}, 1).n > 0 && selOf({}, 5).n === 0,
+        selOf({}, 1).n + ' px on, ' + selOf({}, 5).n + ' px off');
+      ok('it fades in rather than appearing',
+        selOf({}, 0.02).n < selOf({}, 1).n);
+      ok('every outline style paints something, and they differ from each other', (() => {
+        const b = selOf({ style: 'brackets' }, 1).n;
+        const d = selOf({ style: 'dashed' }, 1).n;
+        const o = selOf({ style: 'solid' }, 1).n;
+        return b > 0 && d > 0 && o > 0 && b !== d && d !== o;
+      })());
+      ok('"no outline" really draws no outline, so dim can be used alone',
+        selOf({ style: 'none' }, 1).n === 0);
+      ok('dim darkens OUTSIDE the box and leaves the inside alone', (() => {
+        const c = Object.assign({}, base, { fx: [FX.create('select')] });
+        Object.assign(c.fx[0].params,
+          { showFrom: 0, showTo: 4, fadeIn: 0.01, fadeOut: 0.01, style: 'none', dim: 0.8,
+            x: 0.25, y: 0.25, w: 0.5, h: 0.5 });
+        const img = shoot(c, 1, 200, 356);
+        const at = (fx2, fy) => {
+          const i = ((Math.round(fy * 356) * 200) + Math.round(fx2 * 200)) * 4;
+          return [img.data[i], img.data[i + 1], img.data[i + 2], img.data[i + 3]];
+        };
+        const inside = at(0.5, 0.5), outside = at(0.05, 0.05);
+        // The inside is the untouched plate; the outside is darker but still OPAQUE -
+        // an even-odd fill, not a hole punched through the clip's own layer.
+        return inside[0] === 0x20 && inside[2] === 0x80 &&
+          outside[2] < 0x80 && outside[3] === 255;
+      })());
+      ok('the marching dashes are a function of t, so two runs agree',
+        selOf({ style: 'dashed' }, 1.234).n === selOf({ style: 'dashed' }, 1.234).n);
+
+      // ---- an imported PNG pointer ---------------------------------------
+      ok('an undecodable PNG path falls back to the arrow rather than drawing nothing',
+        (() => {
+          const c = Object.assign({}, base, { mouse: take, fx: [FX.create('cursor')] });
+          c.fx[0].params.image = 'C:\\nope\\missing.png';
+          return mark(shoot(c, 1, 200, 356), 200, 356).n > 20;
+        })());
+      ok('preloading a stack with no images resolves rather than hanging',
+        FX.preloadImages([base]) instanceof Promise);
+      await FX.preloadImages([Object.assign({}, base, { fx: [FX.create('cursor')] })]);
 
       ok('both new types normalise and round-trip like every other effect', (() => {
         const c = { kind: 'video', fx: [{ type: 'cursor', params: { size: 'x' } }, { type: 'ripple' }] };
@@ -534,7 +653,10 @@
         start: 0, in: 0, out: 10, mediaDuration: 10,
         srcW: 1920, srcH: 1080, fps: 30,
         panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+        // BOTH, because they now do different jobs: telemetry feeds auto-zoom, and a
+        // performed take feeds the pointer. A real clip often carries only one.
         screen: tel(ev),
+        mouse: Cursor.makeTake(ev),
       });
       sortTracks();
       const live = () => allClips().map((x) => x.clip).find((c) => c.id === id);
@@ -546,6 +668,10 @@
       ok('the generator is NOT another effect in the stack menu',
         [...document.querySelectorAll('#inspector .fx-box .fx-add select option')]
           .every((o) => o.value !== 'autozoom'));
+      ok('the pointer effects are offered on a clip that HAS a take',
+        [...document.querySelectorAll('#inspector .fx-box .fx-add select option')]
+          .filter((o) => o.value === 'cursor' || o.value === 'ripple')
+          .every((o) => !o.disabled));
       ok('the panel says how many zooms the current settings would place, before ' +
         'anything is committed',
         /\d+ zooms?|No dwell/.test(
@@ -626,24 +752,30 @@
       c.fx = [FX.create('ripple')];
       const job = () => buildJob('C:\\out.mp4', { from: 0, to: 10 });
       const entryOf = (j) => j.clips.find((x) => x.id === id);
-      ok('a clip drawing from telemetry carries a digest of it onto the job',
-        !!entryOf(job()).screen && entryOf(job()).screen.n === c.screen.events.length);
+      ok('a clip drawing from a take carries a digest of it onto the job',
+        !!entryOf(job()).mouse && entryOf(job()).mouse.n === c.mouse.events.length);
       const k0 = jobCacheKey(job());
-      c.screen = tel(ev.concat([{ t: 9.5, x: 0.1, y: 0.1, type: 'down' }]).sort((a, b) => a.t - b.t));
-      ok('different telemetry is a different render, so it is a different cache key',
+      c.mouse = Cursor.makeTake(ev.concat([{ t: 9.5, x: 0.1, y: 0.1, type: 'down' }]));
+      ok('a different take is a different render, so it is a different cache key',
         jobCacheKey(job()) !== k0);
       const k1 = jobCacheKey(job());
-      c.panX = 0.5;
-      ok('...and the digest itself does not change when the clip is merely re-keyed',
-        JSON.stringify(entryOf(job()).screen) ===
-        JSON.stringify({ n: c.screen.events.length, t0: c.screen.events[0].t,
-          t1: c.screen.events[c.screen.events.length - 1].t, clicks: true }));
+      ok('...and the digest does not change when the clip is merely re-keyed',
+        JSON.stringify(entryOf(job()).mouse) ===
+        JSON.stringify({ n: c.mouse.events.length, t0: c.mouse.events[0].t,
+          t1: c.mouse.events[c.mouse.events.length - 1].t, clicks: true }));
       c.fx[0].enabled = false;
-      ok('a BYPASSED cursor effect drops the digest - those pixels no longer depend on it',
-        entryOf(job()).screen === undefined && jobCacheKey(job()) !== k1);
+      ok('a BYPASSED pointer effect drops the digest - those pixels no longer depend on it',
+        entryOf(job()).mouse === undefined && jobCacheKey(job()) !== k1);
       delete c.fx;
       ok('and a clip with no such effect never carried one',
-        entryOf(job()).screen === undefined);
+        entryOf(job()).mouse === undefined);
+      // Telemetry is back out of the key entirely: it decides no pixels any more, because
+      // auto-zoom bakes its answer into ordinary keyframes the job already carries.
+      c.fx = [FX.create('ripple')];
+      const k2 = jobCacheKey(job());
+      c.screen = tel(ev.slice(0, 5));
+      ok('screen telemetry is NOT in the render key - it describes the source, not pixels',
+        jobCacheKey(job()) === k2);
 
       // Leave the timeline as it was found.
       vt.clips.splice(vt.clips.findIndex((x) => x.id === id), 1);

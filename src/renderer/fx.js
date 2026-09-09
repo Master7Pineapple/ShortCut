@@ -46,10 +46,18 @@
   /** A fraction of the frame's shorter side, in pixels at the size being painted. */
   const pxMin = (f, W, H) => (Number(f) || 0) * Math.min(W, H);
 
-  /** Round-rect path built by hand, so it does not depend on a Canvas2D extension. */
-  function roundRectPath(c, x, y, w, h, r) {
+  /**
+   * A rounded rectangle as a SUBPATH - it adds to whatever path is already open and
+   * never calls `beginPath()`.
+   *
+   * That distinction is the whole reason this exists separately. A two-subpath path
+   * filled `evenodd` is how you darken everything OUTSIDE a shape, and the version below
+   * that opens with `beginPath()` silently threw the outer rectangle away when it was
+   * used that way - so the selection's `dim` darkened the inside of the box instead of
+   * the outside. Anything building a hole needs this one.
+   */
+  function roundRectSub(c, x, y, w, h, r) {
     const rr = Math.max(0, Math.min(r, w / 2, h / 2));
-    c.beginPath();
     if (rr <= 0) { c.rect(x, y, w, h); return; }
     c.moveTo(x + rr, y);
     c.arcTo(x + w, y, x + w, y + h, rr);
@@ -57,6 +65,12 @@
     c.arcTo(x, y + h, x, y, rr);
     c.arcTo(x, y, x + w, y, rr);
     c.closePath();
+  }
+
+  /** The same shape as its own fresh path, which is what most callers want. */
+  function roundRectPath(c, x, y, w, h, r) {
+    c.beginPath();
+    roundRectSub(c, x, y, w, h, r);
   }
 
   function hexToRgb(hex) {
@@ -67,6 +81,60 @@
   function rgba(hex, a) {
     const c = hexToRgb(hex);
     return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + clamp(a, 0, 1) + ')';
+  }
+
+  // ------------------------------------------------------------- imported pointers
+
+  /**
+   * PNG pointers, held by path.
+   *
+   * `draw()` is synchronous and must never stall - `loop()` re-arms in a `finally` so a
+   * bad frame costs a frame and never the session - so this hands back `null` while an
+   * image is still decoding and the caller falls back to the built-in arrow. That is
+   * correct for the viewer, where the next frame is 16 ms away, and NOT correct for the
+   * baker, where a frame is written once and a miss would be baked in. `preloadImages()`
+   * is what the baker calls first; see its comment.
+   */
+  const imgCache = new Map();
+  function pointerImage(path) {
+    const key = String(path || '');
+    if (!key) return null;
+    let rec = imgCache.get(key);
+    if (!rec) {
+      if (typeof Image === 'undefined') return null;
+      rec = { el: new Image(), failed: false };
+      rec.el.onerror = () => { rec.failed = true; };
+      rec.el.src = 'file:///' + key.replace(/\\/g, '/').replace(/^\/+/, '');
+      imgCache.set(key, rec);
+    }
+    if (rec.failed) return null;
+    return rec.el.complete && rec.el.naturalWidth ? rec.el : null;
+  }
+
+  /**
+   * Decode every imported pointer a set of clips needs, before anything is baked.
+   *
+   * The preview can afford to miss one and draw the arrow instead; the export cannot,
+   * because the frame it missed on is in the file forever. So the baker awaits this and
+   * the two then paint the same picture - which is the one invariant this whole
+   * architecture exists to keep. A pointer that will not decode resolves anyway: a
+   * missing file must not hang a render, and the arrow is a defensible fallback.
+   */
+  function preloadImages(clips) {
+    const paths = new Set();
+    for (const c of (clips || [])) {
+      for (const f of ((c && c.fx) || [])) {
+        if (f && f.type === 'cursor' && f.params && f.params.image) paths.add(f.params.image);
+      }
+    }
+    return Promise.all([...paths].map((path) => new Promise((done) => {
+      if (pointerImage(path)) return done();
+      const rec = imgCache.get(String(path));
+      if (!rec || rec.failed) return done();
+      rec.el.addEventListener('load', () => done(), { once: true });
+      rec.el.addEventListener('error', () => done(), { once: true });
+      setTimeout(done, 3000);      // a slow or dead path costs three seconds, not the render
+    })));
   }
 
   // ------------------------------------------------------------------ the layer
@@ -150,7 +218,14 @@
     },
 
     round: {
-      label: 'Corners + shadow',
+      // NOT a vignette, and the label says so because the confusion is a fair one: on a
+      // FULL-FRAME clip the rounded rect IS the whole frame, so the shadow it casts falls
+      // entirely outside the canvas and all that is left to see is the corners cut to
+      // transparency with black showing through. It only reads as a shadow once the layer
+      // is smaller than the frame - put a `transform` at scale 0.9 ABOVE it and the
+      // shadow appears in the gap that opens. Darkening the frame's own edges is a
+      // different pass entirely.
+      label: 'Corners + shadow (scale the layer down first)',
       params: { radius: 0.04, colour: '#000000', shadow: 0.5, blur: 0.03, offsetX: 0, offsetY: 0.012 },
       schema: [
         { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.5, step: 0.002, digits: 3 },
@@ -314,8 +389,8 @@
     // its transform to the end of the stack for exactly this reason.
 
     cursor: {
-      label: 'Cursor (recording)',
-      needs: 'screen',
+      label: 'Cursor (performed)',
+      needs: 'mouse',
       params: {
         size: Cursor.DEFAULTS.cursor.size,
         smooth: Cursor.DEFAULTS.cursor.smooth,
@@ -323,9 +398,11 @@
         punch: Cursor.DEFAULTS.cursor.punch,
         punchDur: Cursor.DEFAULTS.cursor.punchDur,
         opacity: 1,
-        conceal: 0.035,
         colour: '#ffffff',
         outline: '#10161c',
+        image: '',
+        hotspotX: 0,
+        hotspotY: 0,
       },
       schema: [
         { path: 'params.size', label: 'Pointer size', type: 'range', min: 0.01, max: 0.15, step: 0.002, digits: 3 },
@@ -334,82 +411,81 @@
         { path: 'params.punch', label: 'Click punch', type: 'range', min: 1, max: 2.5, step: 0.01, digits: 2 },
         { path: 'params.punchDur', label: 'Punch length', type: 'range', min: 0.05, max: 1, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
-        { path: 'params.conceal', label: 'Conceal', type: 'range', min: 0, max: 0.12, step: 0.002, digits: 3 },
         { path: 'params.colour', label: 'Pointer', type: 'color' },
         { path: 'params.outline', label: 'Outline', type: 'color' },
+        { path: 'params.hotspotX', label: 'PNG hotspot X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.hotspotY', label: 'PNG hotspot Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
       ],
       /**
-       * The recorded pointer covered over, and a replacement drawn on the smoothed path.
+       * A pointer drawn on the smoothed path of an ON-RENDER take.
        *
-       * `conceal` is a COVER, not an inpaint, and the panel says so. It clips a small box
-       * at the recorded hotspot and refills it with the layer's own pixels from a little
-       * to the right - which is right over a flat toolbar and wrong over a hard vertical
-       * edge. Removing a compositor's cursor from pixels properly is a matting problem;
-       * covering it is four lines, and the honest answer to "I can still see the old one"
-       * is to record with the cursor off, which is a recorder setting and not this file's
-       * business. Zero disables it, and a capture with no drawn cursor wants zero.
+       * THERE IS NOTHING TO CONCEAL, and that is why this reads `clip.mouse` rather than
+       * `clip.screen`. A screen capture has a real cursor baked into its pixels, so
+       * drawing a second one over it gave two pointers chasing each other and an earlier
+       * version of this effect spent a `conceal` parameter smearing neighbouring pixels
+       * over the first one - a cover, not an inpaint, and wrong over any hard edge. A
+       * performed take is recorded over a picture that never had a pointer in it, so the
+       * drawn one is the only one and the whole problem is gone rather than patched.
+       * Screen captures keep auto-zoom, which has no cursor in it.
        *
-       * The replacement is drawn from `Cursor.smoothAt()`, so it lags and eases; the
-       * scale punch comes from `Cursor.punchAt()`, which is a function of the click times
-       * and nothing else - it cannot drift between the preview and the export, because
-       * neither of them is integrating anything.
+       * The path comes from `Cursor.smoothAt()`, so it lags and eases; the scale punch
+       * comes from `Cursor.punchAt()`, a function of the click times and nothing else -
+       * neither can drift between the preview and the export, because neither is
+       * integrating anything.
+       *
+       * `image` swaps the built-in arrow for an imported PNG, drawn about its own
+       * hotspot. It falls back to the arrow while the file is still decoding, which the
+       * viewer can afford and the baker cannot - see `preloadImages()`.
        */
       draw(L, p, t, e, clip) {
-        const scr = clip && clip.screen;
-        if (!Cursor.has(scr)) return;
+        const mouse = clip && clip.mouse;
+        if (!Cursor.has(mouse)) return;
         const W = L.W, H = L.H;
         const ts = (Number(clip.in) || 0) + t;
-        const map = Cursor.mapper(clip, W, H);
-        const S = pxMin(p.size, W, H);
-
-        if (p.conceal > 0) {
-          const raw = Cursor.rawAt(scr, ts);
-          if (raw) {
-            const q = map(raw.x, raw.y);
-            const d = pxMin(p.conceal, W, H);
-            const src = take(L, 'fxA');
-            L.c.drawImage(src, 0, 0);
-            L.c.save();
-            L.c.beginPath();
-            L.c.rect(q.x - d * 0.25, q.y - d * 0.25, d * 1.5, d * 1.9);
-            L.c.clip();
-            L.c.drawImage(src, d * 1.9, 0);
-            L.c.restore();
-          }
-        }
-
-        const pt = Cursor.smoothAt(scr, ts, { smooth: p.smooth, lag: p.lag });
+        const pt = Cursor.smoothAt(mouse, ts, { smooth: p.smooth, lag: p.lag });
         if (!pt) return;
-        const at = map(pt.x, pt.y);
-        const punch = Cursor.punchAt(scr, ts, { punch: p.punch, punchDur: p.punchDur });
-        const s = S * punch;
+        const at = Cursor.mapperFor(clip, mouse, W, H)(pt.x, pt.y);
+        const punch = Cursor.punchAt(mouse, ts, { punch: p.punch, punchDur: p.punchDur });
+        const s = pxMin(p.size, W, H) * punch;
+
         L.c.save();
         L.c.globalAlpha = clamp(p.opacity, 0, 1);
         L.c.translate(at.x, at.y);
         L.c.scale(s, s);
-        // The classic arrow, in units of the pointer's own width, hotspot at (0, 0).
-        L.c.beginPath();
-        L.c.moveTo(0, 0);
-        L.c.lineTo(0, 1.0);
-        L.c.lineTo(0.28, 0.73);
-        L.c.lineTo(0.45, 1.12);
-        L.c.lineTo(0.62, 1.05);
-        L.c.lineTo(0.45, 0.66);
-        L.c.lineTo(0.72, 0.62);
-        L.c.closePath();
-        L.c.fillStyle = String(p.colour || '#ffffff');
-        L.c.strokeStyle = String(p.outline || '#10161c');
-        L.c.lineWidth = 0.07;
-        L.c.lineJoin = 'round';
-        L.c.fill();
-        L.c.stroke();
+
+        const img = p.image ? pointerImage(p.image) : null;
+        if (img) {
+          // Scaled to the pointer's own height so a tall PNG and a wide one both come out
+          // the size the slider says, and offset by the hotspot so the click lands where
+          // the artwork points rather than at its top-left corner.
+          const ar = img.naturalWidth / Math.max(1, img.naturalHeight);
+          const h = 1.4, w = h * ar;
+          L.c.drawImage(img, -clamp(p.hotspotX, 0, 1) * w, -clamp(p.hotspotY, 0, 1) * h, w, h);
+        } else {
+          // The classic arrow, in units of the pointer's own width, hotspot at (0, 0).
+          L.c.beginPath();
+          L.c.moveTo(0, 0);
+          L.c.lineTo(0, 1.0);
+          L.c.lineTo(0.28, 0.73);
+          L.c.lineTo(0.45, 1.12);
+          L.c.lineTo(0.62, 1.05);
+          L.c.lineTo(0.45, 0.66);
+          L.c.lineTo(0.72, 0.62);
+          L.c.closePath();
+          L.c.fillStyle = String(p.colour || '#ffffff');
+          L.c.strokeStyle = String(p.outline || '#10161c');
+          L.c.lineWidth = 0.07;
+          L.c.lineJoin = 'round';
+          L.c.fill();
+          L.c.stroke();
+        }
         L.c.restore();
       },
     },
 
     ripple: {
       label: 'Click ripples',
-      needs: 'screen',
+      needs: 'mouse',
       params: {
         size: Cursor.DEFAULTS.ripple.size,
         dur: Cursor.DEFAULTS.ripple.dur,
@@ -434,17 +510,17 @@
        * is the brand accent, hardcoded until step 17 hands the brand kit over -
        * `Cursor.ACCENT` is the one place it lives, so that step changes one constant.
        *
-       * A recording whose sidecar says `clicks: false` - the watcher was unavailable -
-       * carries no mouse-downs at all, so this draws nothing, which is the right answer.
+       * A take with no clicks in it carries no mouse-downs at all, so this draws
+       * nothing, which is the right answer.
        */
       draw(L, p, t, e, clip) {
-        const scr = clip && clip.screen;
-        if (!Cursor.has(scr)) return;
+        const mouse = clip && clip.mouse;
+        if (!Cursor.has(mouse)) return;
         const W = L.W, H = L.H;
         const ts = (Number(clip.in) || 0) + t;
-        const rings = Cursor.ripplesAt(scr, ts, { dur: p.dur });
+        const rings = Cursor.ripplesAt(mouse, ts, { dur: p.dur });
         if (!rings.length) return;
-        const map = Cursor.mapper(clip, W, H);
+        const map = Cursor.mapperFor(clip, mouse, W, H);
         const R = pxMin(p.size, W, H);
         const lw = pxMin(p.width, W, H);
         L.c.save();
@@ -457,6 +533,148 @@
           L.c.lineWidth = Math.max(0.5, lw * (1 - r.k * 0.6));
           L.c.beginPath();
           L.c.arc(q.x, q.y, Math.max(0.5, R * grow), 0, Math.PI * 2);
+          L.c.stroke();
+        }
+        L.c.restore();
+      },
+    },
+
+    select: {
+      label: 'Window selection',
+      params: {
+        x: 0.12, y: 0.32, w: 0.76, h: 0.3,
+        style: 'brackets',
+        colour: Cursor.ACCENT,
+        width: 0.005,
+        radius: 0.02,
+        dim: 0,
+        showFrom: 0,
+        showTo: 9999,
+        fadeIn: 0.28,
+        fadeOut: 0.28,
+        opacity: 1,
+      },
+      schema: [
+        { path: 'params.style', label: 'Style', type: 'select',
+          options: [
+            { value: 'brackets', label: 'Corner brackets' },
+            { value: 'dashed', label: 'Dashed marquee' },
+            { value: 'solid', label: 'Outline + glow' },
+            { value: 'none', label: 'No outline (dim only)' },
+          ] },
+        { path: 'params.x', label: 'X', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.y', label: 'Y', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.w', label: 'Width', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.h', label: 'Height', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.width', label: 'Line width', type: 'range', min: 0.001, max: 0.03, step: 0.0005, digits: 4 },
+        { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.2, step: 0.002, digits: 3 },
+        { path: 'params.dim', label: 'Dim outside', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.showFrom', label: 'On at', type: 'range', min: 0, max: 60, step: 0.05, unit: 's', digits: 2 },
+        { path: 'params.showTo', label: 'Off at', type: 'range', min: 0, max: 60, step: 0.05, unit: 's', digits: 2 },
+        { path: 'params.fadeIn', label: 'Fade in', type: 'range', min: 0, max: 2, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.fadeOut', label: 'Fade out', type: 'range', min: 0, max: 2, step: 0.01, unit: 's', digits: 2 },
+      ],
+      /**
+       * The animated window selection: a rectangle that arrives, holds and leaves.
+       *
+       * Recorded by the on-render pass as tagged keys on `x/y/w/h` - the same generator
+       * pattern auto-zoom uses, so a box dragged out in a hurry can be nudged afterwards
+       * instead of re-performed - and equally authorable by hand on a clip that was never
+       * recorded over. That is why it carries no `needs`: unlike the pointer, a selection
+       * box does not require anything to have been recorded.
+       *
+       * THE ENVELOPE IS A FUNCTION OF `t` AND NOTHING ELSE. It fades and scales in over
+       * `fadeIn`, holds, and leaves over `fadeOut`, all computed from the clip-local time
+       * alone - no state, no accumulation, so a scrub backwards and a baker visiting
+       * frames out of order paint the same picture. The marching dashes are the same: the
+       * dash offset is `t * speed`, not an incrementing counter, which is the only reason
+       * the preview and the export agree on where the dashes are.
+       *
+       * `dim` darkens everything OUTSIDE the box, and it does it with an even-odd fill
+       * rather than by clearing the middle. Clearing would punch a transparent hole
+       * through the clip's own layer and let whatever is under it come through, which is
+       * the opposite of lighting one region of this clip.
+       */
+      draw(L, p, t, e, clip) {
+        const W = L.W, H = L.H;
+        const t0 = Number(p.showFrom) || 0;
+        const t1 = Number(p.showTo);
+        if (t < t0 || (isFinite(t1) && t > t1)) return;
+
+        // The entry/exit envelope, eased out so it lands softly at both ends.
+        const fi = Math.max(1e-4, Number(p.fadeIn) || 0);
+        const fo = Math.max(1e-4, Number(p.fadeOut) || 0);
+        let k = 1;
+        if (t < t0 + fi) k = (t - t0) / fi;
+        if (isFinite(t1) && t > t1 - fo) k = Math.min(k, (t1 - t) / fo);
+        k = clamp(k, 0, 1);
+        const ease = 1 - Math.pow(1 - k, 3);
+        const alpha = clamp(p.opacity, 0, 1) * ease;
+        if (alpha <= 0.002) return;
+
+        // Overshoot on the way in: the box arrives slightly large and settles.
+        const grow = (1 - ease) * 0.06;
+        const rw = (Number(p.w) || 0) * W, rh = (Number(p.h) || 0) * H;
+        const rx = (Number(p.x) || 0) * W - grow * rw;
+        const ry = (Number(p.y) || 0) * H - grow * rh;
+        const bw = rw * (1 + grow * 2), bh = rh * (1 + grow * 2);
+        if (!(bw > 0.5 && bh > 0.5)) return;
+        const r = pxMin(p.radius, W, H);
+        const lw = Math.max(0.5, pxMin(p.width, W, H));
+
+        L.c.save();
+        L.c.globalAlpha = alpha;
+
+        if (p.dim > 0) {
+          // Even-odd: the frame with the box punched out of the PATH, not out of the
+          // pixels. Filling that darkens the outside and leaves the middle untouched.
+          L.c.save();
+          L.c.beginPath();
+          L.c.rect(0, 0, W, H);
+          roundRectSub(L.c, rx, ry, bw, bh, r);   // SUBPATH - see roundRectSub()
+          L.c.fillStyle = 'rgba(0,0,0,' + clamp(p.dim, 0, 1) + ')';
+          L.c.fill('evenodd');
+          L.c.restore();
+        }
+
+        const colour = String(p.colour || Cursor.ACCENT);
+        L.c.strokeStyle = colour;
+        L.c.lineWidth = lw;
+        L.c.lineCap = 'round';
+        L.c.lineJoin = 'round';
+
+        if (p.style === 'solid') {
+          L.c.shadowColor = rgba(colour, 0.9);
+          L.c.shadowBlur = lw * 4;
+          roundRectPath(L.c, rx, ry, bw, bh, r);
+          L.c.stroke();
+        } else if (p.style === 'dashed') {
+          const dash = Math.max(2, lw * 3);
+          L.c.setLineDash([dash, dash]);
+          // Marching, as a pure function of time: 60 px a second at the frame's scale.
+          L.c.lineDashOffset = -(t * Math.min(W, H) * 0.11) % (dash * 2);
+          roundRectPath(L.c, rx, ry, bw, bh, r);
+          L.c.stroke();
+          L.c.setLineDash([]);
+        } else if (p.style === 'brackets') {
+          // Four L-shaped corners, each a fixed fraction of the shorter side of the box,
+          // so a wide selection and a tall one get the same-looking corners.
+          const arm = Math.min(bw, bh) * 0.26;
+          const x0 = rx, y0 = ry, x1 = rx + bw, y1 = ry + bh;
+          const L4 = [
+            [[x0, y0 + arm], [x0, y0], [x0 + arm, y0]],
+            [[x1 - arm, y0], [x1, y0], [x1, y0 + arm]],
+            [[x1, y1 - arm], [x1, y1], [x1 - arm, y1]],
+            [[x0 + arm, y1], [x0, y1], [x0, y1 - arm]],
+          ];
+          L.c.beginPath();
+          for (const seg of L4) {
+            L.c.moveTo(seg[0][0], seg[0][1]);
+            L.c.lineTo(seg[1][0], seg[1][1]);
+            L.c.lineTo(seg[2][0], seg[2][1]);
+          }
           L.c.stroke();
         }
         L.c.restore();
@@ -629,8 +847,9 @@
     DEFS, TYPES,
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
+    pointerImage, preloadImages,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
-    roundRectPath, pxMin, rgba,
+    roundRectPath, roundRectSub, pxMin, rgba,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else if (typeof window !== 'undefined') window.FX = API;
