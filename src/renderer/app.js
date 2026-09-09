@@ -1773,6 +1773,171 @@ function clipFxPanel(clip) {
   });
   addRow.appendChild(add);
   box.appendChild(addRow);
+
+  const az = autoZoomPanel(clip);
+  if (az) box.appendChild(az);
+  return box;
+}
+
+// ---- auto-zoom: a generator, not an effect -------------------------------
+//
+// The design point of the whole feature, stated once: auto-zoom writes ORDINARY `Anim`
+// keyframes onto an ordinary `transform` effect, and then gets out of the way. It does
+// not draw anything, it owns no state at render time, and there is no "auto-zoom mode"
+// to be in. What comes out is what a patient author would have keyed by hand, sitting on
+// the same strip with the same handles, so the answer to "the third one goes too far" is
+// to drag it rather than to fight a slider that regenerates everything.
+//
+// The keys it writes are TAGGED (`gen:'autozoom'`), which is what makes regenerating
+// safe: `Cursor.applyGenerated()` replaces the tagged ones and leaves anything the author
+// added alone. Without the tag, Regenerate would either double the animation or destroy
+// hand work, and both of those turn a generator back into a black box.
+
+/** The transform this generator owns on a clip, created on demand. `null` if absent. */
+function autoZoomFx(clip, create) {
+  if (!clip) return null;
+  const found = (clip.fx || []).find((f) => f && f.type === 'transform' && f.gen === 'autozoom');
+  if (found || !create) return found || null;
+  if (!Array.isArray(clip.fx)) clip.fx = [];
+  const e = FX.create('transform');
+  e.gen = 'autozoom';
+  // APPENDED, so it draws last. `cursor` and `ripple` paint at the pixel the framing put
+  // the telemetry on; a transform after them moves the picture and the pointer together,
+  // which is what makes the zoom carry its own cursor with it. Before them it would dive
+  // into the frame while the pointer sat still on top of the result.
+  clip.fx.push(e);
+  return e;
+}
+
+/**
+ * The generator's settings, which live on the effect once there is one.
+ *
+ * Before the first Generate there is nothing to hang them on, so the panel edits a
+ * session-level copy and the first generation carries it onto the effect. After that the
+ * settings travel with the clip - they are what a Regenerate two days later has to reuse,
+ * and they are plain JSON like everything else that lands on a clip.
+ */
+const autoZoomDefaults = JSON.parse(JSON.stringify(Cursor.DEFAULTS.zoom));
+function autoZoomSettings(clip) {
+  const e = autoZoomFx(clip, false);
+  if (e) {
+    e.autozoom = Object.assign({}, Cursor.DEFAULTS.zoom, e.autozoom || {});
+    return e.autozoom;
+  }
+  return autoZoomDefaults;
+}
+
+/** What the current settings WOULD produce, without touching the clip. */
+function autoZoomPreview(clip) {
+  if (!ScreenTel.hasTelemetry(clip)) return { segments: [], keys: { x: [], y: [], scale: [] } };
+  return Cursor.autoZoom(clip.screen, clip,
+    Object.assign({}, autoZoomSettings(clip), { aspect: state.out.w / state.out.h }));
+}
+
+/**
+ * Generate (or regenerate) the zoom. ONE undo entry, then a full rebuild.
+ *
+ * A run that finds no dwell long enough is not an error and not a no-op to be silent
+ * about: if there is an existing generation it is CLEARED, because the settings the
+ * author just moved say those zooms should not be there. With no existing generation and
+ * nothing to place, nothing is pushed onto the undo stack at all - an undo entry for an
+ * operation that changed nothing is worse than no feedback.
+ */
+function applyAutoZoom(clip) {
+  const res = autoZoomPreview(clip);
+  const existing = autoZoomFx(clip, false);
+  if (!res.segments.length && !existing) return res;
+  pushUndo();
+  const e = autoZoomFx(clip, true);
+  e.autozoom = JSON.parse(JSON.stringify(autoZoomSettings(clip)));
+  Cursor.applyGenerated(e, res.keys);
+  FX.normalizeClip(clip);
+  markDirty();
+  renderAll();
+  return res;
+}
+
+/**
+ * Drop the generation. The effect goes too if nothing is left of it - a transform with
+ * default parameters and no keys draws the identity, but it still takes the clip off the
+ * render fast path, so leaving one behind would quietly cost every future export.
+ */
+function clearAutoZoom(clip) {
+  const e = autoZoomFx(clip, false);
+  if (!e) return;
+  pushUndo();
+  Cursor.clearGenerated(e);
+  if (!e.keys) clip.fx.splice(clip.fx.indexOf(e), 1);
+  FX.normalizeClip(clip);
+  markDirty();
+  renderAll();
+}
+
+/**
+ * The auto-zoom section of the effect panel.
+ *
+ * Only for a clip that actually carries telemetry: without it there is nothing to
+ * analyse, and a row of dead sliders is worse than no row. That is the same degradation
+ * contract the two effects keep, shown rather than described.
+ *
+ * The sliders push NO undo entry, exactly like Tighten's threshold and pad - they are
+ * settings for an operation, not the operation. What they do change, live, is the count
+ * of zooms they would place, so the sensitivity is judged before it is committed rather
+ * than by generating and undoing three times.
+ */
+function autoZoomPanel(clip) {
+  if (!ScreenTel.hasTelemetry(clip)) return null;
+  const el = TextUI.el;
+  const settings = autoZoomSettings(clip);
+  // Its own class, NOT `fx-box`: the stack panel's box is how the suites find the
+  // stack, and a generator answering to that selector would make them find two.
+  const box = el('div', 'fx-az');
+
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'Auto-zoom'));
+  const owned = Cursor.countGenerated(autoZoomFx(clip, false));
+  head.appendChild(el('span', 'tc-hint', owned ? owned + ' generated keys' : 'not generated'));
+  box.appendChild(head);
+
+  box.appendChild(el('div', 'tc-hint fx-note',
+    'Reads the recorded cursor and writes ordinary keyframes onto a Transform effect, ' +
+    'which you can then drag, retime or delete like any others. Regenerating replaces ' +
+    'what it wrote last time and leaves keys you added alone.'));
+
+  const count = el('div', 'tc-hint');
+  const refresh = () => {
+    const n = autoZoomPreview(clip).segments.length;
+    count.textContent = n ? n + ' zoom' + (n === 1 ? '' : 's') + ' at these settings'
+      : 'No dwell long enough at these settings.';
+  };
+
+  const hooks = {
+    // Settings, not timeline state: no snapshot, no dirty flag - the same treatment the
+    // Tighten panel's own controls get, and for the same reason.
+    onEdit: () => {}, onEditEnd: () => {}, onChanged: refresh,
+    rebuild: () => {},
+  };
+  const holder = { params: settings };
+  const C = (spec) => TextUI.control(spec, holder, { params: Cursor.DEFAULTS.zoom }, hooks);
+  box.appendChild(C({ path: 'params.sensitivity', label: 'Sensitivity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+  box.appendChild(C({ path: 'params.minHold', label: 'Min hold', type: 'range', min: 0.2, max: 5, step: 0.05, unit: 's', digits: 2 }));
+  box.appendChild(C({ path: 'params.maxZoom', label: 'Max zoom', type: 'range', min: 1, max: 4, step: 0.05, digits: 2 }));
+  box.appendChild(C({ path: 'params.ramp', label: 'Ramp', type: 'range', min: 0.05, max: 2, step: 0.05, unit: 's', digits: 2 }));
+  box.appendChild(C({ path: 'params.curve', label: 'Easing', type: 'select', options: Object.keys(Anim.EASING_PRESETS) }));
+  refresh();
+  box.appendChild(count);
+
+  const row = el('div', 'fx-add');
+  const gen = el('button', 'mini', owned ? 'Regenerate' : 'Generate');
+  gen.title = 'Write zoom keyframes from the recorded cursor. One undo entry.';
+  gen.addEventListener('click', () => applyAutoZoom(clip));
+  row.appendChild(gen);
+  const clr = el('button', 'mini', 'Clear generated');
+  clr.disabled = !owned;
+  clr.title = 'Remove the keys this generated, leaving any you added by hand.';
+  clr.addEventListener('click', () => clearAutoZoom(clip));
+  row.appendChild(clr);
+  box.appendChild(row);
   return box;
 }
 
@@ -4525,6 +4690,13 @@ function buildJob(outPath, range) {
         // it out and turning up a blur would hit the cached render of the old picture.
         // ffmpeg never sees it - the baker has already drawn it by the time main runs.
         fx: c.fx && c.fx.length ? JSON.parse(JSON.stringify(c.fx)) : undefined,
+        // Telemetry itself stays off the job - it is thousands of samples and it
+        // describes the source, not the pixels. But a `cursor` or `ripple` effect DRAWS
+        // from it, and from step 9 that means the picture depends on something the key
+        // could not otherwise see: two cuts of the same file with different sidecars
+        // would share a cached render. A digest is enough, because a sidecar is written
+        // once and never edited - what changes is which one is attached.
+        screen: screenDigest(c),
         visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
           t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
@@ -4586,6 +4758,23 @@ function buildJob(outPath, range) {
  * `outPath` is excluded deliberately - rendering the same content to a new filename is a
  * copy, not an encode.
  */
+/**
+ * The smallest thing that says WHICH telemetry a clip carries, for the render cache.
+ *
+ * `undefined` - so it serialises away entirely - unless the clip both has telemetry and
+ * carries an effect that draws from it. A clip whose cursor effect is bypassed is a clip
+ * whose pixels do not depend on the cursor, and it must key the same as one that never
+ * had the effect at all.
+ */
+function screenDigest(c) {
+  if (!ScreenTel.hasTelemetry(c)) return undefined;
+  const uses = (c.fx || []).some((f) =>
+    f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'screen');
+  if (!uses) return undefined;
+  const ev = c.screen.events;
+  return { n: ev.length, t0: ev[0].t, t1: ev[ev.length - 1].t, clicks: !!c.screen.clicks };
+}
+
 function jobCacheKey(job) {
   const copy = Object.assign({}, job);
   delete copy.outPath;

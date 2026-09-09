@@ -35,7 +35,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-two suites:
+There are twenty-three suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -160,6 +160,20 @@ There are twenty-two suites:
   after Record was pressed, and that the recording imports with its telemetry attached. It
   reuses `clip1.mp4` from `smoke.js`, copying it rather than writing a sidecar next to the
   shared fixture, and *skips* the live capture on a machine that offers no display.
+- `tools/smoke-cursor.js` — the screen-recording treatment: that smoothing a straight
+  path returns it *exactly* (a filter that bends a straight line is bending everything
+  else too) while a jittery one comes back five times calmer, that lag is a shift of the
+  sample time rather than a frame-rate-dependent blend, that the source-to-frame map lands
+  on the pixel `drawClipTo()` painted a marker on, ripple and click-punch timing against
+  the click events, and — for the generator — minimum hold enforced on a deliberately
+  jittery input, maximum zoom respected, the zoomed window never panned off the frame's
+  own edge, a clip trimmed into the middle of a dwell opening already zoomed, and the
+  headline: applying the generated transform puts the dwell in the middle of the frame.
+  Then the generator's contract on a real clip — tagged keys, one undo entry, regenerating
+  replacing rather than doubling, a hand-added key surviving it untouched, and the
+  telemetry digest entering and leaving the render cache key with the effect that reads
+  it. **It needs no fixture and no recording**: every path is synthetic, which is exactly
+  why the answers can be asserted to the last bit instead of approximately.
 
 `tools/smoke.js` is a 26-assertion test of the timeline logic — import ordering, A/V
 linking, split, ripple delete, undo/redo, trimming, the render job, and project
@@ -220,6 +234,7 @@ tools/smoke-layers.js     alpha compositing + stills-on-the-timeline test suite
 tools/smoke-bakefirst.js  bake-first rendering: fast path, composite bake, parity
 tools/smoke-fx.js         the per-clip effect stack: each effect, order, keys, parity
 tools/smoke-recorder.js   the screen recorder: telemetry shape, alignment, degradation
+tools/smoke-cursor.js     cursor smoothing, click ripples, the auto-zoom generator
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -229,6 +244,8 @@ src/renderer/styles.css   all styling; colors live in :root custom properties
 src/renderer/app.js       the editor: state, timeline, preview, editing ops, shortcuts
 src/renderer/anim.js      the keyframe engine: easing curves, tracks, the keyable registry
 src/renderer/fx.js        the visual effect stack: one draw per type, no ffmpeg half
+src/renderer/cursor.js    screen-recording treatment, the pure half: smoothing, ripple
+                          timing, source->frame mapping, the auto-zoom generator
 src/renderer/text/model.js  text cards: defaults, animation layers, how they compose with keys
 src/renderer/text/draw.js   text cards: all canvas painting (preview AND export)
 src/renderer/text/ui.js     text cards: the editor panel
@@ -246,8 +263,10 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
 files are plain `<script>` globals (`TextModel`, `TextDraw`, `TextUI`)
-loaded before `app.js`; `anim.js` (`Anim`) is loaded before all of them and `fx.js` (`FX`)
-straight after it, because every effect parameter reads its animated value through `Anim`. `TextUI` never touches `app.js` globals - it is wired up through
+loaded before `app.js`; `anim.js` (`Anim`) is loaded before all of them, then `cursor.js`
+(`Cursor`) and `fx.js` (`FX`) — in that order, because every effect parameter reads its
+animated value through `Anim` and the two screen-recording effects read their geometry
+through `Cursor`. `TextUI` never touches `app.js` globals - it is wired up through
 the hooks object passed to `TextUI.init()` near the bottom of `app.js`.
 
 `app.js` is organised in ten numbered sections (search for `// ===`), in this order:
@@ -464,7 +483,7 @@ Plain JSON, ordered, and **absent by default** — `FX.normalizeClip()` deletes 
 again once the last effect goes, so a project that uses no effects serialises exactly as
 it did before this existed.
 
-Five types ship in this step, and each one is **one function**:
+Seven types ship so far, and each one is **one function**:
 
 | Type | What it draws |
 | --- | --- |
@@ -473,10 +492,18 @@ Five types ship in this step, and each one is **one function**:
 | `inset` | crops the layer in from any edge, to transparency |
 | `blur` | a padded, non-magnifying gaussian |
 | `grade` | lift / gamma / gain, saturation, contrast, temperature |
+| `cursor` | a smoothed replacement pointer, drawn from the recording's telemetry |
+| `ripple` | an expanding ring at each recorded mouse-down |
 
 Adding a type is one entry in `FX.DEFS` — its label, its default parameters, its
 inspector schema and its `draw()`. The panel, the keyframe strips, the serialisation, the
 normalisation and the "add an effect" menu all build themselves from that entry.
+
+`draw(L, p, t, entry, clip)` takes the clip as its fifth argument, and exactly two effects
+use it: `cursor` and `ripple` read step 8's telemetry, which lives on the clip and could
+never be a parameter — it is thousands of samples. **Nothing else may reach for it.** An
+effect that read `clip.start` from there would be putting a clip's timeline position into
+its own pixels, which is the one thing the render cache's key rules forbid.
 
 #### One implementation, because step 6 earned it
 
@@ -884,7 +911,8 @@ Recording the cursor as *data* is the whole point of doing this before the curso
 effects rather than after. Recovering a pointer path and its clicks from the pixels is
 possible and fragile: the cursor changes shape, disappears over video, and a click leaves
 no mark at all. Sampled at capture time it is exact, free, and it is what makes step 9's
-auto-zoom and step 14's click SFX authoring work instead of a computer-vision project.
+auto-zoom (see "Screen-recording treatment") and step 14's click SFX authoring work
+instead of a computer-vision project.
 
 #### Three processes, because the three signals live in three places
 
@@ -987,8 +1015,18 @@ clipClicks(clip)             // mouse-downs inside the clip's span, retimed to i
 
 Both go through `clip.in`, the same way `mediaFor()` and the framing maths do. `screen`
 is plain JSON on the clip like everything else, because undo is `JSON.stringify` of the
-track list — and it never reaches `buildJob()`, so it is not in the render cache key. It
-describes the source, not the pixels.
+track list.
+
+The telemetry itself never reaches `buildJob()` — it is thousands of samples, and it
+describes the source rather than the pixels. But from step 9 it can *decide* pixels: a
+`cursor` or `ripple` effect draws from it, and a cache key that could not see it would let
+two cuts of the same file with different sidecars share one cached render. So `buildJob()`
+carries a **digest** — `screenDigest()`, four numbers: how many events, the first and last
+timestamp, and whether clicks are trustworthy. It is `undefined` unless the clip both has
+telemetry *and* carries an enabled effect that reads it, so a bypassed cursor effect keys
+identically to no cursor effect at all, and a recording with no treatment on it adds
+nothing to the key. A sidecar is written once and never edited; what changes is which one
+is attached, and four numbers say that.
 
 #### The container has to be remuxed
 
@@ -1011,6 +1049,128 @@ is gone.
 | The capture is refused (permission, no display) | `screen:start` answers `{ok: false, error}`; nothing is left behind |
 | The user stops the capture from the OS | the track's `ended` event stops the recorder like a normal Stop |
 | Nothing was written | the empty file is deleted and the error is reported |
+
+### Screen-recording treatment
+
+Step 8 recorded what the cursor did; this is what the editor does with it. Three things,
+two of which are effects and one of which deliberately is not:
+
+| | What it is | Where it lives |
+| --- | --- | --- |
+| Cursor smoothing | an `FX` type — hides the recorded pointer and draws a replacement on a smoothed, lagged path, with a scale punch on each click | `FX.DEFS.cursor` |
+| Click ripples | an `FX` type — an expanding ring at each recorded mouse-down | `FX.DEFS.ripple` |
+| Auto-zoom | a **generator** — it writes ordinary keyframes onto an ordinary `transform` and gets out of the way | `autoZoomPanel()` in `app.js` |
+
+The maths for all three is in `src/renderer/cursor.js`, a plain `<script>` global `Cursor`
+loaded between `anim.js` and `fx.js`. It touches no DOM, no canvas and no filesystem, so
+`smoke-cursor.js` can check every one of its answers against a path whose value is known
+exactly — which is why that suite needs no fixture and no recording at all.
+
+Everything here degrades. `Cursor` answers `null` / `[]` / "no zoom" for a clip with no
+telemetry, both effects draw **nothing**, and the auto-zoom panel does not appear. That is
+the contract stated under "The screen recorder", asserted rather than assumed: a clip with
+no telemetry paints pixel-identically with both effects switched on.
+
+#### Auto-zoom writes real keyframes, and that is the whole design
+
+The tempting version of this feature is an effect with a "zoom amount" slider that reads
+the telemetry every frame. It is less code and it is much worse, because the moment the
+third zoom of eleven goes slightly too far there is nothing to do about it but turn the
+whole feature off.
+
+So the generator produces what a patient author would have keyed by hand: `Anim` keys on a
+`transform` effect, sitting on the same strip, with the same handles, draggable and
+retimeable and deletable one at a time. The generator does not exist at render time — by
+then there is only a transform with keys on it, indistinguishable from one somebody typed.
+
+**Generated keys are tagged** (`gen: 'autozoom'`, plain JSON like everything else on a
+clip). That is what makes Regenerate safe: `Cursor.applyGenerated()` drops the tagged keys
+and puts the new generation in their place, and every untagged key survives untouched.
+Without the tag, regenerating would either double the animation or silently destroy hand
+work, and both of those turn the generator back into the black box it exists not to be.
+
+Note what the rule does *not* say: dragging a generated key does not un-tag it, so the
+next generation still replaces it. Retiming a machine's guess is a correction to that
+guess; asking for a regeneration is asking for a new one. What survives is what the author
+**added**.
+
+The transform it writes onto is **appended to the stack**, after any cursor and ripple
+effects, and that ordering is load-bearing. Telemetry is a point in the *source* frame, so
+those two paint at the pixel the framing put it on; a transform drawn afterwards moves the
+picture and the pointer together, which is what makes the zoom carry its own cursor with
+it. The other way round, the frame dives in while the pointer sits still on top of it.
+
+#### The minimum hold is enforced in the generator, not smoothed afterwards
+
+`Cursor.segments()` walks the cursor at 10 Hz and keeps extending the current segment
+while every sample in it still fits inside a box whose size comes from **sensitivity**.
+Then it throws away every segment shorter than **minimum hold**, and merges neighbours
+whose centres are within half a box.
+
+That order matters more than it looks. A pointer flicking between two nearby targets
+produces a dozen two-frame segments; smoothing the resulting zoom curve afterwards gives a
+soft, *permanent* wobble, because the wobble is in the data. Rejecting the segments removes
+it — the frame simply does not move for a gesture nobody held. `smoke-cursor.js` feeds it
+four seconds of exactly that flicking and asserts it comes out as one zoom, not a burst.
+
+Each surviving segment becomes a target: the scale is whatever makes the dwell fill 60% of
+the zoomed frame, capped by **max zoom** and never below 1 — zooming *out* of a screen
+recording is never what was asked for. The centre is then clamped so the zoomed window
+stays inside the frame; without that a dwell in a corner pans past the edge and lets black
+through, and the black would be baked into the export, because the baker and the viewer
+run the same code.
+
+Four keys come out per hold — neutral, in, hold, neutral — and consecutive holds whose
+ramps would collide drop the two neutral keys between them, so the frame cuts straight
+from one target to the next instead of pulling out and diving back in. A hold that runs
+off the end of the clip resolves its collision **toward the segment**: a clip trimmed into
+the middle of a dwell opens already zoomed in, because keeping the neutral instead would
+leave one key at 1 and the next at the target four seconds later, turning the whole dwell
+into a slow creeping push nobody asked for.
+
+The offset the generator writes solves `screen = anchor + (p - anchor) * s + offset` with
+the anchor left in the middle — where a hand edit expects to find it — so
+`offset = (0.5 - p) * s`. `Cursor.offsetFor()` is the one place that lives, and the suite
+asserts the round trip: generate, evaluate the tracks, apply the transform, land on 0.5.
+
+#### Smoothing is a filter over time, not over the event array
+
+The events are irregular — the sampler runs at 60 Hz, a click carries a position of its
+own, and a motionless pointer produces nothing for a second at a time. A moving average
+over the event *array* therefore weights a busy stretch and a still one differently, and
+the drawn cursor speeds up wherever the sampler happened to be dense. So `Cursor` resamples
+onto a fixed 60 Hz grid first, filters that, and interpolates the result with Catmull-Rom.
+The grid is held in a `WeakMap` keyed by the telemetry object — it is derived data and it
+is large, and anything that lands on a clip lands in every undo snapshot and in the
+`.scut` file.
+
+The averaging window **shrinks symmetrically at the ends** rather than clamping or
+reflecting the index. Both of those bias the mean where the window runs out, so a pointer
+travelling in a straight line would come out visibly bent for the first and last tenth of
+a second. A symmetric window is exact on a straight line everywhere, and that is the first
+thing `smoke-cursor.js` asserts — to the last bit, not to a tolerance.
+
+**Lag is a shift of the sample time**, not a blend toward the previous drawn position. The
+blend version is one line shorter and depends on the frame rate, and the preview and the
+export do not share one — so the pointer would trail differently in the viewer and in the
+file. Same for the click punch: it is a function of `(t − click)` alone, with no state and
+no accumulation, so a scrub backwards and a bake that visits frames out of order paint the
+same picture.
+
+#### Conceal is a cover, not an inpaint
+
+`conceal` clips a small box at the recorded hotspot and refills it with the layer's own
+pixels from a little to the right. That is right over a flat toolbar and wrong over a hard
+vertical edge, and the panel says so. Removing a compositor's cursor from pixels properly
+is a matting problem; the honest answer to "I can still see the old one" is to record with
+the system cursor off, which is a recorder setting rather than this file's business. Zero
+disables it, and a capture with no drawn cursor wants zero.
+
+#### The ripple colour is hardcoded, on purpose, in one place
+
+`Cursor.ACCENT` is the brand accent until step 17 hands the brand kit over. It is a single
+constant with a single reader, so that step changes one line rather than hunting for a
+colour literal in a draw function.
 
 ### Transcription and captions
 
@@ -2147,7 +2307,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain |
-| A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
+| A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p, t, entry, clip)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
+| A **generator** that writes keyframes | a pure function returning tracks of `{t, v, ease, gen:'<name>'}` + `Cursor.applyGenerated()` to merge them + one panel with its own Generate/Clear. Never an opaque effect — see "Screen-recording treatment" |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
 | A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
@@ -2214,9 +2375,12 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   need PowerShell (Windows only); without it the sidecar still holds the cursor path and
   says `clicks: false`. Nothing downstream may assume telemetry exists - see the contract
   in "The screen recorder".
-- Telemetry is recorded, not yet drawn: nothing in the preview or the render uses it yet.
-  Cursor smoothing, click ripples and auto-zoom are step 9, and read it through
-  `clipCursorAt()` and `clipClicks()`.
+- Telemetry is drawn by exactly three things - the `cursor` and `ripple` effects and the
+  auto-zoom generator - and by nothing else. All three read it through `Cursor`, and all
+  three do nothing at all on a clip that has none. See "Screen-recording treatment".
+- Auto-zoom is a GENERATOR: it writes tagged `Anim` keys onto an ordinary transform and
+  has no existence at render time. Regenerating replaces its own keys and leaves
+  hand-added ones alone.
 - A recorded clip and its telemetry are joined by the file name alone. Move or rename the
   `.webm` without its `.screen.json` and the next import of it has no cursor data.
 

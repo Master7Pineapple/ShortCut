@@ -547,3 +547,10 @@ select, input[type=number], input[type=text] {
 .fx-fx .tc-section { margin-top: 6px; }
 .fx-add { margin-top: 4px; }
 .fx-add select { width: 100%; }
+
+/* Auto-zoom sits under the stack it writes into, and is a GENERATOR rather than another
+   effect - so it gets its own box rather than a row in the list. Its buttons sit side by
+   side, which is why `.fx-add` here is a flex row and not the full-width select above. */
+.fx-az { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.fx-az .fx-add { display: flex; gap: 6px; }
+.fx-az .fx-add button { flex: 1; }

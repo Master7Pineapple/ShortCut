@@ -298,6 +298,170 @@
         L.c.putImageData(img, 0, 0);
       },
     },
+
+    // ------------------------------------------------ the screen-recording pair
+    //
+    // Both read step 8's telemetry off the clip, and both draw NOTHING at all when there
+    // is none. That is the degradation contract stated in the README under "The screen
+    // recorder", and it is why these are ordinary effects rather than a mode: a clip from
+    // Screen Studio or a phone can carry one, it simply has nothing to say.
+    //
+    // WHERE THEY BELONG IN THE STACK. Below a `transform`, always. Telemetry is a point
+    // in the SOURCE frame, so these two paint at the pixel the framing put it on - and a
+    // transform drawn AFTERWARDS moves the picture and the pointer together, which is
+    // what makes an auto-zoom carry its own cursor. Drawn the other way round the frame
+    // dives in and the pointer sits still on top of it. `autoZoomFx()` in app.js appends
+    // its transform to the end of the stack for exactly this reason.
+
+    cursor: {
+      label: 'Cursor (recording)',
+      needs: 'screen',
+      params: {
+        size: Cursor.DEFAULTS.cursor.size,
+        smooth: Cursor.DEFAULTS.cursor.smooth,
+        lag: Cursor.DEFAULTS.cursor.lag,
+        punch: Cursor.DEFAULTS.cursor.punch,
+        punchDur: Cursor.DEFAULTS.cursor.punchDur,
+        opacity: 1,
+        conceal: 0.035,
+        colour: '#ffffff',
+        outline: '#10161c',
+      },
+      schema: [
+        { path: 'params.size', label: 'Pointer size', type: 'range', min: 0.01, max: 0.15, step: 0.002, digits: 3 },
+        { path: 'params.smooth', label: 'Smoothing', type: 'range', min: 0, max: 0.6, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.lag', label: 'Lag', type: 'range', min: 0, max: 0.3, step: 0.005, unit: 's', digits: 3 },
+        { path: 'params.punch', label: 'Click punch', type: 'range', min: 1, max: 2.5, step: 0.01, digits: 2 },
+        { path: 'params.punchDur', label: 'Punch length', type: 'range', min: 0.05, max: 1, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.conceal', label: 'Conceal', type: 'range', min: 0, max: 0.12, step: 0.002, digits: 3 },
+        { path: 'params.colour', label: 'Pointer', type: 'color' },
+        { path: 'params.outline', label: 'Outline', type: 'color' },
+      ],
+      /**
+       * The recorded pointer covered over, and a replacement drawn on the smoothed path.
+       *
+       * `conceal` is a COVER, not an inpaint, and the panel says so. It clips a small box
+       * at the recorded hotspot and refills it with the layer's own pixels from a little
+       * to the right - which is right over a flat toolbar and wrong over a hard vertical
+       * edge. Removing a compositor's cursor from pixels properly is a matting problem;
+       * covering it is four lines, and the honest answer to "I can still see the old one"
+       * is to record with the cursor off, which is a recorder setting and not this file's
+       * business. Zero disables it, and a capture with no drawn cursor wants zero.
+       *
+       * The replacement is drawn from `Cursor.smoothAt()`, so it lags and eases; the
+       * scale punch comes from `Cursor.punchAt()`, which is a function of the click times
+       * and nothing else - it cannot drift between the preview and the export, because
+       * neither of them is integrating anything.
+       */
+      draw(L, p, t, e, clip) {
+        const scr = clip && clip.screen;
+        if (!Cursor.has(scr)) return;
+        const W = L.W, H = L.H;
+        const ts = (Number(clip.in) || 0) + t;
+        const map = Cursor.mapper(clip, W, H);
+        const S = pxMin(p.size, W, H);
+
+        if (p.conceal > 0) {
+          const raw = Cursor.rawAt(scr, ts);
+          if (raw) {
+            const q = map(raw.x, raw.y);
+            const d = pxMin(p.conceal, W, H);
+            const src = take(L, 'fxA');
+            L.c.drawImage(src, 0, 0);
+            L.c.save();
+            L.c.beginPath();
+            L.c.rect(q.x - d * 0.25, q.y - d * 0.25, d * 1.5, d * 1.9);
+            L.c.clip();
+            L.c.drawImage(src, d * 1.9, 0);
+            L.c.restore();
+          }
+        }
+
+        const pt = Cursor.smoothAt(scr, ts, { smooth: p.smooth, lag: p.lag });
+        if (!pt) return;
+        const at = map(pt.x, pt.y);
+        const punch = Cursor.punchAt(scr, ts, { punch: p.punch, punchDur: p.punchDur });
+        const s = S * punch;
+        L.c.save();
+        L.c.globalAlpha = clamp(p.opacity, 0, 1);
+        L.c.translate(at.x, at.y);
+        L.c.scale(s, s);
+        // The classic arrow, in units of the pointer's own width, hotspot at (0, 0).
+        L.c.beginPath();
+        L.c.moveTo(0, 0);
+        L.c.lineTo(0, 1.0);
+        L.c.lineTo(0.28, 0.73);
+        L.c.lineTo(0.45, 1.12);
+        L.c.lineTo(0.62, 1.05);
+        L.c.lineTo(0.45, 0.66);
+        L.c.lineTo(0.72, 0.62);
+        L.c.closePath();
+        L.c.fillStyle = String(p.colour || '#ffffff');
+        L.c.strokeStyle = String(p.outline || '#10161c');
+        L.c.lineWidth = 0.07;
+        L.c.lineJoin = 'round';
+        L.c.fill();
+        L.c.stroke();
+        L.c.restore();
+      },
+    },
+
+    ripple: {
+      label: 'Click ripples',
+      needs: 'screen',
+      params: {
+        size: Cursor.DEFAULTS.ripple.size,
+        dur: Cursor.DEFAULTS.ripple.dur,
+        width: Cursor.DEFAULTS.ripple.width,
+        opacity: 0.9,
+        colour: Cursor.ACCENT,
+      },
+      schema: [
+        { path: 'params.size', label: 'Radius', type: 'range', min: 0.01, max: 0.3, step: 0.002, digits: 3 },
+        { path: 'params.dur', label: 'Length', type: 'range', min: 0.1, max: 2, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.width', label: 'Ring width', type: 'range', min: 0.001, max: 0.03, step: 0.001, digits: 3 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+      ],
+      /**
+       * An expanding ring per mouse-down, at the pixel the click happened on.
+       *
+       * The radius eases out and the alpha falls faster than it, so the ring reads as
+       * energy leaving rather than as a circle fading. Both are functions of
+       * `(t - click)` alone: no state and no accumulation, so a scrub backwards and a
+       * bake that visits frames out of order paint the same picture. The default colour
+       * is the brand accent, hardcoded until step 17 hands the brand kit over -
+       * `Cursor.ACCENT` is the one place it lives, so that step changes one constant.
+       *
+       * A recording whose sidecar says `clicks: false` - the watcher was unavailable -
+       * carries no mouse-downs at all, so this draws nothing, which is the right answer.
+       */
+      draw(L, p, t, e, clip) {
+        const scr = clip && clip.screen;
+        if (!Cursor.has(scr)) return;
+        const W = L.W, H = L.H;
+        const ts = (Number(clip.in) || 0) + t;
+        const rings = Cursor.ripplesAt(scr, ts, { dur: p.dur });
+        if (!rings.length) return;
+        const map = Cursor.mapper(clip, W, H);
+        const R = pxMin(p.size, W, H);
+        const lw = pxMin(p.width, W, H);
+        L.c.save();
+        L.c.strokeStyle = String(p.colour || Cursor.ACCENT);
+        for (const r of rings) {
+          const q = map(r.x, r.y);
+          const grow = 1 - Math.pow(1 - r.k, 3);          // ease-out on the radius
+          const fade = Math.pow(1 - r.k, 1.6);            // alpha falls faster than it
+          L.c.globalAlpha = clamp(p.opacity, 0, 1) * fade;
+          L.c.lineWidth = Math.max(0.5, lw * (1 - r.k * 0.6));
+          L.c.beginPath();
+          L.c.arc(q.x, q.y, Math.max(0.5, R * grow), 0, Math.PI * 2);
+          L.c.stroke();
+        }
+        L.c.restore();
+      },
+    },
   };
 
   const TYPES = Object.keys(DEFS);
@@ -432,9 +596,16 @@
    * and the layer carries on with whatever it had - `loop()` re-arms in a `finally` for
    * exactly the same reason.
    *
-   * Stack ORDER is the array's order and it matters: blur after grade is not blur before
-   * grade, because a grade lifts what a blur has already averaged.
-   */
+ * Stack ORDER is the array's order and it matters: blur after grade is not blur before
+ * grade, because a grade lifts what a blur has already averaged.
+ *
+ * `clip` reaches `draw()` as its fifth argument for one kind of effect: the ones that
+ * read something recorded ALONGSIDE the picture rather than something on the stack.
+ * `cursor` and `ripple` need step 8's telemetry, which lives on the clip and could never
+ * be a parameter - it is thousands of samples. Nothing else may reach for it; an effect
+ * that read `clip.start` from here would be putting a clip's timeline position into its
+ * own pixels, which is the one thing the render cache's key rules forbid.
+ */
   function render(target, W, H, clip, t, surface, paint) {
     const entries = active(clip);
     if (!entries.length) { paint(target, W, H); return false; }
@@ -443,7 +614,7 @@
     paint(L.c, W, H);
     for (const e of entries) {
       try {
-        DEFS[e.type].draw(L, paramsAt(e, t), t, e);
+        DEFS[e.type].draw(L, paramsAt(e, t), t, e, clip);
       } catch (err) {
         if (typeof console !== 'undefined') console.warn('FX ' + e.type + ' failed:', err);
       }
