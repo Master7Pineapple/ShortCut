@@ -514,6 +514,11 @@ select, input[type=number], input[type=text] {
 #meterPanel > * { flex: none; }
 #meterCanvas {
   width: calc(100% - 16px); height: 88px; margin: 5px 8px 4px; display: block;
+  /* The floor stays at 46px, and it is NOT what keeps the meter readable - `meterLayout()`
+     does that, by deriving every row from the height it is actually given. Raising it to
+     58 to buy the bars more room pushed the note out of the fixed-height panel and
+     `smoke-meter.js` caught it: the budget here is zero-sum, so the layout has to bend
+     rather than the box. */
   flex: 1 1 auto; min-height: 46px;
 }
 #meterReadout {

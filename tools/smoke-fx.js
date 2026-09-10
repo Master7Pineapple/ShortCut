@@ -378,6 +378,65 @@
         typeof c.fx[0].params === 'object');
     }
 
+    // ==================================================== 10a. corners AND shadow
+    //
+    // `round` was unusable: the rounded rect was hardcoded to the full frame, so on a
+    // full-frame clip the shadow was cast at the frame edge and fell entirely outside the
+    // canvas. All you could ever see was the corners cut to transparency - and scaling
+    // the layer down first did not help either, because the rounded rect stayed the whole
+    // frame whatever was inside it. `margin` is what makes both halves reachable.
+    {
+      const shot = (params, W, H) => {
+        const f = fx('round', params);
+        const r = run([f], W, H, null, paintBlock('#ff0000'), 0);
+        return r;
+      };
+      const W = 120, H = 200;
+      const r = shot({ margin: 0.08, radius: 0.06, shadow: 0.9, blur: 0.04, offsetY: 0.02 }, W, H);
+      const m = Math.round(0.08 * Math.min(W, H));
+
+      ok('the picture is cropped to the inset rect, not drawn to the frame edge',
+        r.px(W / 2, m + 4)[0] > 200 && r.px(W / 2, Math.floor(m / 2))[0] < 200,
+        'inside=' + r.px(W / 2, m + 4).join(',') + ' margin=' + r.px(W / 2, Math.floor(m / 2)).join(','));
+
+      // THE ONE THAT WAS BROKEN: something is drawn in the margin, and it is the shadow.
+      // Sampled BELOW the card, because the default offset pushes the shadow downward -
+      // the first version of this test sampled the top margin, found nothing, and was
+      // measuring the offset rather than the shadow.
+      const below = Math.round(H - m + 2);
+      const inMargin = r.px(W / 2, below);
+      ok('THE SHADOW IS VISIBLE, in the gap the margin opens',
+        inMargin[3] > 8 && inMargin[0] < 120,
+        'a=' + inMargin[3] + ' rgb=' + inMargin.slice(0, 3).join(','));
+
+      const noShadow = shot({ margin: 0.08, radius: 0.06, shadow: 0, blur: 0.04 }, W, H);
+      ok('...and it is the shadow, because turning it off empties the margin',
+        noShadow.px(W / 2, below)[3] === 0, String(noShadow.px(W / 2, below)[3]));
+
+      // Blur widens it: sample past where an unblurred shadow could possibly reach.
+      const M2 = Math.round(0.12 * Math.min(W, H));
+      const y2 = Math.round(H - M2 + 3);
+      const sharp = shot({ margin: 0.12, radius: 0.02, shadow: 1, blur: 0, offsetY: 0 }, W, H);
+      const soft = shot({ margin: 0.12, radius: 0.02, shadow: 1, blur: 0.06, offsetY: 0 }, W, H);
+      const alphaAt = (img) => img.px(W / 2, y2)[3];
+      ok('shadow blur does something, and it is to spread the shadow outward',
+        alphaAt(soft) > alphaAt(sharp),
+        'sharp=' + alphaAt(sharp) + ' soft=' + alphaAt(soft) + ' at y=' + y2);
+
+      ok('the corners are rounded on the INSET rect, not on the frame', (() => {
+        const big = shot({ margin: 0.1, radius: 0.5, shadow: 0, blur: 0 }, W, H);
+        const mm = Math.round(0.1 * Math.min(W, H));
+        // The inset rect's own corner is cut away; its middle-left edge is not.
+        return big.px(mm + 1, mm + 1)[3] === 0 && big.px(mm + 1, H / 2)[0] > 200;
+      })());
+
+      ok('margin 0 is the old full-frame behaviour, so nothing silently reframes',
+        (() => {
+          const z = shot({ margin: 0, radius: 0, shadow: 0, blur: 0 }, W, H);
+          return z.px(1, 1)[0] > 200 && z.px(W - 2, H - 2)[0] > 200;
+        })());
+    }
+
     // ==================================================== 10b. the per-effect shutter
 
     {

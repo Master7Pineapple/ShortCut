@@ -91,9 +91,37 @@ function createWindow() {
   // renderer `beforeunload` handler that calls preventDefault just blocks the close
   // silently in Electron, which is why the window used to ignore the quit button until
   // the project had been saved.
+  //
+  // The handler is ASYNC, so `close` can fire again while the dialog from the last one is
+  // still open - Alt+F4 twice, the title-bar X twice, or a quit from the taskbar on top
+  // of either. Each of those used to open ANOTHER dialog on top of the first, and since
+  // answering one only closes the window if `allowClose` gets set, the app looked like it
+  // was refusing to close and would not go away until every stacked copy was dismissed.
+  // One dialog at a time, however many times the close is asked for.
+  let askingClose = false;
   win.on('close', async (e) => {
+    // A SMOKE RUN NEVER ASKS, at any point in its life - not just at the end.
+    //
+    // `allowClose` is set right before `app.quit()` on the smoke path, which covers the
+    // orderly exit. It does not cover a run that is KILLED part-way through: the electron
+    // process is orphaned with a dirty project and no `allowClose`, and the first time
+    // anything asks it to close - the user, the OS, a later cleanup - it raises the
+    // unsaved-changes dialog and sits on it forever, holding a window nobody can get rid
+    // of without answering. There is never a person behind a smoke run to answer it, so
+    // the honest rule is that this instance has nothing worth saving, always.
+    if (process.env.SHORTCUT_SMOKE) return;
     if (allowClose || !projectDirty) return;
     e.preventDefault();
+    if (askingClose) return;
+    askingClose = true;
+    try {
+      await askToClose();
+    } finally {
+      askingClose = false;
+    }
+  });
+
+  async function askToClose() {
     const { response } = await dialog.showMessageBox(win, {
       type: 'warning',
       buttons: ['Save and quit', "Don't save", 'Cancel'],
@@ -108,9 +136,11 @@ function createWindow() {
     if (response === 1) { allowClose = true; win.close(); return; }
 
     // Save and quit: the renderer owns the project data, so ask it to save and wait.
+    // If that save is cancelled or fails the window deliberately stays open - see
+    // `app:saveResult` - which is why this is the one answer that does not close here.
     saveThenQuit = true;
     win.webContents.send('app:requestSave');
-  });
+  }
 
   win.on('closed', () => { win = null; });
 }
@@ -132,6 +162,31 @@ app.whenReady().then(() => {
     globalShortcut.register('CommandOrControl+Shift+F9', () => recSend('screen:hotkeyToggle'));
   } catch (e) { /* another app holds the combination; the panel buttons still work */ }
 });
+/**
+ * Tear down anything still running before the app goes.
+ *
+ * A capture in flight holds the process open in three separate ways, and all three have
+ * to go or the app simply does not quit: the hidden recorder window is a BrowserWindow,
+ * so `window-all-closed` never fires while it exists; the cursor sampler is a live
+ * `setInterval`; and the click watcher is a PowerShell child process. The symptom is an
+ * app that ignores the quit - or, on a smoke run, a suite that hangs past its timeout
+ * having already printed nothing.
+ *
+ * This is deliberately blunt and synchronous. `finishRecording()` is the orderly path and
+ * it writes the sidecar; this one runs when there is no longer time for that, so it drops
+ * the recording rather than trying to save it. A half-written `.webm` with no sidecar is
+ * a far better outcome than a process that will not exit.
+ */
+app.on('before-quit', () => {
+  const state = rec;
+  rec = null;
+  if (!state) return;
+  try { if (state.timer) clearInterval(state.timer); } catch (e) { /* ignore */ }
+  try { stopClickWatcher(state); } catch (e) { /* ignore */ }
+  try { if (state.win && !state.win.isDestroyed()) state.win.destroy(); } catch (e) { /* ignore */ }
+  try { state.stream.end(); } catch (e) { /* ignore */ }
+});
+
 app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch (e) { /* ignore */ } });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

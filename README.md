@@ -592,7 +592,13 @@ export at 1080x1920, so a "12 px" corner radius would be twice as round in the v
 in the file, and a "20 px" blur twice as soft. **Anything added here that takes a length
 must go through `pxMin()`.** `smoke-fx.js` paints a four-effect stack at 135x240 and at
 540x960 and asserts the two agree to within 12 levels of 255 — which is preview/render
-parity for this file, stated as one test.
+parity for this file, stated as one test. It currently measures **0**.
+
+`pxMin()` is necessary but not sufficient, and `round` is how that was learned. A
+*proportional* geometry can still break parity if it makes the engine **resample**: a
+non-integer scale puts content edges at different sub-pixel phases at the two sizes, and a
+later `transform` amplifies the difference into something visible. Clipping is exact;
+scaling is not. Prefer a clip whenever the effect has the choice.
 
 #### The layer rule, inherited from the text cards
 
@@ -833,6 +839,26 @@ The suite asserted against it and passed while the feature was unreachable by mo
 and asserts the inspector is not showing the multi-selection message.
 
 #### The loudness meter
+
+`meterLayout(H)` decides where the two bars and the dB scale go, and it derives every row
+from the height it is actually given. That is not tidiness. The layout used to be
+constants — rows at 16 and 42 with the scale pinned to `H - 4` — which needs about 70 px,
+and the canvas is a flex child of a fixed-height panel, so its height is whatever is left
+over. When the panel got tight the constants drew the loudness bar straight through the dB
+scale with the "LUFS" label running underneath it. Nothing clipped and nothing errored; it
+just became unreadable, which is the failure a fixed layout in a flexible box always has.
+
+Below about 46 px two bars and a 12 px gap stop fitting, and the **gap** gives way first,
+down to the 4 px the target sign needs — the bar carries its own label, so it is the thing
+that has to stay legible. The left gutter is measured from the width of the widest label
+rather than assumed, for the same reason: "LUFS" at 9 px is about 24 px wide and the gutter
+was 26, so one font fallback wider put the label under the bar.
+
+`smoke-meter.js` asserts the invariants at every height from 40 to 160 — bars never
+overlap, never run into the scale, never get thinner than their own text. Raising the CSS
+`min-height` instead was tried and rejected: it pushed the note out of the fixed-height
+panel and the suite caught that too. The budget is zero-sum, so the layout bends rather
+than the box.
 
 The footer carries a live meter of the **preview mix**, next to the render panel. Two
 scales, because they answer different questions and routinely disagree — a heavily
@@ -1300,6 +1326,14 @@ Three details that make the replay a replay:
   rule, so the box simply stays at the size it was released at until the effect goes off
   screen — `Cursor.DEFAULTS.select.hold` seconds later. A trailing key would be a key the
   author has to delete.
+- **Both corners come off the DRAWN pointer, not the recorded one.** The cursor is
+  deliberately not drawn where it was recorded: `cursor` smooths the path and evaluates it
+  `lag` seconds in the past so it reads as a physical object. A box built from the raw
+  samples therefore tracks a point the viewer cannot see, and the corner separates from
+  the pointer by exactly `lag` — it appears to chase the cursor rather than be held by it.
+  `selectionKeys()` takes a `pointerAt(t)` and runs the anchor and the moving corner
+  through it, using that clip's own `cursor` settings, so the two are locked by
+  construction rather than by tuning a number.
 
 The static `params` are the box **as released**, so bypassing or deleting the keys leaves
 the shape that was drawn rather than a default rectangle somewhere else.
@@ -1319,16 +1353,40 @@ Two things it gets right on purpose:
   hole-punching path can be built at all, and `smoke-cursor.js` asserts the inside is
   untouched and the outside is darker and still opaque.
 
-#### The `round` effect is not a vignette
+#### `round` needs a margin, and that is what makes it work at all
 
-Worth stating because the control invites the mistake: `round` clips the layer to a
-rounded rectangle **at full frame size** and casts the canvas shadow from that shape. On a
-full-frame clip the shadow falls entirely outside the canvas, so all you see is the corners
-cut to transparency with black showing through.
+It is not a vignette — darkening the frame's own edges is a different pass and belongs with
+the finishing effects. It rounds and shadows the **clip**.
 
-It only reads as a shadow once the layer is smaller than the frame — put a `transform` at
-scale ~0.9 **above** it and the shadow appears in the gap that opens. Darkening the frame's
-own edges is a different pass, and belongs with the finishing effects. The label says so.
+For a long time it could do neither. The rounded rectangle was hardcoded to the full
+frame, which is a catch-22: on a full-frame clip the shadow is cast at the frame edge and
+falls entirely outside the canvas, so the only visible result was the corners cut to
+transparency with black showing through — and scaling the layer down first did **not**
+help, because the rounded rect stayed the whole frame no matter what was inside it. Both
+halves of "corners + shadow" were unreachable.
+
+`margin` is the fix: the effect insets the rectangle it rounds, and the margin is the room
+the shadow needs. Two decisions inside it are worth knowing.
+
+**It CLIPS to the inset rect; it does not scale into it.** Scaling looked more useful — the
+whole picture, smaller, inside a frame — and it cost preview/render parity. Resampling by
+a non-integer factor puts the content's own edges at different sub-pixel phases at 135 px
+and at 540 px wide, and a later `transform` lands those differences **35 levels** apart in
+the viewer and the file, against a tolerance of 12. `inset`, which clips, measures exactly
+**0** at the same test, which is what pointed at the resample. So `round` crops the outer
+margin away the way a rounded-corner mask does, and the whole four-effect parity stack now
+measures 0 rather than the 9 it used to. If you want the whole picture smaller, put a
+`transform` above it.
+
+**The shadow is a silhouette, not `ctx.shadowBlur`.** It paints the same rounded rect as a
+solid shape, offsets it, blurs it through `padBlur()` — the same padded, non-magnifying
+blur the `blur` effect uses — and composites it under the picture. That makes it
+independent of the layer's own alpha, so a clip with transparency in it casts a clean card
+shadow instead of a ragged one.
+
+The margin is an equal number of **pixels** on all four sides, not an equal fraction of
+each axis: on a 9:16 frame a uniform fraction would inset the top and bottom nearly twice
+as far as the sides and the border would read as lopsided.
 
 ### Auto-zoom, and cursor smoothing
 
@@ -2320,6 +2378,27 @@ This must not move back into the renderer. A `beforeunload` handler that calls
 which is exactly why the window used to ignore the quit button until the project had been
 saved. "Save and quit" sends `app:requestSave` to the renderer, which saves and reports
 back through `app:saveResult`; a cancelled save leaves the window open.
+
+**One dialog at a time.** The close handler is `async`, so `close` can fire again while
+the dialog from the last one is still open — Alt+F4 twice, the title-bar X twice, or a
+quit from the taskbar on top of either. Each of those used to open *another* dialog on top
+of the first, and since answering one only closes the window when it sets `allowClose`, the
+app looked like it was refusing to close and would not go away until every stacked copy had
+been dismissed. An `askingClose` flag now swallows the repeats.
+
+**A smoke instance never asks, at any point in its life.** `allowClose` is set just before
+`app.quit()` on the smoke path, which covers the orderly exit and nothing else. A run that
+is *killed* part-way through leaves an orphaned electron with a dirty project and no
+`allowClose`, and the first time anything asks it to close it raises the unsaved-changes
+dialog and sits on it — a window nobody can get rid of without answering, from a run
+nobody is watching. The guard now returns immediately when `SHORTCUT_SMOKE` is set.
+
+**A capture in flight holds the app open three ways**, and `before-quit` tears down all
+three: the hidden recorder window is a `BrowserWindow`, so `window-all-closed` never fires
+while it exists; the cursor sampler is a live `setInterval`; and the click watcher is a
+PowerShell child. That teardown is deliberately blunt and drops the recording —
+`finishRecording()` is the orderly path that writes the sidecar, and this one runs when
+there is no longer time for it. A half-written `.webm` beats a process that will not exit.
 
 ### Presets
 

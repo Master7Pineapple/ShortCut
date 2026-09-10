@@ -166,6 +166,41 @@
     return { cv, c };
   }
 
+  /**
+   * Blur a canvas by `r` pixels without letting the frame edge eat into it.
+   *
+   * The plate is padded so the blur kernel has somewhere to reach, blurred at 1:1, then
+   * cropped back - never drawn oversized, which would silently magnify the picture by an
+   * amount that grows with the radius. `blur`'s own draw extends the EDGE PIXELS into the
+   * padding because it is blurring a full-frame picture whose surround would otherwise
+   * pull a dark rim inwards; a silhouette is already surrounded by transparency and wants
+   * to stay that way, so `extend` is optional.
+   *
+   * Shared because `ctx.shadowBlur` is NOT scale-invariant - see the `round` effect.
+   */
+  function padBlur(srcCv, r, W, H, surface, tag, extend) {
+    const pad = Math.ceil(r * 3) + 2;
+    const PW = W + pad * 2, PH = H + pad * 2;
+    const plate = clean(surface, tag + 'P', PW, PH);
+    const c = plate.c;
+    c.drawImage(srcCv, pad, pad);
+    if (extend) {
+      c.drawImage(srcCv, 0, 0, 1, H, 0, pad, pad, H);
+      c.drawImage(srcCv, W - 1, 0, 1, H, W + pad, pad, pad, H);
+      c.drawImage(srcCv, 0, 0, W, 1, pad, 0, W, pad);
+      c.drawImage(srcCv, 0, H - 1, W, 1, pad, H + pad, W, pad);
+      c.drawImage(srcCv, 0, 0, 1, 1, 0, 0, pad, pad);
+      c.drawImage(srcCv, W - 1, 0, 1, 1, W + pad, 0, pad, pad);
+      c.drawImage(srcCv, 0, H - 1, 1, 1, 0, H + pad, pad, pad);
+      c.drawImage(srcCv, W - 1, H - 1, 1, 1, W + pad, H + pad, pad, pad);
+    }
+    const soft = clean(surface, tag + 'S', PW, PH);
+    soft.c.filter = 'blur(' + (Math.round(r * 100) / 100) + 'px)';
+    soft.c.drawImage(plate.cv, 0, 0);
+    soft.c.filter = 'none';
+    return { cv: soft.cv, pad };
+  }
+
   /** Copy the layer into a scratch and clear the layer, ready to be repainted from it. */
   function take(L, name) {
     const s = clean(L.surface, name, L.W, L.H);
@@ -218,16 +253,21 @@
     },
 
     round: {
-      // NOT a vignette, and the label says so because the confusion is a fair one: on a
-      // FULL-FRAME clip the rounded rect IS the whole frame, so the shadow it casts falls
-      // entirely outside the canvas and all that is left to see is the corners cut to
-      // transparency with black showing through. It only reads as a shadow once the layer
-      // is smaller than the frame - put a `transform` at scale 0.9 ABOVE it and the
-      // shadow appears in the gap that opens. Darkening the frame's own edges is a
-      // different pass entirely.
-      label: 'Corners + shadow (scale the layer down first)',
-      params: { radius: 0.04, colour: '#000000', shadow: 0.5, blur: 0.03, offsetX: 0, offsetY: 0.012 },
+      // NOT a vignette. This rounds and shadows the CLIP; darkening the frame's own edges
+      // is a different pass entirely, and belongs with the finishing effects.
+      //
+      // `margin` is what makes the effect work at all, and it was missing. The rounded
+      // rect used to be hardcoded to the full frame, which is a catch-22: on a full-frame
+      // clip the shadow is cast at the frame edge and falls entirely outside the canvas,
+      // so all you ever saw was the corners cut to transparency with black showing
+      // through - and scaling the layer down first did NOT help, because the rounded rect
+      // stayed the whole frame no matter what was inside it. Corners and shadow were
+      // therefore both unreachable. The effect now insets the picture by `margin` and
+      // rounds THAT rectangle, so the shadow has somewhere to fall.
+      label: 'Corners + shadow',
+      params: { margin: 0.05, radius: 0.04, colour: '#000000', shadow: 0.5, blur: 0.03, offsetX: 0, offsetY: 0.012 },
       schema: [
+        { path: 'params.margin', label: 'Inset', type: 'range', min: 0, max: 0.3, step: 0.002, digits: 3 },
         { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.5, step: 0.002, digits: 3 },
         { path: 'params.colour', label: 'Shadow colour', type: 'color' },
         { path: 'params.shadow', label: 'Shadow', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
@@ -239,23 +279,68 @@
       // thing being drawn, so rounding first and drawing once gives a shadow that follows
       // the corners exactly. Two passes would have to keep two paths in agreement, which
       // is the mistake this whole architecture exists to stop making.
+      //
+      // The margin is an equal number of PIXELS on all four sides - `pxMin()` against the
+      // shorter side - not an equal fraction of each axis. On a 9:16 frame a uniform
+      // fraction would inset the top and bottom nearly twice as far as the sides and the
+      // border would read as lopsided, which is the opposite of what a frame is for.
       draw(L, p) {
         const src = take(L, 'fxA');
         const W = L.W, H = L.H;
+        const m = Math.max(0, pxMin(p.margin, W, H));
+        const dw = W - 2 * m, dh = H - 2 * m;
+        if (!(dw > 1 && dh > 1)) return;      // the margin ate the whole picture
+        const rad = pxMin(p.radius, W, H);
+
+        // CLIPPED to the inset rect, not SCALED into it - a 1:1 copy through a clip path.
+        //
+        // Scaling looked more useful (the whole picture, smaller, inside a frame) and it
+        // cost preview/render parity: resampling by a non-integer factor puts the
+        // content's own edges at different sub-pixel phases at 135 px and at 540 px wide,
+        // and a later `transform` lands those differences 35 levels apart in the viewer
+        // and the file. `inset`, which clips, measures exactly 0 at the same test - which
+        // is what pointed at the resample. So this crops the outer `margin` away instead,
+        // the way a rounded-corner mask does, and the margin becomes the room the shadow
+        // needs. If you want the whole picture smaller, put a `transform` above this one.
         const rounded = clean(L.surface, 'fxB', W, H);
         rounded.c.save();
-        roundRectPath(rounded.c, 0, 0, W, H, pxMin(p.radius, W, H));
+        roundRectPath(rounded.c, m, m, dw, dh, rad);
         rounded.c.clip();
         rounded.c.drawImage(src, 0, 0);
         rounded.c.restore();
 
-        L.c.save();
-        L.c.shadowColor = rgba(p.colour, p.shadow);
-        L.c.shadowBlur = pxMin(p.blur, W, H);
-        L.c.shadowOffsetX = pxMin(p.offsetX, W, H);
-        L.c.shadowOffsetY = pxMin(p.offsetY, W, H);
+        // The shadow is painted from a SILHOUETTE of the same rounded rect, blurred with
+        // `padBlur()`, rather than through `ctx.shadowBlur`.
+        //
+        // `ctx.shadowBlur` is not scale-invariant: at 6.75 px and at 27 px - the same
+        // fraction of a 135-wide and a 540-wide frame - it produces gradients that are
+        // proportional in extent but not in shape, and the difference is large enough to
+        // survive a later `transform` and land 33 levels apart in the preview and the
+        // export. `smoke-fx.js` measured exactly that, and only found it once the margin
+        // made shadows visible at all: before that the shadow was cast at the frame edge
+        // and fell outside the canvas, so the parity assertion had never once tested a
+        // shadow pixel. The padded blur is the same one the `blur` effect uses and it
+        // measures scale-invariant, so the two resolutions now agree.
+        const sh = clamp(p.shadow, 0, 1);
+        if (sh > 0.002) {
+          const r = Math.max(0, pxMin(p.blur, W, H));
+          const ox = pxMin(p.offsetX, W, H), oy = pxMin(p.offsetY, W, H);
+          const sil = clean(L.surface, 'fxShA', W, H);
+          sil.c.fillStyle = rgba(p.colour, 1);
+          roundRectPath(sil.c, m + ox, m + oy, dw, dh, rad);
+          sil.c.fill();
+          L.c.save();
+          L.c.globalAlpha = sh;
+          if (r > 0.05) {
+            const b = padBlur(sil.cv, r, W, H, L.surface, 'fxSh', false);
+            L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+          } else {
+            L.c.drawImage(sil.cv, 0, 0);
+          }
+          L.c.restore();
+        }
+
         L.c.drawImage(rounded.cv, 0, 0);
-        L.c.restore();
       },
     },
 
@@ -306,28 +391,12 @@
         const r = pxMin(p.radius, W, H);
         if (!(r > 0.05)) return;
         const src = take(L, 'fxA');
-        const pad = Math.ceil(r * 3) + 2;
-        const PW = W + pad * 2, PH = H + pad * 2;
-        const plate = clean(L.surface, 'fxPad', PW, PH);
-        const c = plate.c;
-        c.drawImage(src, pad, pad);
-        c.drawImage(src, 0, 0, 1, H, 0, pad, pad, H);              // left
-        c.drawImage(src, W - 1, 0, 1, H, W + pad, pad, pad, H);    // right
-        c.drawImage(src, 0, 0, W, 1, pad, 0, W, pad);              // top
-        c.drawImage(src, 0, H - 1, W, 1, pad, H + pad, W, pad);    // bottom
-        c.drawImage(src, 0, 0, 1, 1, 0, 0, pad, pad);
-        c.drawImage(src, W - 1, 0, 1, 1, W + pad, 0, pad, pad);
-        c.drawImage(src, 0, H - 1, 1, 1, 0, H + pad, pad, pad);
-        c.drawImage(src, W - 1, H - 1, 1, 1, W + pad, H + pad, pad, pad);
-
-        // Blurred padded -> padded, THEN cropped. Drawing the crop with the filter still
-        // on would blur the crop rather than the plate, and the rim would come straight
-        // back - the padding would have bought nothing.
-        const soft = clean(L.surface, 'fxPad2', PW, PH);
-        soft.c.filter = 'blur(' + (Math.round(r * 100) / 100) + 'px)';
-        soft.c.drawImage(plate.cv, 0, 0);
-        soft.c.filter = 'none';
-        L.c.drawImage(soft.cv, pad, pad, W, H, 0, 0, W, H);
+        // EXTENDED, unlike the shadow's silhouette: this is a full-frame picture, so the
+        // transparent surround would be pulled inwards and leave a soft dark rim all the
+        // way round the frame. The rim is built out of the picture's own edge instead,
+        // which is what it would have been if the frame continued.
+        const b = padBlur(src, r, W, H, L.surface, 'fxPad', true);
+        L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
       },
     },
 
@@ -940,7 +1009,7 @@
     pointerImage, preloadImages,
     MBLUR, mblurOf, timeVarying,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
-    roundRectPath, roundRectSub, pxMin, rgba,
+    roundRectPath, roundRectSub, pxMin, rgba, padBlur,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else if (typeof window !== 'undefined') window.FX = API;

@@ -306,6 +306,38 @@ const METER_TOP = 0;
  * Called from loop(), which re-arms in a finally - a fault here costs a frame, never the
  * session.
  */
+/**
+ * Where the meter's two bars and its dB scale go, for a canvas of height `H`.
+ *
+ * Pure, and separate from the drawing, so `smoke-meter.js` can assert the invariants at
+ * every height the panel can produce instead of squinting at pixels: the bars never
+ * overlap each other, never run into the scale strip, and never get thinner than their
+ * own labels.
+ *
+ * It exists because the layout used to be constants - rows at 16 and 42, the scale pinned
+ * to `H - 4` - which needs about 70 px. The canvas is a flex child of a fixed-height
+ * panel, so a tight panel squeezed it below that and the constants then drew the loudness
+ * bar straight through the scale with the "LUFS" label running under it. Nothing clipped
+ * and nothing errored; it just became unreadable, which is the failure a fixed layout in
+ * a flexible box always has.
+ */
+function meterLayout(H) {
+  const scaleH = 13;                       // the dB numbers along the bottom
+  const topPad = 4;
+  const gap = 12;                          // between the two bars, and where the sign goes
+  const avail = Math.max(20, H - scaleH - topPad);
+  let g = gap;
+  let barH = Math.min(14, Math.floor((avail - g) / 2));
+  // Below about 46px the two bars and a 12px gap no longer fit. The BAR is the thing that
+  // has to stay legible - it carries its own label - so the gap gives way first, down to
+  // the 4px the target sign needs. Letting the bar shrink instead drew rows thinner than
+  // the text on them, and letting neither give ran the loudness bar into the dB scale.
+  if (barH < 6) { barH = 6; g = Math.max(4, avail - 2 * barH); }
+  const peakY = topPad + Math.max(0, Math.floor((avail - g - barH * 2) / 2));
+  const loudY = peakY + barH + g;
+  return { scaleH, topPad, gap: g, barH, peakY, loudY, barsBottom: loudY + barH };
+}
+
 function drawMeter() {
   const cv = $('#meterCanvas');
   if (!cv) return;
@@ -323,8 +355,26 @@ function drawMeter() {
   const W = w / dpr, H = h / dpr;
 
   const s = previewMix.session;
-  const x0 = 26, x1 = W - 6;
+
+  /*
+   * EVERY VERTICAL POSITION HERE IS DERIVED FROM `H`, and the left gutter from the width
+   * of the widest label. Both used to be constants - a 26 px gutter and rows at 16 / 42
+   * with the scale pinned to `H - 4` - which needs about 70 px of canvas. The canvas is a
+   * flex child of a fixed-height panel, so when the panel got tight it was squeezed below
+   * that, and the constants then drew the loudness bar straight through the dB scale with
+   * the "LUFS" label running under it. Nothing clipped or errored; it just became
+   * unreadable, which is the failure mode a fixed layout in a flexible box always has.
+   *
+   * The gutter is measured rather than assumed for the same reason: "LUFS" at 9 px is
+   * about 24 px wide and the gutter was 26, so a font fallback one size bigger put the
+   * label under the bar.
+   */
+  g.font = '8px system-ui, sans-serif';
+  const gutter = Math.ceil(Math.max(g.measureText('LUFS').width, g.measureText('PK').width)) + 6;
+  const x0 = gutter, x1 = W - 6;
   const span = x1 - x0;
+
+  const { scaleH, gap, barH, peakY, loudY, barsBottom } = meterLayout(H);
   const at = (db) => x0 + span * (clamp(db, METER_FLOOR, METER_TOP) - METER_FLOOR) / (METER_TOP - METER_FLOOR);
 
   const peakDb = s ? s.peakDb() : -Infinity;
@@ -342,7 +392,7 @@ function drawMeter() {
 
   const label = (text, y) => {
     g.fillStyle = '#7d8694';
-    g.font = '9px system-ui, sans-serif';
+    g.font = '8px system-ui, sans-serif';
     g.textAlign = 'left';
     g.fillText(text, 2, y);
   };
@@ -358,17 +408,16 @@ function drawMeter() {
   for (const db of [-60, -50, -40, -30, -20, -10, -6, -3, 0]) {
     const x = Math.round(at(db)) + 0.5;
     g.beginPath();
-    g.moveTo(x, 12);
-    g.lineTo(x, H - 14);
+    g.moveTo(x, peakY - 3);
+    g.lineTo(x, barsBottom + 3);
     g.stroke();
   }
   for (const db of [-60, -40, -20, -6, 0]) {
-    g.fillText(String(db), Math.round(at(db)), H - 4);
+    g.fillText(String(db), Math.round(at(db)), H - 3);
   }
 
   // ---- peak bar -------------------------------------------------------
-  const peakY = 16, barH = 14;
-  label('PK', peakY + 11);
+  label('PK', peakY + barH - 3);
   g.fillStyle = 'rgba(255,255,255,.05)';
   g.fillRect(x0, peakY, span, barH);
   if (isFinite(meterFall)) {
@@ -387,8 +436,7 @@ function drawMeter() {
   }
 
   // ---- loudness bar ---------------------------------------------------
-  const loudY = peakY + barH + 12;
-  label('LUFS', loudY + 11);
+  label('LUFS', loudY + barH - 3);
   const target = Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness).lufs;
 
   // The tolerance band, drawn under everything as a sign of "close enough".
@@ -414,10 +462,11 @@ function drawMeter() {
 
   // The target sign itself.
   const tx = at(target);
+  const signH = Math.min(6, gap - 4);
   g.fillStyle = '#e8ebf0';
   g.beginPath();
-  g.moveTo(tx - 4, loudY - 8);
-  g.lineTo(tx + 4, loudY - 8);
+  g.moveTo(tx - 4, loudY - signH - 2);
+  g.lineTo(tx + 4, loudY - signH - 2);
   g.lineTo(tx, loudY - 2);
   g.closePath();
   g.fill();
@@ -5790,16 +5839,31 @@ function stopMouseTake() {
 
     // Generated selections are replaced wholesale; hand-made ones are not touched.
     c.fx = c.fx.filter((f) => !(f && f.type === 'select' && f.gen === 'onrender'));
+
+    // The rectangle has to track the pointer the viewer can SEE, which is the smoothed,
+    // lagged one - so it is built from the same path, with this clip's own cursor
+    // settings rather than the defaults, in case they have been tuned. Timeline time in,
+    // frame-space out; `splitTake` put the take on the clip's source axis, so the
+    // conversion is the same one `clipCursorAt()` makes.
+    const cur = (c.fx || []).find((f) => f && f.type === 'cursor');
+    const cp = (cur && cur.params) || Cursor.DEFAULTS.cursor;
+    const pointerAt = (tt) => Cursor.smoothAt(
+      c.mouse, tt - c.start + (Number(c.in) || 0), { smooth: cp.smooth, lag: cp.lag });
+
     for (const sel of sels) {
       const mid = (sel.t0 + sel.t1) / 2;
       if (mid < c.start || mid >= clipEnd(c)) continue;
-      const built = Cursor.selectionKeys(sel, c, 'onrender');
+      const built = Cursor.selectionKeys(sel, c, 'onrender', pointerAt);
       const fx = FX.create('select');
       fx.gen = 'onrender';
       // The static values are the box as RELEASED, so bypassing the keys or deleting them
       // leaves the shape that was drawn rather than a default rectangle somewhere else.
-      fx.params.x = sel.x; fx.params.y = sel.y;
-      fx.params.w = sel.w; fx.params.h = sel.h;
+      // Taken from the generated keys rather than from `sel`, so they agree with what is
+      // actually drawn - `sel` holds the raw corners and the keys hold the smoothed ones.
+      const lastOf = (k) => (built.keys[k] && built.keys[k].length
+        ? built.keys[k][built.keys[k].length - 1].v : sel[k]);
+      fx.params.x = lastOf('x'); fx.params.y = lastOf('y');
+      fx.params.w = lastOf('w'); fx.params.h = lastOf('h');
       fx.params.showFrom = built.t0;
       // The band is its own entrance, so the envelope's fade is short and the box holds
       // for a couple of seconds after the drag - long enough to be looked at, and an

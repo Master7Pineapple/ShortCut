@@ -93,7 +93,11 @@
   /** The brand accent, until step 17 hands it over to the brand kit. */
   const ACCENT = '#22d3ee';
 
-  const DOWN = 'down', UP = 'up';
+  // MOVE was used by `makeTake()` and `splitTake()` and never defined - a ReferenceError
+  // waiting for the first event that arrived without a `type`. Nothing in the app hit it
+  // because `mouseSample()` always sets one, but both are public and `smoke-cursor.js`
+  // hit it the moment it built a take from bare {t,x,y} samples.
+  const MOVE = 'move', DOWN = 'down', UP = 'up';
 
   const has = (screen) =>
     !!(screen && Array.isArray(screen.events) && screen.events.length);
@@ -640,11 +644,23 @@
    * is a box nobody will fix. `t0`/`t1` come back in clip-local seconds alongside, because
    * the effect also needs to know when to be on screen at all.
    *
+   * `pointerAt(t)` is what keeps the box LOCKED TO THE DRAWN CURSOR, and it matters more
+   * than it looks. The pointer is not drawn at the recorded position: `cursor` smooths the
+   * path and evaluates it `lag` seconds in the past, deliberately, so it reads as a
+   * physical object. A rectangle built from the RAW samples therefore tracks a different
+   * point from the one the viewer can see, and the corner and the pointer separate by
+   * exactly `lag` - the corner appears to chase the cursor, or lead it, instead of being
+   * held by it. Feeding both corners through the same smoothed path removes the gap by
+   * construction rather than by tuning a number.
+   *
+   * `pointerAt` takes a time on the SAME axis as `sel.t0`/`sel.samples` (timeline
+   * seconds) and answers frame-space coordinates, or null to fall back to the raw sample.
+   *
    * A `sel` with no samples - one built by hand, or by an older build - falls back to a
    * static box, which is what it used to be.
    */
   const MIN_GAP = 0.05;
-  function selectionKeys(sel, clip, tag) {
+  function selectionKeys(sel, clip, tag, pointerAt) {
     const start = num((clip || {}).start, 0);
     const L = (t) => Math.max(0, r4(t - start));
     const t0 = L(sel.t0), t1 = L(sel.t1);
@@ -669,8 +685,19 @@
     samples.forEach((sm, i) => {
       if (i === samples.length - 1 || sm.t - last >= MIN_GAP) { kept.push(sm); last = sm.t; }
     });
+
+    // Both corners come off the same path. The anchor is the DRAWN pointer at the moment
+    // of the press, not the raw one, or the box would start away from the cursor that
+    // opened it and snap into place a frame later.
+    const at = (t, rx, ry) => {
+      const q = pointerAt ? pointerAt(t) : null;
+      return q ? q : { x: rx, y: ry };
+    };
+    const anchor = at(sel.t0, sel.x0, sel.y0);
+
     for (const sm of kept) {
-      const r = normRect(sel.x0, sel.y0, sm.x, sm.y);
+      const q = at(sm.t, sm.x, sm.y);
+      const r = normRect(anchor.x, anchor.y, q.x, q.y);
       const t = L(sm.t);
       keys.x.push(key(r.x, t, true));
       keys.y.push(key(r.y, t, true));

@@ -472,6 +472,45 @@
         ok('and the track holds after release rather than needing a trailing key',
           near(Anim.valueAt(holder, 'w', built.t1 + 5, 0), 0.6, 1e-4));
 
+        // LOCKED TO THE DRAWN POINTER. The cursor is not drawn at the recorded
+        // position - it is smoothed and evaluated `lag` seconds in the past, on purpose -
+        // so a box built from the RAW samples tracks a point the viewer cannot see and
+        // the corner separates from the pointer by exactly `lag`. Both corners have to
+        // come off the same path.
+        {
+          const LAG = 0.1;
+          const take = Cursor.makeTake(samples.map((sm) => ({ t: sm.t, x: sm.x, y: sm.y })));
+          const pointerAt = (tt) => Cursor.smoothAt(take, tt, { smooth: 0, lag: LAG });
+          const locked = Cursor.selectionKeys(sel, { start: 0, in: 0 }, 'onrender', pointerAt);
+          const holder = { keys: locked.keys };
+
+          // At any instant the moving corner must BE the drawn pointer.
+          let worst = 0;
+          for (let t = 4.4; t <= 5.8; t += 0.1) {
+            const q = pointerAt(t);
+            const x = Anim.valueAt(holder, 'x', t, 0);
+            const w = Anim.valueAt(holder, 'w', t, 0);
+            const anchor = pointerAt(4);
+            const corner = q.x >= anchor.x ? x + w : x;
+            worst = Math.max(worst, Math.abs(corner - q.x));
+          }
+          ok('THE FIX: the moving corner sits ON the drawn pointer, not behind it',
+            worst < 0.01, 'worst gap = ' + worst.toFixed(4) + ' of the frame');
+
+          // And the proof it was measuring something: the raw-sample version does NOT.
+          const raw = Cursor.selectionKeys(sel, { start: 0, in: 0 }, 'onrender');
+          const rawHolder = { keys: raw.keys };
+          let rawWorst = 0;
+          for (let t = 4.4; t <= 5.8; t += 0.1) {
+            const q = pointerAt(t);
+            const x = Anim.valueAt(rawHolder, 'x', t, 0);
+            const w = Anim.valueAt(rawHolder, 'w', t, 0);
+            rawWorst = Math.max(rawWorst, Math.abs((x + w) - q.x));
+          }
+          ok('...which the un-locked version genuinely did not do',
+            rawWorst > 0.02, 'raw gap = ' + rawWorst.toFixed(4));
+        }
+
         // Dragging up-and-left from the anchor: the rect flips sides, and x/y have to
         // move for it rather than the width going negative.
         const back = [];

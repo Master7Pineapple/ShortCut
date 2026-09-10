@@ -285,6 +285,40 @@
       document.querySelector('#meterCanvas').getBoundingClientRect().height >= 46,
       Math.round(document.querySelector('#meterCanvas').getBoundingClientRect().height) + 'px');
 
+    // ================================================ the layout at every height
+    //
+    // The canvas is a flex child of a fixed-height panel, so its height is whatever is
+    // left over - and the layout used to be constants that needed about 70px. Squeezed
+    // below that it drew the loudness bar straight through the dB scale with the "LUFS"
+    // label running under it: unreadable, but nothing clipped and nothing errored, which
+    // is why it survived. `meterLayout()` derives every row instead, so this asserts the
+    // invariants across the whole range the panel can hand it.
+    {
+      let worstH = 0, bad = '';
+      for (let H = 40; H <= 160; H++) {
+        const L = meterLayout(H);
+        const fail =
+          L.peakY < 0 ? 'peak above the canvas'
+            : L.loudY < L.peakY + L.barH ? 'bars overlap'
+              : L.barsBottom > H - L.scaleH ? 'bars run into the dB scale'
+                : L.barH < 6 ? 'bar thinner than its own label'
+                  : L.loudY - (L.peakY + L.barH) < 4 ? 'no room for the target sign'
+                    : '';
+        if (fail && !bad) { bad = fail; worstH = H; }
+      }
+      ok('the meter lays out cleanly at every height the panel can give it',
+        !bad, bad ? (bad + ' at H=' + worstH) : '40..160 all clean');
+
+      const tight = meterLayout(46);      // the CSS floor
+      ok('...including at the CSS floor, where it used to collide',
+        tight.barsBottom <= 46 - tight.scaleH && tight.barH >= 6,
+        JSON.stringify(tight));
+      const roomy = meterLayout(120);
+      ok('and it uses the room when there is some, up to the cap',
+        roomy.barH === 14 && roomy.barH >= tight.barH,
+        'barH ' + tight.barH + ' -> ' + roomy.barH);
+    }
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {
