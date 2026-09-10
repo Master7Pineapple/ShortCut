@@ -265,8 +265,17 @@
       // therefore both unreachable. The effect now insets the picture by `margin` and
       // rounds THAT rectangle, so the shadow has somewhere to fall.
       label: 'Corners + shadow',
-      params: { margin: 0.05, radius: 0.04, colour: '#000000', shadow: 0.5, blur: 0.03, offsetX: 0, offsetY: 0.012 },
+      params: {
+        mode: 'inner',
+        margin: 0, radius: 0, colour: '#000000',
+        shadow: 0.5, blur: 0.08, offsetX: 0, offsetY: 0,
+      },
       schema: [
+        { path: 'params.mode', label: 'Shadow falls', type: 'select',
+          options: [
+            { value: 'inner', label: 'Inward (vignette)' },
+            { value: 'outer', label: 'Outward (drop shadow)' },
+          ] },
         { path: 'params.margin', label: 'Inset', type: 'range', min: 0, max: 0.3, step: 0.002, digits: 3 },
         { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.5, step: 0.002, digits: 3 },
         { path: 'params.colour', label: 'Shadow colour', type: 'color' },
@@ -322,9 +331,14 @@
         // shadow pixel. The padded blur is the same one the `blur` effect uses and it
         // measures scale-invariant, so the two resolutions now agree.
         const sh = clamp(p.shadow, 0, 1);
-        if (sh > 0.002) {
-          const r = Math.max(0, pxMin(p.blur, W, H));
-          const ox = pxMin(p.offsetX, W, H), oy = pxMin(p.offsetY, W, H);
+        const inner = String(p.mode || 'inner') !== 'outer';
+        const r = Math.max(0, pxMin(p.blur, W, H));
+        const ox = pxMin(p.offsetX, W, H), oy = pxMin(p.offsetY, W, H);
+
+        // OUTWARD: the silhouette laid down first, so the picture covers its middle and
+        // only the part that escapes past the edges is seen. It needs somewhere to escape
+        // TO, which is what `margin` opens - on a full-frame clip it falls off the canvas.
+        if (sh > 0.002 && !inner) {
           const sil = clean(L.surface, 'fxShA', W, H);
           sil.c.fillStyle = rgba(p.colour, 1);
           roundRectPath(sil.c, m + ox, m + oy, dw, dh, rad);
@@ -341,6 +355,59 @@
         }
 
         L.c.drawImage(rounded.cv, 0, 0);
+
+        // INWARD: the silhouette INVERTED - solid everywhere except the rect - blurred so
+        // it bleeds back over the picture's own edges, and composited `source-atop` so it
+        // touches nothing but this clip. That is the darkening people mean by a vignette:
+        // strongest in the corners, because a corner has the most "outside" near it, and
+        // more so the rounder it is.
+        //
+        // This is the default, and it is the one that works with NO setup: it needs no
+        // margin, so a full-frame clip gets a vignette the moment the effect is added.
+        // The outward shadow needs room opened for it first, which is why it was mistaken
+        // for a broken effect - it draws into space that is not on the canvas.
+        if (sh > 0.002 && inner) {
+          // THE PADDING IS SOLID SHADOW, and that is the whole trick.
+          //
+          // The obvious build - fill the frame, punch the rect out, blur - produces
+          // NOTHING at the default settings, because with no inset and no corner radius
+          // the rect IS the frame and the punch removes everything. There has to be
+          // shadow OUTSIDE the picture for any of it to bleed back in.
+          //
+          // So the plate is built oversized and filled solid, and the rect is punched out
+          // of the middle of it. Everything beyond the frame edge is then shadow, the
+          // blur carries it inward over the picture's own edges, and the result is a dark
+          // band all the way round that is strongest in the corners - because a corner
+          // has solid plate on two sides of it instead of one, and more so the rounder it
+          // is. That is the darkening people mean by a vignette.
+          const pad = Math.ceil(Math.max(r, 1) * 3) + 2;
+          const PW = W + pad * 2, PH = H + pad * 2;
+          const plate = clean(L.surface, 'fxShP', PW, PH);
+          plate.c.fillStyle = rgba(p.colour, 1);
+          plate.c.fillRect(0, 0, PW, PH);
+          plate.c.globalCompositeOperation = 'destination-out';
+          roundRectPath(plate.c, pad + m + ox, pad + m + oy, dw, dh, rad);
+          plate.c.fill();
+          plate.c.globalCompositeOperation = 'source-over';
+
+          let out = plate.cv;
+          if (r > 0.05) {
+            const soft = clean(L.surface, 'fxShS', PW, PH);
+            soft.c.filter = 'blur(' + (Math.round(r * 100) / 100) + 'px)';
+            soft.c.drawImage(plate.cv, 0, 0);
+            soft.c.filter = 'none';
+            out = soft.cv;
+          }
+
+          L.c.save();
+          L.c.globalAlpha = sh;
+          // Only over this clip's own pixels. Filled normally it would darken the
+          // transparency around a logo or a cutout, and dim the layers underneath through
+          // a clip that is not even there.
+          L.c.globalCompositeOperation = 'source-atop';
+          L.c.drawImage(out, pad, pad, W, H, 0, 0, W, H);
+          L.c.restore();
+        }
       },
     },
 
@@ -1002,12 +1069,36 @@
     return true;
   }
 
+  /**
+   * Why a `round` shadow cannot be seen, at one instant. `null` when it can.
+   *
+   * Both answers are things the panel cannot show any other way. The shadow lives in the
+   * room `margin` opens, so there are exactly two ways to lose it: leave no room, or push
+   * it out of the room there is. Neither draws anything, and neither is wrong enough to
+   * be an error - which is precisely why they need saying out loud.
+   *
+   * It takes the ANIMATED parameters rather than the static ones, because the first way
+   * to end up with no room is a keyframe. A single key on `margin` holds its value across
+   * the whole clip and silently overrides the slider above it, so a panel reading
+   * `params.margin` would cheerfully report 0.04 while the picture used 0.
+   */
+  function shadowProblem(p) {
+    if (!(clamp(p.shadow, 0, 1) > 0.002)) return null;      // no shadow asked for
+    // An INWARD shadow draws over the picture itself, so it needs no room and can never
+    // be pushed out of any. Only the outward one can be aimed at space that is not there.
+    if (String(p.mode || 'inner') !== 'outer') return null;
+    const margin = Number(p.margin) || 0;
+    if (!(margin > 0.001)) return 'no-room';
+    const reach = Math.max(Math.abs(Number(p.offsetX) || 0), Math.abs(Number(p.offsetY) || 0));
+    return reach > margin ? 'pushed-out' : null;
+  }
+
   const API = {
     DEFS, TYPES,
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
     pointerImage, preloadImages,
-    MBLUR, mblurOf, timeVarying,
+    MBLUR, mblurOf, timeVarying, shadowProblem,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
   };

@@ -184,11 +184,12 @@
 
     // ============================================================ 5. corners + shadow
     {
-      const rounded = run([fx('round', { radius: 0.25, shadow: 0 })], 80, 80, null);
+      const rounded = run([fx('round', { mode: 'outer', radius: 0.25, shadow: 0 })], 80, 80, null);
       ok('a corner radius rounds the layer away to transparency',
         rounded.px(2, 2)[3] === 0 && eq(rounded.px(40, 40), [255, 0, 0, 255]),
         'corner ' + rounded.px(2, 2).join(',') + ' middle ' + rounded.px(40, 40).join(','));
-      const shadowed = run([fx('round', { radius: 0.25, shadow: 1, blur: 0.08, offsetX: 0, offsetY: 0 })],
+      const shadowed = run([fx('round',
+        { mode: 'outer', radius: 0.25, shadow: 1, blur: 0.08, offsetX: 0, offsetY: 0 })],
         80, 80, null);
       ok('the shadow is cast into the rounded-away corner, not squared off',
         shadowed.px(2, 2)[3] > rounded.px(2, 2)[3],
@@ -200,7 +201,9 @@
       // Predicted in FLOAT from the transparent run, not by re-compositing that canvas over
       // blue: an 8-bit canvas stores colour unpremultiplied, so bouncing a shadow of alpha
       // 15 through one loses far more precision than the thing being measured.
-      const shadowCfg = { radius: 0.25, shadow: 1, blur: 0.08, offsetX: 0, offsetY: 0 };
+      // The SAME config `shadowed` above was painted with, or the two runs being compared
+      // are not the same effect and the comparison means nothing.
+      const shadowCfg = { mode: 'outer', radius: 0.25, shadow: 1, blur: 0.08, offsetX: 0, offsetY: 0 };
       const overBg = run([fx('round', shadowCfg)], 80, 80, '#0000ff');
       const bgRGB = [0, 0, 255];
       let worst = 0, at = '';
@@ -386,10 +389,11 @@
     // the layer down first did not help either, because the rounded rect stayed the whole
     // frame whatever was inside it. `margin` is what makes both halves reachable.
     {
+      // OUTWARD unless a case says otherwise: the inward shadow is the default now, and
+      // this whole block is about the outward one and the room it needs.
       const shot = (params, W, H) => {
-        const f = fx('round', params);
-        const r = run([f], W, H, null, paintBlock('#ff0000'), 0);
-        return r;
+        const f = fx('round', Object.assign({ mode: 'outer' }, params));
+        return run([f], W, H, null, paintBlock('#ff0000'), 0);
       };
       const W = 120, H = 200;
       const r = shot({ margin: 0.08, radius: 0.06, shadow: 0.9, blur: 0.04, offsetY: 0.02 }, W, H);
@@ -429,6 +433,53 @@
         // The inset rect's own corner is cut away; its middle-left edge is not.
         return big.px(mm + 1, mm + 1)[3] === 0 && big.px(mm + 1, H / 2)[0] > 200;
       })());
+
+      // ---- the two ways to lose the shadow, and the panel that names them -----
+      //
+      // Both came off a real report: Inset 0.040 with a keyframe pinning it to 0, and
+      // Shadow X/Y at 0.136 against a 0.040 Inset. Neither draws anything and neither is
+      // an error, which is exactly why they need saying out loud.
+      const P = (o) => Object.assign({}, FX.DEFS.round.params, { mode: 'outer' }, o);
+      ok('no Inset means no room, and that is diagnosable',
+        FX.shadowProblem(P({ margin: 0, shadow: 0.6 })) === 'no-room');
+      ok('an offset further than the Inset pushes the shadow out of the frame',
+        FX.shadowProblem(P({ margin: 0.04, shadow: 0.63, offsetX: 0.136, offsetY: -0.14 })) === 'pushed-out');
+      ok('and a shadow that fits reports nothing',
+        FX.shadowProblem(P({ margin: 0.04, shadow: 0.63, offsetX: 0.02, offsetY: -0.02 })) === null);
+      ok('no shadow asked for is never a problem',
+        FX.shadowProblem(P({ margin: 0, shadow: 0 })) === null);
+
+      // The pixels agree with the diagnosis: pushed out really is invisible.
+      {
+        const pushed = shot({ margin: 0.04, radius: 0.02, shadow: 0.63, blur: 0.048,
+          offsetX: 0.136, offsetY: -0.14 }, W, H);
+        const fits = shot({ margin: 0.04, radius: 0.02, shadow: 0.63, blur: 0.048,
+          offsetX: 0.01, offsetY: 0.012 }, W, H);
+        const mm = Math.round(0.04 * Math.min(W, H));
+        const y = Math.round(H - mm + 1);
+        ok('THE REPORT: an offset past the Inset leaves the margin empty',
+          pushed.px(W / 2, y)[3] < 8 && fits.px(W / 2, y)[3] > 8,
+          'pushed a=' + pushed.px(W / 2, y)[3] + '  fits a=' + fits.px(W / 2, y)[3]);
+      }
+
+      // ONE KEY OVERRIDES THE SLIDER, for the whole clip. This is the general rule the
+      // report ran into: a track holds its first value before its first key and its last
+      // after its last, so a single key is a constant - and the slider above it, which
+      // still reads 0.040, is then decoration.
+      {
+        const f = fx('round', { mode: 'outer', margin: 0.04 });
+        Anim.addKey(Anim.trackFor(f, 'margin', true), 0.46, 0);
+        ok('a single keyframe pins the parameter across the whole clip, slider ignored',
+          FX.paramAt(f, 'margin', 0) === 0 && FX.paramAt(f, 'margin', 5) === 0 &&
+          f.params.margin === 0.04,
+          'static=' + f.params.margin + ' animated=' + FX.paramAt(f, 'margin', 5));
+        ok('...so the shadow is diagnosed from the ANIMATED value, not the slider',
+          FX.shadowProblem(FX.paramsAt(f, 2)) === 'no-room');
+        Anim.trackFor(f, 'margin', true).length = 0;
+        Anim.pruneKeys(f);
+        ok('clearing the keys hands the slider back',
+          FX.paramAt(f, 'margin', 2) === 0.04 && !f.keys);
+      }
 
       ok('margin 0 is the old full-frame behaviour, so nothing silently reframes',
         (() => {
@@ -631,9 +682,47 @@
       ok('every numeric parameter gets a keyframe strip',
         strips.length === blurParams + gradeParams,
         strips.length + ' strips for ' + (blurParams + gradeParams) + ' parameters');
-      ok('a colour parameter gets a swatch but no keyframe strip',
-        Object.keys(FX.DEFS.round.params).filter((k) => typeof FX.DEFS.round.params[k] === 'number').length ===
-        Object.keys(FX.DEFS.round.params).length - 1);
+      // Only NUMBERS get a strip. `round` now has two that are not - `colour` and the
+      // `mode` select - so this counts them rather than assuming there is exactly one.
+      ok('non-numeric parameters get a control but no keyframe strip', (() => {
+        const all = Object.keys(FX.DEFS.round.params);
+        const nums = all.filter((k) => typeof FX.DEFS.round.params[k] === 'number');
+        return nums.length === all.length - 2 && all.includes('colour') && all.includes('mode');
+      })());
+
+      // ---- a first key must not move the picture ---------------------------
+      //
+      // `keyStrip()` promises that adding a key never moves anything. On an empty track
+      // it takes `spec.base`, which used to be the parameter's DEFAULT - so adding a key
+      // to a value the author had moved would snap it back to the default and change the
+      // picture at the exact moment they asked to animate it.
+      {
+        renderInspector();
+        const c0 = live();
+        // The block after this one expects the two-effect stack the panel tests built, so
+        // borrow the clip and give it back rather than leaving it empty.
+        const savedStack = JSON.parse(JSON.stringify(c0.fx || []));
+        c0.fx = [FX.create('round')];
+        c0.fx[0].params.margin = 0.04;          // moved away from the default
+        renderInspector();
+        const allStrips = [...document.querySelectorAll('#inspector .fx-box .tc-kf')];
+        const strip = allStrips.find((r) => /Inset/.test(r.textContent));
+        ok('the Inset parameter has a keyframe strip', !!strip,
+          allStrips.length + ' strips: ' + allStrips.map((r) => r.textContent.slice(0, 12)).join(' | '));
+        const addKey = strip && [...strip.querySelectorAll('button')]
+          .find((b) => b.textContent === '+ key');
+        if (addKey) addKey.click();
+        const track = ((live().fx[0] || {}).keys || {}).margin || [];
+        ok('a first key takes the CURRENT value, not the default',
+          track.length === 1 && Math.abs(track[0].v - 0.04) < 1e-9,
+          'key=' + (track[0] && track[0].v) + ' slider=0.04 default=' + FX.DEFS.round.params.margin);
+        ok('...so the picture does not move when you start animating',
+          Math.abs(FX.paramAt(live().fx[0], 'margin', 0) - 0.04) < 1e-9);
+        live().fx = savedStack.length ? savedStack
+          : [FX.create('blur'), FX.create('grade')];
+        FX.normalizeClip(live());
+        renderInspector();
+      }
 
       // ---- rolling a row up ------------------------------------------------
       //

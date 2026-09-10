@@ -1815,6 +1815,32 @@ function clipFxPanel(clip) {
         'No mouse take on this clip, so this draws nothing. Record one with Mouse.'));
     }
 
+    // A `round` shadow that cannot be seen, and why. Read at the PLAYHEAD and from the
+    // animated values, because the commonest way to lose the shadow is a keyframe on
+    // Inset holding it at 0 - which overrides the slider above and shows up nowhere else.
+    if (fx.type === 'round') {
+      const dur0 = Math.max(0.001, clip.out - clip.in);
+      const tNow = clamp(state.playhead - clip.start, 0, dur0);
+      const anim = FX.paramsAt(fx, tNow);
+      const why = FX.shadowProblem(anim);
+      const keyed = !!(fx.keys && fx.keys.margin && fx.keys.margin.length);
+      if (why === 'no-room') {
+        row.appendChild(el('div', 'tc-hint fx-warn',
+          keyed
+            ? 'A keyframe is holding Inset at ' + anim.margin.toFixed(3) + ' here, which ' +
+              'overrides the slider above - so the shadow is cast at the frame edge and ' +
+              'falls outside it. Clear the Inset keys, or raise that key.'
+            : 'Inset is 0, so the shadow is cast at the frame edge and falls outside the ' +
+              'frame. Raise Inset to open the gap the shadow needs.'));
+      } else if (why === 'pushed-out') {
+        const reach = Math.max(Math.abs(anim.offsetX), Math.abs(anim.offsetY));
+        row.appendChild(el('div', 'tc-hint fx-warn',
+          'Shadow X/Y is offset ' + reach.toFixed(3) + ', further than the ' +
+          anim.margin.toFixed(3) + ' Inset opens - so most of the shadow falls outside ' +
+          'the frame. Raise Inset, or bring Shadow X/Y under it.'));
+      }
+    }
+
     const body = el('div', 'fx-fx-body');
     body.hidden = shut;
     // Belt and braces now that the row is not a drag source either: an explicit `false`
@@ -1898,6 +1924,12 @@ function clipFxPanel(clip) {
           'Keys are times within the clip, so moving the clip moves its animation with it.'));
         for (const k of numeric) {
           const spec = Object.assign({}, Anim.propSpec(k), specForParam(d, k));
+          // `base` is what a FIRST key on an empty track takes, and it has to be the
+          // parameter's CURRENT value rather than its default - otherwise adding a key to
+          // an Inset the author had moved to 0.040 would pin it at the 0.05 default and
+          // jump the picture the moment they asked to animate it. `keyStrip()` promises
+          // that adding a key never moves anything; this is what makes that true.
+          if (typeof fx.params[k] === 'number') spec.base = fx.params[k];
           kb.appendChild(TextUI.keyStrip(k, Object.assign({}, keyHooks, {
             spec,
             getKeys: () => Anim.trackFor(fx, k, true),

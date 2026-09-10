@@ -1364,10 +1364,34 @@ Two things it gets right on purpose:
   hole-punching path can be built at all, and `smoke-cursor.js` asserts the inside is
   untouched and the outside is darker and still opaque.
 
-#### `round` needs a margin, and that is what makes it work at all
+#### `round`: the shadow falls inward by default, and that IS the vignette
 
-It is not a vignette — darkening the frame's own edges is a different pass and belongs with
-the finishing effects. It rounds and shadows the **clip**.
+**Shadow falls** picks the direction, and it is the control that decides whether the effect
+appears to work at all.
+
+**Inward** (the default) is the vignette: a soft darkening around the inside of the frame,
+strongest in the corners. It needs no setup — no inset, no corner radius — so a full-frame
+clip gets a vignette the moment the effect is added.
+
+**Outward** is an ordinary drop shadow. It draws *beyond* the picture, so on a full-frame
+clip it lands off the canvas and shows nothing until `Inset` opens room for it. That is
+what made the effect look broken for so long: the only visible result of adding it was the
+corner radius cutting the corners to transparency, and the shadow controls did nothing
+that could be seen.
+
+The inward shadow's implementation has one trick worth knowing. The obvious build — fill
+the frame, punch the rounded rect out, blur what is left — produces **nothing** at the
+default settings, because with no inset and no radius the rect *is* the frame and the
+punch removes everything. There has to be shadow *outside* the picture for any of it to
+bleed back in. So the plate is built oversized and filled solid, the rect is punched out of
+the middle of it, and the blur carries the surround inward over the picture's own edges.
+The corners come out darkest because a corner has solid plate on two sides of it instead
+of one — more so the rounder it is.
+
+It composites `source-atop`, which is the difference between a vignette and a grey
+rectangle: filled normally the gradient would darken the layer's *transparency* too, so a
+logo or a cutout would gain a dark halo and the layers underneath would be dimmed through
+a clip that is not even there.
 
 For a long time it could do neither. The rounded rectangle was hardcoded to the full
 frame, which is a catch-22: on a full-frame clip the shadow is cast at the frame edge and
@@ -1398,6 +1422,20 @@ shadow instead of a ragged one.
 The margin is an equal number of **pixels** on all four sides, not an equal fraction of
 each axis: on a 9:16 frame a uniform fraction would inset the top and bottom nearly twice
 as far as the sides and the border would read as lopsided.
+
+**There are exactly two ways to lose the OUTWARD shadow, and the panel names both.** It
+lives in the room the margin opens, so you either leave no room or push it out of the room
+there is — `FX.shadowProblem()` answers `no-room`, `pushed-out` or `null`, and the row says
+which. An inward shadow draws over the picture itself, so it needs no room and can never be
+pushed out of any; the check returns `null` for it. Neither case draws anything and neither
+is an error, which is why both went undiagnosed for so long:
+
+- **No room.** `margin` is 0, so the shadow is cast at the frame edge and falls outside it.
+- **Pushed out.** `offsetX`/`offsetY` reach further than `margin`, so the shadow lands
+  mostly beyond the frame. A 0.136 offset against a 0.040 inset shows nothing at all.
+
+It reads the **animated** parameters at the playhead, not the sliders, because the
+commonest way to end up with no room is a keyframe — see below.
 
 ### Auto-zoom, and cursor smoothing
 
@@ -1794,6 +1832,21 @@ Four rules the tracks live by, each of which has a test:
   in exactly one place, `Anim.sortKeys()`, called by the editing functions.
 - **`retimeKey` returns the key's new index**, because dragging a key past its neighbour
   reorders the track and a caller holding the old index would then edit the wrong key.
+
+#### One key is a constant, and the slider becomes decoration
+
+A track holds its first value before its first key and its last after its last, so a
+**single keyframe pins the parameter across the whole clip**. The slider above it still
+shows the old number and is simply no longer read. This is correct and it is also the
+easiest thing in the panel to do by accident: one stray key on `Inset` at 0 makes a shadow
+impossible while the control still reads 0.040, and nothing anywhere says so. Anything
+diagnosing a parameter has to read it through `FX.paramAt()` rather than off `params`.
+
+**A first key takes the parameter's CURRENT value.** `keyStrip()` promises that adding a
+key never moves anything, and on an empty track it takes `spec.base` — which used to be
+the parameter's *default*. So adding a key to a value the author had moved snapped it back
+to the default and changed the picture at the exact moment they asked to animate it.
+`clipFxPanel()` now overrides `base` with the live `params[k]`.
 
 #### Keys on an ordinary clip
 
