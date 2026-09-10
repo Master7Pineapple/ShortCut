@@ -210,6 +210,33 @@
     return s.cv;
   }
 
+  /**
+   * The clip AS PAINTED, before any effect in the stack touched it - built on first ask
+   * and never otherwise, so a stack that does not want it allocates nothing.
+   *
+   * This is the second and last thing an effect may reach for beyond its own parameters,
+   * alongside the `clip` argument, and it exists for one effect: `background` in its
+   * blurred-copy mode is documented as a blurred copy OF THE CLIP, and by the time it
+   * runs the layer is whatever `chrome` or `inset` left of it - a hole, mostly. Reading
+   * the layer there would make the background a blurred copy of a picture with a
+   * device-shaped bite out of it.
+   *
+   * It is the clip's own pixels and nothing else - no timeline position, no neighbours -
+   * so it stays inside the cache key rules exactly as `paint` itself does.
+   */
+  function baseOf(surface, W, H, paint) {
+    let cv = null;
+    return () => {
+      if (!cv) {
+        const b = clean(surface, 'fxBase', W, H);
+        paint(b.c, W, H);
+        reset(b.c);
+        cv = b.cv;
+      }
+      return cv;
+    };
+  }
+
   // ----------------------------------------------------------------- effect types
 
   /**
@@ -819,9 +846,644 @@
         L.c.restore();
       },
     },
+
+    // ------------------------------------------------- step 10: the framing four
+    //
+    // Chrome, background, spotlight and cutout are one shape wearing four hats:
+    // something drawn AROUND the footage, BEHIND it, OVER it, or LIFTED OUT of it.
+    // All four are ordinary DEFS entries, so the panel, the keyframe strips, the
+    // serialisation and the shutter arrived with them and none of it is written here.
+    //
+    // Two of the four only have anything to do once the layer has transparency in it -
+    // `background` paints into it, `chrome` makes it - so ORDER is the whole feature:
+    // chrome then background is a framed shot on a gradient; background then chrome is a
+    // gradient the chrome then covers up. The panel's arrows are how that is said, and
+    // there is deliberately no auto-ordering to guess it for the author.
+
+    chrome: {
+      label: 'Device frame',
+      params: {
+        preset: 'browser',
+        pad: 0.05,
+        aspect: 0,
+        x: 0, y: 0,
+        radius: 0.028,
+        fit: 'cover',
+        tinted: 0,
+        tint: '#f4f5f7',
+        shadow: 0.45,
+        blur: 0.035,
+        offsetY: 0.012,
+      },
+      schema: [
+        { path: 'params.preset', label: 'Frame', type: 'select',
+          options: [
+            { value: 'browser', label: 'Browser - light' },
+            { value: 'browserDark', label: 'Browser - dark' },
+            { value: 'laptop', label: 'Laptop' },
+            { value: 'phone', label: 'Phone' },
+          ] },
+        { path: 'params.pad', label: 'Padding', type: 'range', min: 0, max: 0.45, step: 0.002, digits: 3 },
+        { path: 'params.aspect', label: 'Screen aspect', type: 'range', min: 0, max: 3, step: 0.01, digits: 2 },
+        { path: 'params.x', label: 'Offset X', type: 'range', min: -0.5, max: 0.5, step: 0.002, digits: 3 },
+        { path: 'params.y', label: 'Offset Y', type: 'range', min: -0.5, max: 0.5, step: 0.002, digits: 3 },
+        { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.12, step: 0.001, digits: 3 },
+        { path: 'params.fit', label: 'Footage', type: 'select',
+          options: [
+            { value: 'cover', label: 'Fill the screen (crop)' },
+            { value: 'contain', label: 'Fit the screen (letterbox)' },
+          ] },
+        { path: 'params.tinted', label: 'Override body colour', type: 'check' },
+        { path: 'params.tint', label: 'Body colour', type: 'color' },
+        { path: 'params.shadow', label: 'Shadow', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.blur', label: 'Shadow blur', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
+        { path: 'params.offsetY', label: 'Shadow drop', type: 'range', min: -0.1, max: 0.1, step: 0.001, digits: 3 },
+      ],
+      /**
+       * The clip drawn inside a device, with a title bar, a bezel and a drop shadow.
+       *
+       * THE PRESETS ARE PATHS, NEVER BITMAPS. A 1x bitmap frame would be sharp in the
+       * 540x960 viewer and soft in the 1080x1920 file, which is the one thing this file
+       * exists to prevent. Every preset is `roundRectPath()` plus a handful of fills, so
+       * it is exact at any output size.
+       *
+       * `chromeGeom()` does the whole layout and nothing else does any of it: it is the
+       * only place that decides where the device, its bar and its screen are, so the
+       * smoke suite asserts the geometry at several aspect ratios without painting.
+       */
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const g = chromeGeom(p, W, H);
+        if (!g) return;
+        const pre = g.pre;
+        const src = take(L, 'fxChA');
+
+        // The shadow first, underneath everything: the device's own silhouette, blurred
+        // at 1:1 and cropped back. `ctx.shadowBlur` is not scale-invariant - `round`
+        // learned that the hard way - so it is not used here either.
+        const sh = clamp(p.shadow, 0, 1);
+        const r = Math.max(0, pxMin(p.blur, W, H));
+        if (sh > 0.002 && r > 0.05) {
+          const sil = clean(L.surface, 'fxChSil', W, H);
+          sil.c.fillStyle = '#000';
+          roundRectPath(sil.c, g.frame.x, g.frame.y, g.frame.w, g.frame.h, g.radius);
+          sil.c.fill();
+          if (g.base) {
+            sil.c.beginPath();
+            sil.c.rect(g.base.x, g.base.y, g.base.w, g.base.h);
+            sil.c.fill();
+          }
+          // NOT edge-extended: a silhouette is already surrounded by transparency and
+          // wants to stay that way. See padBlur().
+          const b = padBlur(sil.cv, r, W, H, L.surface, 'fxChSh', false);
+          L.c.save();
+          L.c.globalAlpha = sh;
+          L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, pxMin(p.offsetY, W, H), W, H);
+          L.c.restore();
+          reset(L.c);
+        }
+
+        // The body.
+        // An explicit switch rather than an empty colour: a colour input cannot show
+        // "unset" - Chromium renders an empty value as black - so a swatch reading black
+        // while the frame drew grey would be the panel lying about the picture.
+        const body = Number(p.tinted) ? String(p.tint || pre.body) : pre.body;
+        L.c.fillStyle = body;
+        roundRectPath(L.c, g.frame.x, g.frame.y, g.frame.w, g.frame.h, g.radius);
+        L.c.fill();
+
+        // The title bar, its separator and its furniture, clipped to the body's rounding.
+        if (g.bar.h > 0.5) {
+          L.c.save();
+          roundRectPath(L.c, g.frame.x, g.frame.y, g.frame.w, g.frame.h, g.radius);
+          L.c.clip();
+          L.c.fillStyle = pre.barFill;
+          L.c.fillRect(g.bar.x, g.bar.y, g.bar.w, g.bar.h);
+          L.c.fillStyle = pre.line;
+          const hair = Math.max(1, g.unit * 0.005);
+          L.c.fillRect(g.bar.x, g.bar.y + g.bar.h - hair, g.bar.w, hair);
+          L.c.restore();
+          reset(L.c);
+
+          const dot = g.bar.h * 0.15;
+          const cy = g.bar.y + g.bar.h / 2;
+          const cols = pre.dark ? ['#4a4f5a', '#4a4f5a', '#4a4f5a'] : ['#ff5f57', '#febc2e', '#28c840'];
+          for (let i = 0; i < 3; i++) {
+            L.c.fillStyle = cols[i];
+            L.c.beginPath();
+            L.c.arc(g.bar.x + g.bar.h * (0.42 + i * 0.4), cy, dot, 0, Math.PI * 2);
+            L.c.fill();
+          }
+          // The address pill is a SHAPE, not text. Text would need a font, and a mockup
+          // that renders differently because the export lacks one is exactly the drift
+          // step 6 got rid of.
+          const pw = g.bar.w * 0.44, ph = g.bar.h * 0.44;
+          L.c.fillStyle = pre.pill;
+          roundRectPath(L.c, g.bar.x + (g.bar.w - pw) / 2, cy - ph / 2, pw, ph, ph / 2);
+          L.c.fill();
+        }
+
+        // The phone's notch, over the bezel and outside the screen.
+        if (pre.notch) {
+          const nw = g.frame.w * 0.34, nh = Math.max(1, g.unit * 0.022);
+          L.c.fillStyle = '#0b0c10';
+          roundRectPath(L.c, g.frame.x + (g.frame.w - nw) / 2, g.frame.y + g.bezel * 0.35,
+            nw, nh, nh / 2);
+          L.c.fill();
+        }
+
+        // The screen: the footage, fitted and CLIPPED to the inner rounding. A clip, not
+        // a second scale - clipping is exact and scaling is not. See the unit rule.
+        L.c.save();
+        roundRectPath(L.c, g.screen.x, g.screen.y, g.screen.w, g.screen.h, g.innerRadius);
+        L.c.clip();
+        fitDraw(L.c, src, W, H, g.screen, String(p.fit || 'cover'));
+        L.c.restore();
+        reset(L.c);
+
+        // The laptop base last, so it sits in front of the shadow it casts.
+        if (g.base) {
+          L.c.fillStyle = pre.baseFill || body;
+          roundRectPath(L.c, g.base.x, g.base.y, g.base.w, g.base.h, g.base.h * 0.35);
+          L.c.fill();
+          L.c.fillStyle = pre.line;
+          const lw = g.base.w * 0.16, lh = g.base.h * 0.3;
+          roundRectPath(L.c, g.base.x + (g.base.w - lw) / 2, g.base.y, lw, lh, lh / 2);
+          L.c.fill();
+        }
+      },
+    },
+
+    background: {
+      label: 'Background',
+      params: {
+        mode: 'gradient',
+        colourA: '#101828',
+        colourB: '#2b4a8b',
+        angle: 0.25,
+        zoom: 1.25,
+        radius: 0.06,
+        dim: 0.35,
+        opacity: 1,
+      },
+      schema: [
+        { path: 'params.mode', label: 'Mode', type: 'select',
+          options: [
+            { value: 'gradient', label: 'Gradient' },
+            { value: 'solid', label: 'Solid' },
+            { value: 'blur', label: 'Blurred copy of the clip' },
+          ] },
+        { path: 'params.colourA', label: 'Colour', type: 'color' },
+        { path: 'params.colourB', label: 'Colour 2', type: 'color' },
+        { path: 'params.angle', label: 'Angle', type: 'range', min: 0, max: 1, step: 0.005, digits: 3 },
+        { path: 'params.zoom', label: 'Copy zoom', type: 'range', min: 1, max: 3, step: 0.01, digits: 2 },
+        { path: 'params.radius', label: 'Copy blur', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
+        { path: 'params.dim', label: 'Copy dim', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      /**
+       * Something behind the footage, for when the footage no longer fills the frame.
+       *
+       * It paints the WHOLE layer and puts the picture back on top, so on a clip that
+       * still covers the frame it is invisible - which is correct, and is why it belongs
+       * after `chrome`, `inset` or a shrinking `transform` rather than before one.
+       *
+       * The blurred-copy mode is the one place in this file that magnifies on purpose:
+       * `zoom` is a design decision, not a blur artefact. The BLUR still goes through
+       * `padBlur()` at 1:1, so the radius means the same thing at both resolutions - the
+       * magnification and the softening are separate steps and stay that way.
+       */
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const a = clamp(p.opacity, 0, 1);
+        if (a <= 0.002) return;
+        const src = take(L, 'fxBgA');
+        const mode = String(p.mode || 'gradient');
+
+        L.c.save();
+        L.c.globalAlpha = a;
+        if (mode === 'blur') {
+          const z = clamp(p.zoom, 1, 8);
+          // THE CLIP, not the layer: by now `chrome` or `inset` may have taken a
+          // device-shaped bite out of the layer, and a blurred copy of a hole is not
+          // what this mode says on the tin. See baseOf().
+          const from = typeof L.base === 'function' ? L.base() : src;
+          const plate = clean(L.surface, 'fxBgB', W, H);
+          plate.c.drawImage(from, (W - W * z) / 2, (H - H * z) / 2, W * z, H * z);
+          const r = pxMin(p.radius, W, H);
+          if (r > 0.05) {
+            const b = padBlur(plate.cv, r, W, H, L.surface, 'fxBgP', true);
+            L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+          } else {
+            L.c.drawImage(plate.cv, 0, 0);
+          }
+          const dim = clamp(p.dim, 0, 1);
+          if (dim > 0.002) {
+            L.c.fillStyle = 'rgba(0,0,0,' + dim + ')';
+            L.c.fillRect(0, 0, W, H);
+          }
+        } else if (mode === 'solid') {
+          L.c.fillStyle = String(p.colourA || '#000000');
+          L.c.fillRect(0, 0, W, H);
+        } else {
+          // The angle is a TURN, so 0 is left-to-right and 0.25 is top-to-bottom, and a
+          // keyframe can take it all the way round without a discontinuity at 360.
+          const th = (Number(p.angle) || 0) * Math.PI * 2;
+          const cx = W / 2, cy = H / 2;
+          const rr = (Math.abs(Math.cos(th)) * W + Math.abs(Math.sin(th)) * H) / 2;
+          const gr = L.c.createLinearGradient(
+            cx - Math.cos(th) * rr, cy - Math.sin(th) * rr,
+            cx + Math.cos(th) * rr, cy + Math.sin(th) * rr);
+          gr.addColorStop(0, String(p.colourA || '#000000'));
+          gr.addColorStop(1, String(p.colourB || '#000000'));
+          L.c.fillStyle = gr;
+          L.c.fillRect(0, 0, W, H);
+        }
+        L.c.restore();
+        reset(L.c);
+        L.c.drawImage(src, 0, 0);
+      },
+    },
+
+    spotlight: {
+      label: 'Spotlight',
+      params: {
+        shape: 'rect',
+        x: 0.2, y: 0.35, w: 0.6, h: 0.3,
+        radius: 0.03,
+        feather: 0.02,
+        dim: 0.6,
+        blur: 0.008,
+        invert: 0,
+      },
+      schema: [
+        { path: 'params.shape', label: 'Shape', type: 'select',
+          options: [
+            { value: 'rect', label: 'Rounded rectangle' },
+            { value: 'ellipse', label: 'Ellipse' },
+          ] },
+        { path: 'params.x', label: 'X', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.y', label: 'Y', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.w', label: 'Width', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.h', label: 'Height', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.25, step: 0.002, digits: 3 },
+        { path: 'params.feather', label: 'Feather', type: 'range', min: 0, max: 0.15, step: 0.001, digits: 3 },
+        { path: 'params.dim', label: 'Dim outside', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.blur', label: 'Blur outside', type: 'range', min: 0, max: 0.1, step: 0.001, digits: 3 },
+        { path: 'params.invert', label: 'Invert', type: 'check' },
+      ],
+      /**
+       * Light one feature by putting everything else in the dark.
+       *
+       * THE MASK IS AN ALPHA MASK, and that is the trap this codebase has now hit three
+       * times. `destination-in` composites on the ALPHA CHANNEL: a mask painted as opaque
+       * black-and-white is opaque everywhere, so it masks NOTHING and the "lit" region
+       * comes out as the whole frame. The fill below is rgba(255,255,255,1) and the
+       * feather is a blur of THAT ALPHA falling away to rgba(255,255,255,0) - never a
+       * fade towards black, which would look right on a white plate and mask nothing.
+       *
+       * The outside is dimmed with `source-atop` rather than a plain fill, so a layer
+       * that is already partly transparent - anything downstream of `chrome` or `inset` -
+       * does not have black painted into its empty half.
+       *
+       * The blur goes through `padBlur()`, so it does not magnify and does not pull a
+       * dark rim in from the frame edge.
+       */
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const dim = clamp(p.dim, 0, 1);
+        const br = pxMin(p.blur, W, H);
+        if (dim <= 0.002 && br <= 0.05) return;
+        const box = spotRect(p, W, H);
+        if (!(box.w > 0.5 && box.h > 0.5)) return;
+        const src = take(L, 'fxSpA');
+
+        // 1. everything, blurred and darkened: what the outside will be.
+        const out = clean(L.surface, 'fxSpB', W, H);
+        if (br > 0.05) {
+          const b = padBlur(src, br, W, H, L.surface, 'fxSpP', true);
+          out.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+        } else {
+          out.c.drawImage(src, 0, 0);
+        }
+        if (dim > 0.002) {
+          out.c.globalCompositeOperation = 'source-atop';
+          out.c.fillStyle = 'rgba(0,0,0,' + dim + ')';
+          out.c.fillRect(0, 0, W, H);
+          reset(out.c);
+        }
+
+        // 2. the mask: WHITE WITH ALPHA, feathered by blurring that alpha.
+        const mask = clean(L.surface, 'fxSpM', W, H);
+        mask.c.fillStyle = 'rgba(255,255,255,1)';
+        if (String(p.shape) === 'ellipse') {
+          mask.c.beginPath();
+          mask.c.ellipse(box.x + box.w / 2, box.y + box.h / 2, box.w / 2, box.h / 2, 0, 0, Math.PI * 2);
+          mask.c.fill();
+        } else {
+          roundRectPath(mask.c, box.x, box.y, box.w, box.h, pxMin(p.radius, W, H));
+          mask.c.fill();
+        }
+        let maskCv = mask.cv;
+        const fr = pxMin(p.feather, W, H);
+        if (fr > 0.05) {
+          // A silhouette, so the padding is NOT edge-extended: the softness has to fall
+          // away into transparency, which is the whole point of a feather.
+          const b = padBlur(mask.cv, fr, W, H, L.surface, 'fxSpF', false);
+          const crop = clean(L.surface, 'fxSpM2', W, H);
+          crop.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+          maskCv = crop.cv;
+        }
+
+        // 3. the sharp original, kept only where the mask has alpha.
+        const lit = clean(L.surface, 'fxSpC', W, H);
+        lit.c.drawImage(src, 0, 0);
+        lit.c.globalCompositeOperation = 'destination-in';
+        lit.c.drawImage(maskCv, 0, 0);
+        reset(lit.c);
+
+        if (!Number(p.invert)) {
+          L.c.drawImage(out.cv, 0, 0);
+          L.c.drawImage(lit.cv, 0, 0);
+          return;
+        }
+
+        // Inverted: the treated copy shows THROUGH the shape and the sharp original is
+        // everything else - a redaction rather than a spotlight. Same two plates, masked
+        // the other way round, so nothing here re-derives the geometry.
+        const hole = clean(L.surface, 'fxSpD', W, H);
+        hole.c.drawImage(out.cv, 0, 0);
+        hole.c.globalCompositeOperation = 'destination-in';
+        hole.c.drawImage(maskCv, 0, 0);
+        reset(hole.c);
+        const rest = clean(L.surface, 'fxSpE', W, H);
+        rest.c.drawImage(src, 0, 0);
+        rest.c.globalCompositeOperation = 'destination-out';
+        rest.c.drawImage(maskCv, 0, 0);
+        reset(rest.c);
+        L.c.drawImage(rest.cv, 0, 0);
+        L.c.drawImage(hole.cv, 0, 0);
+      },
+    },
+
+    cutout: {
+      label: 'Cutout',
+      params: {
+        sx: 0.1, sy: 0.4, sw: 0.35, sh: 0.16,
+        x: 0.5, y: 0.68,
+        scale: 1.9,
+        radius: 0.018,
+        shadow: 0.5,
+        blur: 0.03,
+        offsetY: 0.01,
+        outline: 0,
+        colour: Cursor.ACCENT,
+        dimSource: 0.35,
+        opacity: 1,
+      },
+      schema: [
+        { path: 'params.sx', label: 'From X', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.sy', label: 'From Y', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.sw', label: 'From width', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.sh', label: 'From height', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.x', label: 'To X', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.y', label: 'To Y', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.scale', label: 'Scale', type: 'range', min: 0.2, max: 6, step: 0.01, digits: 2 },
+        { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.12, step: 0.001, digits: 3 },
+        { path: 'params.shadow', label: 'Shadow', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.blur', label: 'Shadow blur', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
+        { path: 'params.offsetY', label: 'Shadow drop', type: 'range', min: -0.1, max: 0.1, step: 0.001, digits: 3 },
+        { path: 'params.outline', label: 'Outline', type: 'range', min: 0, max: 0.02, step: 0.0005, digits: 4 },
+        { path: 'params.colour', label: 'Outline colour', type: 'color' },
+        { path: 'params.dimSource', label: 'Dim the source', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      /**
+       * Lift a region out of the picture, blow it up and float it over the top.
+       *
+       * The mapping is `cutoutRect()` and nothing else computes it, so the smoke suite
+       * asserts source-to-destination directly rather than by hunting for pixels. The
+       * destination is the source region scaled ABOUT THE POINT IT IS MOVED TO, which is
+       * what keeps a keyframed `scale` growing from where the reader is already looking
+       * instead of sliding sideways as it grows.
+       */
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const a = clamp(p.opacity, 0, 1);
+        const m = cutoutRect(p, W, H);
+        if (!(m.src.w > 0.5 && m.src.h > 0.5) || !(m.dst.w > 0.5 && m.dst.h > 0.5)) return;
+        const src = take(L, 'fxCoA');
+
+        // The picture, with the region it came from optionally pushed back. `source-atop`
+        // again: an already-transparent layer must not gain a grey rectangle.
+        L.c.drawImage(src, 0, 0);
+        const ds = clamp(p.dimSource, 0, 1);
+        if (ds > 0.002) {
+          L.c.save();
+          L.c.globalCompositeOperation = 'source-atop';
+          L.c.fillStyle = 'rgba(0,0,0,' + ds + ')';
+          L.c.fillRect(m.src.x, m.src.y, m.src.w, m.src.h);
+          L.c.restore();
+          reset(L.c);
+        }
+        if (a <= 0.002) return;
+
+        // The float, built at its DESTINATION size so the rounding and the outline are
+        // exact rather than scaled up along with the pixels.
+        const plate = clean(L.surface, 'fxCoB', W, H);
+        const rad = pxMin(p.radius, W, H);
+        plate.c.save();
+        roundRectPath(plate.c, m.dst.x, m.dst.y, m.dst.w, m.dst.h, rad);
+        plate.c.clip();
+        plate.c.drawImage(src, m.src.x, m.src.y, m.src.w, m.src.h,
+          m.dst.x, m.dst.y, m.dst.w, m.dst.h);
+        plate.c.restore();
+        reset(plate.c);
+        const ow = pxMin(p.outline, W, H);
+        if (ow > 0.2) {
+          plate.c.strokeStyle = String(p.colour || Cursor.ACCENT);
+          plate.c.lineWidth = ow;
+          roundRectPath(plate.c, m.dst.x + ow / 2, m.dst.y + ow / 2,
+            m.dst.w - ow, m.dst.h - ow, Math.max(0, rad - ow / 2));
+          plate.c.stroke();
+          reset(plate.c);
+        }
+
+        // Its shadow, from its own silhouette. Same rule as `chrome` and `round`.
+        const sh = clamp(p.shadow, 0, 1);
+        const r = Math.max(0, pxMin(p.blur, W, H));
+        if (sh > 0.002 && r > 0.05) {
+          const sil = clean(L.surface, 'fxCoSil', W, H);
+          sil.c.fillStyle = '#000';
+          roundRectPath(sil.c, m.dst.x, m.dst.y, m.dst.w, m.dst.h, rad);
+          sil.c.fill();
+          const b = padBlur(sil.cv, r, W, H, L.surface, 'fxCoSh', false);
+          L.c.save();
+          L.c.globalAlpha = sh * a;
+          L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, pxMin(p.offsetY, W, H), W, H);
+          L.c.restore();
+          reset(L.c);
+        }
+
+        L.c.save();
+        L.c.globalAlpha = a;
+        L.c.drawImage(plate.cv, 0, 0);
+        L.c.restore();
+        reset(L.c);
+      },
+    },
   };
 
   const TYPES = Object.keys(DEFS);
+
+  // ------------------------------------------------------------ framing geometry
+  //
+  // The layout half of step 10's four effects, kept out of their `draw()`s and exported,
+  // because geometry is the part worth asserting: a smoke suite can check where a device
+  // frame lands at six aspect ratios without painting a single pixel, and a pixel test
+  // that failed would then not be able to say whether the layout or the paint was wrong.
+
+  /**
+   * The device presets, as NUMBERS AND COLOURS - never bitmaps.
+   *
+   * Every length here is in SCREEN WIDTHS, so a preset is a shape rather than a size and
+   * `chromeGeom()` scales the whole thing to fit whatever room `pad` leaves. That is what
+   * makes a preset resolution-independent for free: there is no pixel anywhere in it.
+   *
+   *   aspect   the screen's own w/h, used when the author leaves `aspect` at 0
+   *   bezel    the body's border around the screen
+   *   bar      the title bar's height, 0 for a device that has none
+   *   base     the laptop's foot: [height, width] again in screen widths
+   */
+  const CHROME = {
+    browser: {
+      aspect: 16 / 10, bezel: 0.012, bar: 0.07,
+      body: '#f4f5f7', barFill: '#e8eaee', line: '#d2d6de', pill: '#ffffff', dark: false,
+    },
+    browserDark: {
+      aspect: 16 / 10, bezel: 0.012, bar: 0.07,
+      body: '#171a21', barFill: '#20242d', line: '#2f343f', pill: '#2b3039', dark: true,
+    },
+    laptop: {
+      aspect: 16 / 10, bezel: 0.028, bar: 0,
+      body: '#2a2e37', barFill: '#2a2e37', line: '#3c424e', pill: '#3c424e', dark: true,
+      base: [0.035, 1.16], baseFill: '#20242c',
+    },
+    phone: {
+      aspect: 9 / 19.5, bezel: 0.05, bar: 0,
+      body: '#14161c', barFill: '#14161c', line: '#262a33', pill: '#262a33', dark: true,
+      notch: true,
+    },
+  };
+
+  /**
+   * Where the device, its title bar and its screen land, in pixels at the size being
+   * painted. `null` if there is no room left for one.
+   *
+   * The whole layout is built in SCREEN WIDTHS and scaled by a single factor `k` at the
+   * end, which is the only reason a preset can be a handful of ratios: the device is
+   * assembled at its natural proportions and then made to fit, rather than each part
+   * being fitted separately and drifting out of proportion at extreme aspect ratios.
+   *
+   * `pad` and `radius` go through `pxMin()` like every other length in this file, so the
+   * same parameters give the same picture at 135x240 and at 1080x1920.
+   */
+  function chromeGeom(p, W, H) {
+    const pre = CHROME[String(p.preset)] || CHROME.browser;
+    const padPx = Math.max(0, pxMin(clamp(p.pad, 0, 0.45), W, H));
+    const availW = W - 2 * padPx, availH = H - 2 * padPx;
+    if (!(availW > 2 && availH > 2)) return null;
+
+    const ar = Number(p.aspect) > 0.01 ? clamp(p.aspect, 0.05, 20) : pre.aspect;
+    // In screen widths: the screen is 1 wide by 1/ar tall, and everything else hangs off
+    // that. `unit` is what one screen width turns out to be in pixels.
+    const sh = 1 / ar;
+    const outW = 1 + 2 * pre.bezel;
+    const outH = sh + 2 * pre.bezel + pre.bar;
+    const baseH = pre.base ? pre.base[0] : 0;
+    const baseW = pre.base ? pre.base[1] : 0;
+    const totalW = Math.max(outW, baseW);
+    const totalH = outH + baseH;
+    const unit = Math.min(availW / totalW, availH / totalH);
+    if (!(unit > 0.5)) return null;
+
+    const ox = W / 2 + pxMin(p.x, W, H) - (totalW * unit) / 2;
+    const oy = H / 2 + pxMin(p.y, W, H) - (totalH * unit) / 2;
+    const fx0 = ox + (totalW - outW) * unit / 2;
+
+    const frame = { x: fx0, y: oy, w: outW * unit, h: outH * unit };
+    const bar = { x: frame.x, y: frame.y, w: frame.w, h: pre.bar * unit };
+    const screen = {
+      x: frame.x + pre.bezel * unit,
+      y: frame.y + pre.bar * unit + pre.bezel * unit,
+      w: unit,
+      h: sh * unit,
+    };
+    const radius = Math.min(pxMin(p.radius, W, H), frame.w / 2, frame.h / 2);
+    return {
+      pre, unit, frame, bar, screen, radius,
+      // The screen's rounding follows the body's, inset by the bezel, so the two curves
+      // stay concentric instead of the inner one looking wrong at a large radius.
+      innerRadius: Math.max(0, Math.min(radius - pre.bezel * unit, screen.w / 2, screen.h / 2)),
+      base: pre.base
+        ? { x: ox + (totalW - baseW) * unit / 2, y: oy + outH * unit, w: baseW * unit, h: baseH * unit }
+        : null,
+    };
+  }
+
+  /**
+   * Draw a full-frame source into a destination rect, filling it or fitting inside it.
+   *
+   * `cover` crops the long axis; `contain` letterboxes to TRANSPARENCY rather than to
+   * black, because whatever is under the layer has to come through - the same reason
+   * `inset` clears instead of filling.
+   */
+  function fitDraw(c, src, SW, SH, dst, mode) {
+    const sa = SW / SH, da = dst.w / dst.h;
+    if (mode === 'contain') {
+      const w = sa > da ? dst.w : dst.h * sa;
+      const h = sa > da ? dst.w / sa : dst.h;
+      c.drawImage(src, dst.x + (dst.w - w) / 2, dst.y + (dst.h - h) / 2, w, h);
+      return;
+    }
+    // cover: take the largest source rect of the destination's aspect, centred.
+    const cw = sa > da ? SH * da : SW;
+    const ch = sa > da ? SH : SW / da;
+    c.drawImage(src, (SW - cw) / 2, (SH - ch) / 2, cw, ch, dst.x, dst.y, dst.w, dst.h);
+  }
+
+  /** The spotlight's window in pixels. Its own function so the mask and a test agree. */
+  function spotRect(p, W, H) {
+    return {
+      x: (Number(p.x) || 0) * W,
+      y: (Number(p.y) || 0) * H,
+      w: Math.max(0, Number(p.w) || 0) * W,
+      h: Math.max(0, Number(p.h) || 0) * H,
+    };
+  }
+
+  /**
+   * The cutout's source-to-destination mapping, in pixels.
+   *
+   * `x`/`y` are the CENTRE of the destination, not its corner, so `scale` grows the
+   * float about the point the author placed it on rather than dragging it down and right
+   * as it gets bigger - which matters the moment `scale` carries a keyframe.
+   */
+  function cutoutRect(p, W, H) {
+    const s = clamp(p.scale, 0.05, 12);
+    const sw = Math.max(0, Number(p.sw) || 0) * W;
+    const sh = Math.max(0, Number(p.sh) || 0) * H;
+    const dw = sw * s, dh = sh * s;
+    return {
+      src: { x: (Number(p.sx) || 0) * W, y: (Number(p.sy) || 0) * H, w: sw, h: sh },
+      dst: {
+        x: (Number(p.x) || 0) * W - dw / 2,
+        y: (Number(p.y) || 0) * H - dh / 2,
+        w: dw, h: dh,
+      },
+    };
+  }
+
 
   // -------------------------------------------------------------------- the grade
 
@@ -926,7 +1588,7 @@
       const ti = n < 2 ? t : t + ((i / (n - 1)) - 0.5) * span;
       const sub = clean(surface, 'fxMbSub', W, H);
       sub.c.drawImage(before, 0, 0);
-      const subL = { cv: sub.cv, c: sub.c, W, H, surface };
+      const subL = { cv: sub.cv, c: sub.c, W, H, surface, base: L.base };
       DEFS[entry.type].draw(subL, paramsAt(entry, ti), ti, entry, clip);
       reset(sub.c);
       sctx.drawImage(sub.cv, 0, 0);
@@ -1049,7 +1711,7 @@
     const entries = active(clip);
     if (!entries.length) { paint(target, W, H); return false; }
     const layer = clean(surface, 'fxLayer', W, H);
-    const L = { cv: layer.cv, c: layer.c, W, H, surface };
+    const L = { cv: layer.cv, c: layer.c, W, H, surface, base: baseOf(surface, W, H, paint) };
     paint(L.c, W, H);
     for (const e of entries) {
       try {
@@ -1101,6 +1763,7 @@
     MBLUR, mblurOf, timeVarying, shadowProblem,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
+    CHROME, chromeGeom, spotRect, cutoutRect, fitDraw,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else if (typeof window !== 'undefined') window.FX = API;

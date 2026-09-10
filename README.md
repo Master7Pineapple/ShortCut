@@ -551,7 +551,7 @@ Plain JSON, ordered, and **absent by default** — `FX.normalizeClip()` deletes 
 again once the last effect goes, so a project that uses no effects serialises exactly as
 it did before this existed.
 
-Eight types ship so far, and each one is **one function**:
+Twelve types ship so far, and each one is **one function**:
 
 | Type | What it draws |
 | --- | --- |
@@ -563,6 +563,10 @@ Eight types ship so far, and each one is **one function**:
 | `cursor` | a smoothed pointer, drawn from a performed mouse take |
 | `ripple` | an expanding ring at each performed mouse-down |
 | `select` | an animated window-selection box: brackets, marquee, outline, dim outside |
+| `chrome` | the clip drawn inside a browser, laptop or phone frame |
+| `background` | a gradient, a solid or a blurred copy of the clip, drawn behind it |
+| `spotlight` | darken and blur everything outside a rounded rect or an ellipse |
+| `cutout` | a region lifted out, scaled up and floated with its own shadow |
 
 Adding a type is one entry in `FX.DEFS` — its label, its default parameters, its
 inspector schema and its `draw()`. The panel, the keyframe strips, the serialisation, the
@@ -573,6 +577,9 @@ use it: `cursor` and `ripple` read the performed take on `clip.mouse`, which liv
 clip and could never be a parameter — it is thousands of samples. **Nothing else may reach
 for it.** An effect that read `clip.start` from there would be putting a clip's timeline
 position into its own pixels, which is the one thing the render cache's key rules forbid.
+
+The layer's `L.base()` is the only other way past an effect's own parameters, and exactly
+one effect uses it: `background`'s blurred-copy mode. See "The framing four" below.
 
 `DEFS[type].needs` names what a clip has to be carrying for the effect to have anything to
 draw — `'mouse'` for the two pointer effects, absent for everything else. The panel greys
@@ -594,6 +601,59 @@ it by the time main runs.
 That is also why any effect at all takes a span off the fast path. There is nothing for
 ffmpeg to fall back on — a clip carrying an effect must be baked, or the export simply
 would not have it. See "The fast path, and exactly what leaves it".
+
+#### The framing four, and why order is the whole feature
+
+`chrome`, `background`, `spotlight` and `cutout` are one shape wearing four hats:
+something drawn **around** the footage, **behind** it, **over** it, or **lifted out** of
+it. They are ordinary `DEFS` entries, so the panel, the keyframe strips, the shutter and
+the serialisation all arrived with them and none of it is written twice — which is what
+step 7's container was for. Every parameter keyframes through `Anim`, which is what lets
+a spotlight follow a feature down a scrolling page.
+
+Two of the four only have anything to do once the layer has transparency in it:
+`background` paints into it and `chrome` is what makes it. So **the stack order is the
+feature, not a detail of it**. Chrome then background is a framed shot floating on a
+gradient; background then chrome is a gradient the chrome immediately covers up. There is
+deliberately **no auto-ordering** — the arrows on each row are the control, and
+`smoke-mockup.js` asserts both orders give different pictures so that stays true.
+
+The presets are **numbers and colours, never bitmaps**. `FX.CHROME` holds four — browser
+light, browser dark, laptop, phone — and every length in one is expressed in *screen
+widths*, so a preset is a shape rather than a size. `chromeGeom()` assembles the device at
+its natural proportions and scales the whole thing by a single factor to fit whatever room
+`pad` leaves, which is why the parts cannot drift out of proportion at an extreme aspect
+ratio. A 1x bitmap frame would have been sharp in the 540x960 viewer and soft in the
+1080x1920 file, which is the one thing this file exists to prevent.
+
+`chromeGeom()`, `cutoutRect()` and `spotRect()` are the only things that compute geometry,
+and they are exported for that reason: `smoke-mockup.js` checks a device's layout at four
+presets, five aspect ratios and four output shapes without painting a pixel, so a layout
+bug and a paint bug can never be mistaken for each other.
+
+**Masks composite on the ALPHA channel.** This codebase has now hit that three times. A
+mask painted as opaque black-and-white is opaque *everywhere*, so `destination-in` keeps
+everything and the mask masks nothing — and the symptom is not an error, it is a spotlight
+that lights the whole frame. The fill is `rgba(255,255,255,1)` and the feather is a blur of
+**that alpha**, falling away to `rgba(255,255,255,0)`; a fade towards black would look
+right on a white plate and mask nothing. `smoke-mockup.js` asserts specifically that a
+corner is dark while the middle is not, which is the assertion an opaque mask fails.
+
+`spotlight` and `cutout` darken with `source-atop` rather than a plain fill, so a layer
+that is already partly transparent — anything downstream of `chrome` or `inset` — does not
+get black painted into its empty half. Every blur goes through `padBlur()` at 1:1, so none
+of them magnifies; `background`'s blurred-copy mode is the one place in the file that
+magnifies **on purpose**, and even there the zoom and the softening are separate steps so
+the radius still means the same thing at both resolutions.
+
+`background`'s blurred copy is a copy of **the clip**, not of the layer, and that needed a
+second way into the effect. `FX.render()` hands each effect an `L.base()` — the clip as
+painted, before anything in the stack touched it, built on first ask and never otherwise.
+By the time a background runs, `chrome` may have taken a device-shaped bite out of the
+layer, and a blurred copy of a hole is not what the mode says on the tin. It is the clip's
+own pixels and nothing else — no timeline position, no neighbours — so it stays inside the
+cache key rules exactly as `paint` does. Alongside the `clip` argument that is now **two**
+things an effect may reach for beyond its own parameters, and there are no others.
 
 #### The unit rule: fractions of the frame, never pixels
 
@@ -2739,8 +2799,16 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   ripple but are never sliced, text cards shift but are never cut, and a locked track is
   left entirely alone — see "Tighten".
 - Video clips and stills carry an ordered, keyframable effect stack: transform, rounded
-  corners and shadow, crop/inset, blur and a grade — see "The effect stack". Text cards
-  do not; they have their own richer animation model. There are still no speed changes.
+  corners and shadow, crop/inset, blur, a grade, the three pointer effects, and the four
+  framing treatments — device frame, background, spotlight and cutout — see "The effect
+  stack". Text cards do not; they have their own richer animation model. There are still
+  no speed changes.
+- A device frame ships four presets (browser light, browser dark, laptop, phone) drawn as
+  paths, and the footage is fitted into the screen rect. It does not know what is IN the
+  footage: a recording that is already 16:9 lands cleanly, and one that is not is cropped
+  or letterboxed by the `Footage` control. There is no auto-detection of a window's edges.
+- `background` and `chrome` only mean anything in the right stack order, and nothing
+  reorders them for you — see "The framing four, and why order is the whole feature".
 - An effect does not apply inside a transition window, in the preview or in the render —
   see "The effect stack".
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The
