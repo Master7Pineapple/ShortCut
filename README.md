@@ -234,6 +234,17 @@ the QuickBin, so two electron instances racing each other produce failures that 
 neither run — `smoke-textrender.js` reporting `cached=false` on a job it just rendered is
 the usual symptom.
 
+**A smoke run must never raise a modal, and there are two of them.** The main process's
+unsaved-changes guard is one; the renderer's own `confirm('Discard unsaved changes?')` in
+`newProject()` and `openProject()` is the other, and it is the one that bit hardest. Nine
+suites call one of those two functions, and every suite dirties the project the moment it
+imports a clip - so the run would sit on a blocking `confirm()` until something killed it,
+having printed nothing. That is indistinguishable from a hang, and for a long time it was
+diagnosed as one: slow suites, racing instances, orphaned electrons. `confirmDiscard()`
+answers itself when `window.api.smoke` is set, and `smoke.js` asserts it - in the suite
+every other one is built on, because a regression here would not fail, it would hang, and
+a hang says nothing about which change caused it.
+
 **A smoke run force-closes.** Every suite dirties the project the moment it imports a clip,
 and the unsaved-changes guard on `win.on('close')` would then `preventDefault()` and open a
 modal with nobody there to answer it — electron sat on that dialog until something killed

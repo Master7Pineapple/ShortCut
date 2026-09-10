@@ -12,6 +12,17 @@
   const ok = (name, cond, extra) => results.push((cond ? 'PASS  ' : 'FAIL  ') + name + (extra ? '   ' + extra : ''));
   const D = 'C:\\Users\\BlasePC\\AppData\\Local\\Temp\\scut_test\\';
 
+  // A blocking `confirm()` has nobody to answer it on a smoke run, and nine suites call
+  // newProject()/openProject() - both of which ask "Discard unsaved changes?" whenever the
+  // project is dirty, which it is the moment anything is imported. A run that hits it sits
+  // on the modal until something kills it, having printed nothing. Asserted here, in the
+  // suite every other one is built on, because a regression would not FAIL - it would
+  // HANG, and a hang tells you nothing about which change caused it.
+  ok('the renderer knows this is a smoke run', window.api.smoke === true);
+  state.dirty = true;
+  ok('so the discard prompt answers itself instead of blocking', confirmDiscard() === true);
+  state.dirty = false;
+
   await importPaths([D + 'clip1.mp4', D + 'clip2.mp4']);
 
   const v = state.tracks.find((t) => t.type === 'video');

@@ -4775,8 +4775,26 @@ function syncLoudnessControl() {
   }
 }
 
+/**
+ * "Discard unsaved changes?" - and never on a smoke run.
+ *
+ * `confirm()` BLOCKS the renderer until somebody answers it, and on a smoke run nobody
+ * is there. Nine suites call `newProject()` or `openProject()`, both of which ask this
+ * whenever the project is dirty - and every suite dirties the project the moment it
+ * imports a clip. The run then sits on a modal until something kills it, having printed
+ * nothing, which is indistinguishable from a hang and is exactly what it was.
+ *
+ * `createWindow()` already forces the MAIN process's unsaved-changes guard open on the
+ * smoke path; this is the same rule for the renderer's own prompt, which that guard does
+ * not cover. A smoke run has nothing worth keeping, always.
+ */
+function confirmDiscard() {
+  if (window.api.smoke) return true;
+  return confirm('Discard unsaved changes?');
+}
+
 function newProject() {
-  if (state.dirty && !confirm('Discard unsaved changes?')) return;
+  if (state.dirty && !confirmDiscard()) return;
   for (const id of [...mediaEls.keys()]) dropMedia(id);
   state.tracks = [makeTrack('video', 1), makeTrack('audio', 1)];
   state.selection.clear();
@@ -4821,7 +4839,7 @@ async function saveProject(asNew) {
 }
 
 async function openProject() {
-  if (state.dirty && !confirm('Discard unsaved changes?')) return;
+  if (state.dirty && !confirmDiscard()) return;
   const r = await window.api.openProject(null);
   if (r.canceled) return;
   if (r.error) { log(r.error); alert(r.error); return; }
