@@ -3532,12 +3532,46 @@ function transitionMediaTargets() {
 
 /** Keep every clip's media element in sync with the playhead. */
 function syncMedia() {
-  // A rendered span carries its own picture and audio, so the source clips must be
-  // silent and idle underneath it.
+  // A rendered span carries its own picture and audio, so nothing underneath it may be
+  // heard. The PICTURE is parked; the AUDIO is kept running and silent. See below.
   const band = activePreviewBand();
   syncPreviewBand(band);
   if (band) {
-    for (const el of mediaEls.values()) { if (!el.paused) el.pause(); }
+    // Parking the audio too was a hole at the far edge of every rendered span.
+    //
+    // This used to pause every element and return, which abandoned their clocks: an
+    // audio element sat paused at wherever it happened to be - usually 0 - for as long
+    // as the band played. The moment the playhead left the band, `syncMedia()` needed
+    // that element AT the playhead, so it issued a cold seek across the whole span.
+    // Measured on a 0-2s band: readyState fell from 4 to 1, roughly 300 ms of silence,
+    // and the element came back ~150 ms behind - under the 0.3 s correction threshold,
+    // so nothing ever closed the gap. Land in a band edge repeatedly and each cold seek
+    // starts the next one before the last has finished, which is the stutter that ends
+    // in no audio at all.
+    //
+    // Kept running and muted, the handoff at the edge is an UNMUTE: no seek, no decode
+    // gap, and already in sync because it never stopped tracking the playhead.
+    //
+    // The picture is the opposite trade and stays parked. Decoding video nobody can see
+    // is precisely what a rendered span exists to avoid, and a cold first frame is
+    // covered by `frameCache`. Audio has no equivalent of a held frame, and the ear is
+    // far less forgiving of a 300 ms hole than the eye is of one stale frame.
+    for (const { clip } of allClips()) {
+      const el = mediaEls.get(clip.id);
+      if (clip.kind !== 'audio') { if (el && !el.paused) el.pause(); continue; }
+      const live = state.playhead >= clip.start && state.playhead < clipEnd(clip);
+      if (!live) { if (el && !el.paused) el.pause(); continue; }
+      const m = mediaFor(clip);
+      m.muted = true;                       // the band already carries this mix
+      const target = clip.in + (state.playhead - clip.start);
+      if (state.playing) {
+        if (!m.seeking && Math.abs(m.currentTime - target) > 0.3) m.currentTime = target;
+        if (m.paused) m.play().catch(() => {});
+      } else {
+        if (!m.paused) m.pause();
+        if (!m.seeking && Math.abs(m.currentTime - target) > 0.06) m.currentTime = target;
+      }
+    }
     return;
   }
 
@@ -4870,9 +4904,16 @@ async function saveProject(asNew) {
   log('Saved ' + r.filePath);
 }
 
-async function openProject() {
+/**
+ * Open a project. With no argument it asks; with a path it opens that file.
+ *
+ * The path form is what the launch argument uses - `ShortCut.bat some.scut`, or
+ * `npx electron . some.scut` - so a project under test can be reopened without walking
+ * the file dialog every time. It is the same code either way; only the dialog is skipped.
+ */
+async function openProject(filePath) {
   if (state.dirty && !confirmDiscard()) return;
-  const r = await window.api.openProject(null);
+  const r = await window.api.openProject(filePath || null);
   if (r.canceled) return;
   if (r.error) { log(r.error); alert(r.error); return; }
   for (const id of [...mediaEls.keys()]) dropMedia(id);
@@ -6217,6 +6258,10 @@ $('#recStop').addEventListener('click', () => stopRecording());
 // The hotkey is registered in main, because it has to fire while another app has focus.
 // It toggles, and it does not need the panel to have been opened first - see
 // toggleRecording().
+// A project named on the command line. Nothing has been edited yet at this point, so
+// there is no unsaved work for openProject()'s discard prompt to ask about.
+window.api.onOpenOnLaunch((p) => { openProject(p); });
+
 window.api.onScreenHotkeyToggle(() => toggleRecording());
 window.api.onScreenFailed((m) => {
   Rec.recording = false;

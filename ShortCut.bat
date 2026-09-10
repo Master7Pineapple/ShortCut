@@ -13,5 +13,7 @@ if not exist "node_modules\electron" (
   )
 )
 
-start "" /b cmd /c "node_modules\.bin\electron.cmd" .
+rem A .scut path passed to this script opens on launch, skipping the file dialog:
+rem   ShortCut.bat project_test_2.scut
+start "" /b cmd /c "node_modules\.bin\electron.cmd" . %*
 exit /b 0

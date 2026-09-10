@@ -270,6 +270,77 @@
         (() => { seek(0.2); play(); const on = state.playing; pause(); return on; })());
     }
 
+    // ============================ audio is kept warm UNDER a rendered span
+    //
+    // The span carries the mix, so nothing underneath it may be heard - but pausing the
+    // source audio abandoned its clock, and the far edge of the band then needed that
+    // element at the playhead. The cold seek across the whole span cost readyState, about
+    // 300 ms of silence, and left the clip running behind a correction it never closed.
+    //
+    // Kept running and muted, the handoff at the edge is an UNMUTE. Asserted as: during
+    // the band the audio element is PLAYING, MUTED and tracking the playhead; crossing
+    // the edge it is unmuted, still has data, and is still in sync.
+    {
+      state.usePreviewRender = true;
+      const auds = allClips().filter((x) => x.clip.kind === 'audio').map((x) => x.clip);
+      const liveAudio = () => auds.find((c) =>
+        state.playhead >= c.start && state.playhead < clipEnd(c) && mediaEls.get(c.id));
+
+      // Render a span to test against, then WAIT for the bar to re-verify it.
+      // `refreshCacheBands()` kicks off an async re-hash and returns before it lands, so
+      // reading `state.cacheBands` on the next line finds the old answer.
+      setInPoint(0); setOutPoint(2);
+      document.querySelector('#renderRange').value = 'marks';
+      await doPreviewRender({ force: true });
+      for (let i = 0; i < 40 && !state.cacheBands.some((b) => b.file); i++) await sleep(100);
+      const band0 = state.cacheBands.find((b) => b.file);
+      if (!band0 || !auds.length) {
+        ok('a rendered band and an audio clip to test the hand-off with', false);
+      } else {
+        // Park just inside the band's far edge and play across it.
+        seek(Math.max(band0.from, band0.to - 0.6));
+        await sleep(300);
+        play();
+        await sleep(250);
+
+        const during = (() => {
+          const c = liveAudio();
+          if (!c) return null;
+          const el = mediaEls.get(c.id);
+          return { muted: el.muted, paused: el.paused, rs: el.readyState,
+            off: el.currentTime - (c.in + (state.playhead - c.start)) };
+        })();
+        ok('under a rendered span the source audio is RUNNING, not parked',
+          !!during && during.paused === false,
+          during ? 'paused=' + during.paused : 'no live audio clip');
+        ok('  and silent, so it is not heard on top of the span s own mix',
+          !!during && during.muted === true);
+        ok('  and still tracking the playhead, so the edge needs no seek',
+          !!during && Math.abs(during.off) < 0.35, during ? during.off.toFixed(3) : '-');
+
+        // Cross the edge.
+        let after = null;
+        for (let i = 0; i < 20 && state.playhead < band0.to + 0.35; i++) await sleep(60);
+        {
+          const c = liveAudio();
+          const el = c && mediaEls.get(c.id);
+          if (el) {
+            after = { muted: el.muted, paused: el.paused, rs: el.readyState,
+              off: el.currentTime - (c.in + (state.playhead - c.start)) };
+          }
+        }
+        pause();
+        ok('leaving the span is an UNMUTE, not a cold start',
+          !!after && after.muted === false && after.paused === false,
+          after ? 'muted=' + after.muted + ' paused=' + after.paused : 'no live audio clip');
+        ok('  and the element still has data - no decode hole at the edge',
+          !!after && after.rs >= 2, after ? 'readyState=' + after.rs : '-');
+        ok('  and it is still in sync on the far side',
+          !!after && Math.abs(after.off) < 0.35, after ? after.off.toFixed(3) : '-');
+      }
+      state.usePreviewRender = false;
+    }
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {

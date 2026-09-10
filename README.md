@@ -20,6 +20,16 @@ npm install
 npm start
 ```
 
+A `.scut` path on the command line **opens on launch**, which saves walking the file
+dialog every time the same project is being worked on or tested:
+
+```bash
+npx electron . project_test_2.scut
+```
+
+`ShortCut.bat` passes its arguments through, so `ShortCut.bat project_test_2.scut` does
+the same. A smoke run ignores it — those suites all start from an empty timeline.
+
 There is **no build step and no bundler**. `src/renderer/app.js` is plain ES2020 loaded
 directly by a `<script>` tag. Edit a file, press `F5` in the app window to reload the
 renderer (`Ctrl+Shift+I` opens DevTools — note `Ctrl+R` is bound to *render*, not
@@ -2430,6 +2440,32 @@ sources running would double it up.
 
 `P` toggles the whole behaviour, which is also the way to compare a render against the
 live composite.
+
+#### The picture is parked under a band; the audio is not
+
+`syncMedia()` silences the source clips while a rendered span is on screen, but the two
+kinds are silenced differently, and the difference is the whole quality of the hand-off at
+the far edge.
+
+The **picture** is parked. Decoding video nobody can see is exactly what a rendered span
+exists to avoid, and a cold first frame at the edge is covered by `frameCache`.
+
+The **audio keeps running, muted**. Pausing it used to abandon its clock: an audio element
+sat paused at wherever it happened to be — usually 0 — for as long as the band played, and
+the moment the playhead left the band `syncMedia()` needed that element *at* the playhead.
+On a 0–2 s band that meant a cold two-second seek: `readyState` fell from 4 to 1, about
+300 ms of silence, and the element came back roughly 150 ms behind — under the 0.3 s
+correction threshold, so nothing ever closed the gap. Cross a few edges and each cold seek
+starts before the last has finished, and it degenerates into no audio at all.
+
+Kept running and muted, leaving the band is an **unmute**: no seek, no decode hole, and
+already in sync because it never stopped tracking. Measured on a real project, the same
+edge goes from `rs4 → rs1` with a 300 ms hole to `rs4` throughout with the offset holding
+at 0.02–0.04 s. The frame loop stops lurching too — it was lurching *because* of the seek
+thrash, not independently of it.
+
+`smoke-previewrender.js` asserts both halves: playing-and-muted under the band, unmuted
+with `readyState >= 2` and still in sync on the far side.
 
 Two rules keep this working:
 

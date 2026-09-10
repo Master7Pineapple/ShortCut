@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('api', {
 
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),
+  onOpenOnLaunch: (cb) => ipcRenderer.on('project:openOnLaunch', (_e, p) => cb(p)),
 
   pickOutput: (name) => ipcRenderer.invoke('render:pickOutput', name),
   startRender: (job) => ipcRenderer.invoke('render:start', job),

@@ -51,6 +51,23 @@ function createWindow() {
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
+  // A project named on the command line opens on launch: `ShortCut.bat some.scut`, or
+  // `npx electron . some.scut`. Saves walking the file dialog every time the same project
+  // is being worked on or tested. Never during a smoke run - those suites all start from
+  // an empty timeline and would fail against someone's loaded project.
+  if (!process.env.SHORTCUT_SMOKE) {
+    const arg = process.argv.slice(1).find((a) => /\.scut$/i.test(a));
+    if (arg) {
+      const target = path.resolve(arg);
+      win.webContents.once('did-finish-load', () => {
+        // Reported rather than thrown: a bad path on the command line should land the
+        // user in an empty editor with a line in the log, not a dead window.
+        console.log('Opening ' + target + ' from the command line.');
+        win.webContents.send('project:openOnLaunch', target);
+      });
+    }
+  }
+
   // Set SHORTCUT_DEBUG=1 to mirror renderer console output into the terminal.
   if (process.env.SHORTCUT_DEBUG) {
     win.webContents.on('console-message', (_e, level, message, line, source) => {
