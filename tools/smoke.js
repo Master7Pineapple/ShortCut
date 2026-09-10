@@ -93,6 +93,48 @@
   ok('serialize keeps clip fields',
     json.tracks.flatMap((t) => t.clips).every((c) => c.src && typeof c.in === 'number' && typeof c.panX === 'number'));
 
+  // --- a click listener hands its handler an Event -------------------------
+  //
+  // `#btnOpen` was bound straight to `openProject`, which was harmless while that
+  // function took no arguments. The moment it took a path, the click Event went to main
+  // as a structured-cloned Object and `fs.readFileSync` refused it: "the path argument
+  // must be of type string ... received an instance of Object". The button is wrapped
+  // now AND the function guards its own argument; this asserts the guard, because that
+  // is the half a future caller cannot get wrong.
+  //
+  // Stubbed, so nothing here can open a real dialog - which on a smoke run would hang
+  // with nobody to answer it, the same failure mode `confirmDiscard()` is asserted for
+  // at the top of this file.
+  // Asserted through `projectPathArg()` rather than by watching the IPC call, because
+  // `window.api` is frozen by contextBridge and cannot be stubbed. Calling `openProject()`
+  // for real is not an option either: with no path it opens a modal file dialog, which on
+  // a smoke run has nobody to answer it - the same hang `confirmDiscard()` is asserted
+  // against at the top of this file.
+  ok('an Event reaching openProject is not forwarded to main as a path',
+    projectPathArg(new Event('click')) === null,
+    'got ' + JSON.stringify(projectPathArg(new Event('click'))));
+  ok('nor is any other non-string',
+    projectPathArg({ some: 'object' }) === null && projectPathArg(42) === null &&
+    projectPathArg('') === null);
+  ok('but a real path still goes through untouched',
+    projectPathArg('C:\\nowhere\\x.scut') === 'C:\\nowhere\\x.scut');
+  ok('and no argument still means "ask me", which is what the button does',
+    projectPathArg() === null && projectPathArg(null) === null);
+
+  // The same bug class, one button along: `toggleBin` takes `show`, so bound directly it
+  // received the click Event - truthy - and could open the bin but never close it again.
+  {
+    toggleBin(true);
+    const opened = !$('#quickBin').hidden;
+    $('#btnBinCollapse').click();
+    const closed = $('#quickBin').hidden;
+    $('#btnBinCollapse').click();
+    const reopened = !$('#quickBin').hidden;
+    ok('the QuickBin collapse button actually toggles, both ways',
+      opened && closed && reopened,
+      'open=' + opened + ' close=' + closed + ' reopen=' + reopened);
+  }
+
   // --- new project --------------------------------------------------------
   state.dirty = false;
   newProject();

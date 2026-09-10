@@ -4905,6 +4905,24 @@ async function saveProject(asNew) {
 }
 
 /**
+ * A path argument, or `null` meaning "ask me". ONLY a string is a path.
+ *
+ * `openProject` is wired to a click listener, and a listener hands its handler an Event.
+ * That was harmless while the function took no arguments at all - the moment it took one,
+ * `#btnOpen` began sending a structured-cloned Event to main, and `fs.readFileSync`
+ * refused it: *the "path" argument must be of type string ... received an instance of
+ * Object*. The listener passes nothing now, and this exists so the next caller cannot
+ * reintroduce it - a function that is both a handler and an API needs the coercion at the
+ * door rather than at every call site.
+ *
+ * Separate and named so `smoke.js` can assert it. `window.api` is frozen by
+ * `contextBridge`, so a suite cannot stub the IPC call to watch what it was sent.
+ */
+function projectPathArg(v) {
+  return typeof v === 'string' && v ? v : null;
+}
+
+/**
  * Open a project. With no argument it asks; with a path it opens that file.
  *
  * The path form is what the launch argument uses - `ShortCut.bat some.scut`, or
@@ -4913,7 +4931,7 @@ async function saveProject(asNew) {
  */
 async function openProject(filePath) {
   if (state.dirty && !confirmDiscard()) return;
-  const r = await window.api.openProject(filePath || null);
+  const r = await window.api.openProject(projectPathArg(filePath));
   if (r.canceled) return;
   if (r.error) { log(r.error); alert(r.error); return; }
   for (const id of [...mediaEls.keys()]) dropMedia(id);
@@ -6311,7 +6329,10 @@ $('#btnBinNewFolder').addEventListener('click', () => {
 });
 $('#btnBinUse').addEventListener('click', () => QuickBin.useSelection());
 $('#btnBinRemove').addEventListener('click', () => QuickBin.removeSelection());
-$('#btnBinCollapse').addEventListener('click', toggleBin);
+// Wrapped, like #btnCapCollapse below it. Bound directly, the click Event arrived as
+// `show` - which is truthy, so `hide` was always false and the button could open the bin
+// but never close it. `toggleBin()` with no argument is what flips it.
+$('#btnBinCollapse').addEventListener('click', () => toggleBin());
 
 $('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
 
@@ -6363,7 +6384,9 @@ Wave.onReady(() => {
   waveRedraw = setTimeout(renderLanes, 120);
 });
 $('#btnNew').addEventListener('click', newProject);
-$('#btnOpen').addEventListener('click', openProject);
+// Wrapped, NOT passed directly: a listener hands its handler the click Event, and
+// openProject() now takes a path as its first argument. See the guard inside it.
+$('#btnOpen').addEventListener('click', () => openProject());
 $('#btnSave').addEventListener('click', () => saveProject(false));
 $('#btnSaveAs').addEventListener('click', () => saveProject(true));
 $('#btnSplit').addEventListener('click', splitAtPlayhead);
