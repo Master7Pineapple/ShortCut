@@ -235,6 +235,41 @@
       document.querySelector('#aspectBadge').textContent);
     state.out.w = 720; state.out.h = 1280; resizeCanvas();
 
+    // ================================================ a render stops playback
+    //
+    // The baker drives `mediaFor()` - the viewer's OWN element per clip - and parks it on
+    // each bake frame in turn. Left playing, `syncMedia()` is seeking those same elements
+    // back under the playhead every frame, and the two fight: the picture stutters and
+    // the audio drifts, gets corrected by a large seek, drifts again, and ends the render
+    // parked mid-seek. There is one element per clip by design, so the baker can only
+    // borrow it - and it cannot borrow what is still in use.
+    //
+    // Asserted here because the symptom is audible rather than visible, so a regression
+    // would not fail anything else in this suite: it would just sound broken.
+    {
+      state.out.w = 480; state.out.h = 854; state.out.quality = 'draft';
+      resizeCanvas();
+      seek(0);
+      play();
+      await sleep(200);
+      ok('playing, so the render has something to stop', state.playing === true);
+
+      let playingDuringBake = null;
+      const pending = doPreviewRender({ force: true });
+      // Sampled WHILE the bake is running, which is the only moment the fight exists.
+      await sleep(250);
+      playingDuringBake = state.playing;
+      await pending;
+
+      ok('A RENDER STOPS PLAYBACK - the baker gets the media elements to itself',
+        playingDuringBake === false, 'state.playing during the bake was ' + playingDuringBake);
+      ok('  and every source element is parked, not still being driven',
+        [...mediaEls.values()].every((el) => el.paused),
+        [...mediaEls.values()].map((el) => el.paused).join(','));
+      ok('  and playback still works afterwards',
+        (() => { seek(0.2); play(); const on = state.playing; pause(); return on; })());
+    }
+
     const failed = results.filter((x) => x.startsWith('FAIL')).length;
     return results.join('\n') + '\n\n' + (results.length - failed) + '/' + results.length + ' passed';
   } catch (e) {

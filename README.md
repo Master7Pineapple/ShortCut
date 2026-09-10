@@ -2442,6 +2442,29 @@ Two rules keep this working:
 - **`pause()` has to stop the span players too.** They are not in `mediaEls`, and
   `syncMedia()` - the thing that would otherwise pause them - only runs while playing. Miss
   this and Stop does nothing to a rendered span: it plays on with no way to halt it.
+- **Starting a render stops playback**, and that is not a courtesy. See below.
+
+#### A render stops playback, because the baker borrows the viewer's elements
+
+`bakeComposite()` draws its frames from `mediaFor()` — the viewer's **own** element per
+clip, the same one `syncMedia()` keeps parked under the playhead. There is one element per
+clip by design; a second decoder per clip is exactly what the pool exists to avoid. So the
+baker can only *borrow* it, and it cannot borrow what is still in use.
+
+Left playing, the two fight over every element: the baker seeks one back to its bake
+frame, the next turn of `loop()` seeks it forward to the playhead, and neither gets what it
+asked for. **The audible half is worse than the visible half**, which is why this is worth
+its own section. Baking one frame is a full-resolution composite plus an 8 MB
+`getImageData`, and the loop only yields every fourth frame — so `requestAnimationFrame`
+starves, `syncMedia()` stops running anywhere near frame rate, and the audio elements drift
+out from under a playhead that is still advancing in real time. Each drift ends in a large
+corrective seek. That is the stutter; and the render finishes with those elements parked
+mid-seek, which is the silence.
+
+`doPreviewRender()` and `doRender()` therefore both call `pause()` before baking.
+`smoke-previewrender.js` asserts it by sampling `state.playing` *during* the bake, because
+a regression here fails nothing else in the suite — the render is still correct, the cache
+band still matches, and the only symptom is that the app sounds broken while you use it.
 
 ### Rendering a range
 

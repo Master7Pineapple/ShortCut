@@ -5570,6 +5570,23 @@ async function doPreviewRender(opts) {
     return;
   }
 
+  // A RENDER STOPS PLAYBACK, and it has to.
+  //
+  // `bakeComposite()` drives `mediaFor()` - the viewer's OWN element per clip, the same
+  // one `syncMedia()` keeps under the playhead - and parks it on each bake frame in turn.
+  // Left playing, the two fight over every element: the baker seeks one backwards, the
+  // next frame of `loop()` seeks it forward again, and neither gets what it asked for.
+  // The audible half is worse than the visible one. Baking a frame is a full-resolution
+  // composite plus an 8 MB `getImageData`, and it only yields every fourth frame, so the
+  // frame loop starves; `syncMedia()` then runs far too slowly to keep the audio elements
+  // under a playhead that is still advancing in real time, and they drift, get corrected
+  // by a large seek, drift again - which is the stutter - and end the render parked
+  // mid-seek, which is the silence.
+  //
+  // Stopping first is the whole fix: there is one element per clip by design (a second
+  // decoder per clip is what the pool exists to avoid), so the baker can only borrow it,
+  // and it cannot borrow what is still in use.
+  pause();
   rendering = true;
   $('#btnRenderPreview').disabled = true;
   $('#btnCancelRender').disabled = false;
@@ -5647,6 +5664,9 @@ async function doRender(opts) {
   const outPath = await window.api.pickOutput(name);
   if (!outPath) return;
 
+  // Same reason as the preview render above: the baker borrows the viewer's own elements
+  // and cannot borrow what is still playing.
+  pause();
   rendering = true;
   $('#btnRender').disabled = true;
   $('#btnCancelRender').disabled = false;
