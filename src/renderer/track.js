@@ -346,7 +346,14 @@
         t.rate = Math.round(num(t.rate, DEFAULTS.rate));
         t.points = t.points
           .filter((p) => p && isFinite(Number(p.t)) && isFinite(Number(p.x)) && isFinite(Number(p.y)))
-          .map((p) => ({ t: r4(p.t), x: r5(p.x), y: r5(p.y), c: clamp(num(p.c, 1), 0, 1) }))
+          .map((p) => {
+            const q = { t: r4(p.t), x: r5(p.x), y: r5(p.y), c: clamp(num(p.c, 1), 0, 1) };
+            // `fix` marks a sample a PERSON is responsible for: 1 interpolated across a
+            // lost span at their request, 2 placed by hand. Absent on a solved sample, so
+            // an untouched track serialises exactly as it did before repair existed.
+            if (p.fix === 1 || p.fix === 2) q.fix = p.fix;
+            return q;
+          })
           .sort((a, b) => a.t - b.t);
         const a = t.anchor || t.points[0];
         t.anchor = { t: r4(a.t), x: r5(a.x), y: r5(a.y) };
@@ -426,10 +433,115 @@
     let worst = 1;
     for (const p of track.points) {
       if (p.t < from - 1e-6 || p.t > to + 1e-6) continue;
-      const c = clamp(num(p.c, 1), 0, 1);
+      // A REPAIRED sample is not a hole any more. The solver failed there and a person
+      // answered for it, so it stops counting against the track - otherwise a fully
+      // repaired track would still report itself broken and the warning would be noise.
+      // The lane still draws repairs in their own colour, so "the machine failed here"
+      // remains visible; it is just no longer an alarm.
+      const c = p.fix ? 1 : clamp(num(p.c, 1), 0, 1);
       if (c < worst) worst = c;
     }
     return worst;
+  }
+
+  /**
+   * The runs of samples the solver could not hold - the red on the lane.
+   *
+   * `edge` marks a run with no confident sample on one side: a track that was already
+   * lost when the clip started, or never recovered before it ended. Those cannot be
+   * bridged, because bridging needs something to bridge BETWEEN, and the honest repair
+   * for one is to re-anchor there and solve again. Saying which kind a span is, is the
+   * difference between a repair button that works and one that silently does nothing.
+   */
+  function lostSpans(track, minConf) {
+    const lo = num(minConf, DEFAULTS.minConf);
+    const pts = (track && track.points) || [];
+    const bad = (p) => !p.fix && clamp(num(p.c, 1), 0, 1) < lo;
+    const out = [];
+    let i = 0;
+    while (i < pts.length) {
+      if (!bad(pts[i])) { i++; continue; }
+      let j = i;
+      while (j + 1 < pts.length && bad(pts[j + 1])) j++;
+      const before = i > 0 ? pts[i - 1] : null;
+      const after = j + 1 < pts.length ? pts[j + 1] : null;
+      out.push({
+        i0: i, i1: j, t0: pts[i].t, t1: pts[j].t, n: j - i + 1,
+        edge: !before ? 'lead' : (!after ? 'trail' : null),
+      });
+      i = j + 1;
+    }
+    return out;
+  }
+
+  /**
+   * Repair the lost spans that CAN be repaired: interpolate across them.
+   *
+   * The solver held the point still through a lost span, which is the right thing for it
+   * to do with no information - but a held point is visibly wrong when the thing it was
+   * following kept moving, and it is the jump out the far side that reads worst. A person
+   * looking at the two confident ends can see that the object travelled between them, and
+   * a straight line between those ends is very nearly always closer to the truth than a
+   * frozen point. So this fills the run in, marks every sample it touched `fix: 1`, and
+   * leaves the confidence numbers underneath alone.
+   *
+   * Interior spans only. An edge span has nothing to interpolate towards, and guessing
+   * off the end of the data is how a repair becomes a lie. Those are reported instead.
+   */
+  function repairSpans(track, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const spans = lostSpans(track, o.minConf);
+    const pts = track.points;
+    let bridged = 0, edges = 0;
+    for (const sp of spans) {
+      if (sp.edge) { edges++; continue; }
+      const a = pts[sp.i0 - 1], b = pts[sp.i1 + 1];
+      const span = b.t - a.t;
+      for (let k = sp.i0; k <= sp.i1; k++) {
+        const f = span > 1e-9 ? (pts[k].t - a.t) / span : 0;
+        pts[k].x = r5(a.x + (b.x - a.x) * f);
+        pts[k].y = r5(a.y + (b.y - a.y) * f);
+        pts[k].fix = 1;
+      }
+      bridged++;
+    }
+    return { bridged, edges, spans: spans.length };
+  }
+
+  /**
+   * Put one sample where a person says it belongs, and re-bridge around it.
+   *
+   * The difference from `reanchorAt()` is everything that happens NEXT, and it is why
+   * both exist. Re-anchoring says "the solve is wrong from here on" and throws the future
+   * away to be solved again. A fix point says "the solve is wrong just here" and keeps
+   * every solved sample on both sides - which is what you want in the middle of a long
+   * track with one bad stretch, where re-solving the remaining minute to correct six
+   * frames is a bad trade.
+   */
+  function fixPointAt(track, t, x, y, opts) {
+    if (!track) return null;
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const tt = r4(t);
+    const pts = track.points || (track.points = []);
+    const rate = Math.max(1, num(track.rate, DEFAULTS.rate));
+    // Replace the sample nearest `t` when there is one within half a sample period, so a
+    // fix lands ON the grid rather than wedging an off-grid sample between two others.
+    let best = -1, bestD = (0.5 / rate) + 1e-6;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - tt);
+      if (d <= bestD) { bestD = d; best = i; }
+    }
+    const sample = { t: best >= 0 ? pts[best].t : tt, x: r5(x), y: r5(y), c: 1, fix: 2 };
+    if (best >= 0) pts[best] = sample;
+    else { pts.push(sample); pts.sort((a, b) => a.t - b.t); }
+    // Only the runs this fix now bounds are repaired; the rest of the track is untouched.
+    repairSpans(track, o);
+    return sample;
+  }
+
+  /** Every sample a person is answerable for, which is what the panel counts. */
+  function fixCount(track) {
+    return ((track && track.points) || []).filter((p) => p.fix).length;
   }
 
   // ----------------------------------------------------------------- the binding
@@ -486,13 +598,89 @@
    * telemetry effects keep: a clip whose track was deleted, or that was carried into
    * another project without one, keeps working and stops following.
    */
-  function bindPos(clip, bind, tSource, aspect) {
+  /**
+   * A track's position at `t`, averaged over a window of `smooth` seconds.
+   *
+   * Averaged over TIME rather than over samples, the same rule `Cursor`'s smoothing
+   * follows and for the same reason: the samples are on a fixed grid here, but a repaired
+   * or hand-fixed span is not, so weighting by sample count would smooth the repaired
+   * stretches differently from the solved ones.
+   */
+  function smoothedAt(track, t, smooth) {
+    const w = Math.max(0, num(smooth, 0));
+    if (!(w > 1e-4)) return sampleAt(track, t);
+    const rate = Math.max(1, num(track && track.rate, DEFAULTS.rate));
+    const step = 1 / rate;
+    const n = Math.max(1, Math.round(w / step));
+    let sx = 0, sy = 0, sc = 1, k = 0;
+    for (let i = -n; i <= n; i++) {
+      const s = sampleAt(track, t + i * step);
+      if (!s) continue;
+      sx += s.x; sy += s.y; k++;
+      if (s.c < sc) sc = s.c;
+    }
+    return k ? { x: sx / k, y: sy / k, c: sc } : sampleAt(track, t);
+  }
+
+  /**
+   * A binding resolved: where the bound thing should sit, as a fraction of the FRAME.
+   *
+   *   bind = { track, clip, offX, offY, strength, smooth, keys }
+   *
+   * `tSource` is source seconds on the clip that OWNS the track, and `tKeys` is the bound
+   * effect's own clip-local time - the axis `Anim` keys live on. They are the same number
+   * for a same-clip binding and different ones when the track lives on another clip, so
+   * they are separate arguments rather than one that means two things.
+   *
+   * STRENGTH IS WHY THIS TAKES KEYS AT ALL. A track is a measurement of the thing it was
+   * put on, and a bound effect moving exactly with it is often more movement than the shot
+   * wants - the tracked element crosses half the frame and the callout chasing it reads as
+   * frantic. `strength` scales the movement AWAY FROM THE ANCHOR: 1 follows exactly, 0.4
+   * follows at 40% of the distance travelled, 0 pins it where it started. Because it is
+   * keyframable, it can be 1 through the part of the shot that needs to track and 0.3
+   * through the part that only needs to drift.
+   *
+   * The reference is the track's own ANCHOR - the pixel the author put the tracker on -
+   * so damping pulls toward a point they chose rather than toward the middle of the frame.
+   */
+  function bindPos(clip, bind, tSource, aspect, tKeys) {
     if (!bind || !bind.track) return null;
-    const s = positionAt(clip, bind.track, tSource);
+    const track = trackById(clip, bind.track);
+    if (!track) return null;
+    const tk = num(tKeys, num(tSource, 0) - num((clip || {}).in, 0));
+    // `Anim` is a plain global here, exactly as it is in fx.js - but this file is also
+    // loaded as a module by the suite and inside the worker, where it does not exist. A
+    // bare identifier would throw rather than be undefined, so the lookup is guarded.
+    const A = (typeof Anim !== 'undefined' && Anim) ||
+      (typeof self !== 'undefined' && self.Anim) || null;
+    const anim = (key, fallback) => {
+      const v = (A && A.valueAt) ? A.valueAt(bind, key, tk, fallback) : fallback;
+      return isFinite(Number(v)) ? Number(v) : fallback;
+    };
+    const s = smoothedAt(track, tSource, anim('smooth', num(bind.smooth, 0)));
     if (!s) return null;
+    const strength = clamp(anim('strength', num(bind.strength, 1)), -4, 4);
+    const a = track.anchor || s;
     const m = frameMap(clip, aspect);
-    const p = m(s.x, s.y);
-    return { x: p.x, y: p.y, c: s.c };
+    // Damped in SOURCE space, before the framing map. The map is affine, so damping either
+    // side of it is the same picture - and doing it here means `strength` means "a
+    // fraction of how far the tracked thing actually moved", which is what it says.
+    const p = m(a.x + (s.x - a.x) * strength, a.y + (s.y - a.y) * strength);
+    /*
+     * THE OFFSETS COME BACK RATHER THAN BEING APPLIED, and that is not fussiness.
+     *
+     * An offset means something different to each kind of binding: to a spotlight it
+     * moves the lit shape, and to a bound `transform` - which is a camera - it moves the
+     * FRAME, so adding it to the tracked point would move the picture the other way. They
+     * were briefly applied here, and `smoke-track.js` caught exactly that inversion.
+     * So the animated values are handed back and `DEFS[type].bind.apply()` puts them
+     * wherever they belong for that type.
+     */
+    return {
+      x: p.x, y: p.y, c: s.c,
+      offX: anim('offX', num(bind.offX, 0)),
+      offY: anim('offY', num(bind.offY, 0)),
+    };
   }
 
   /**
@@ -538,6 +726,7 @@
     makeTrack, normalizeClip, hasTracks, trackById,
     sampleAt, positionAt, reanchorAt, mergePoints, worstIn, isSolved,
     textureAt, bestFeatureNear,
+    lostSpans, repairSpans, fixPointAt, fixCount, smoothedAt,
     frameMap, bindPos, digest, cacheKey,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;

@@ -1702,11 +1702,35 @@
      * effect draws its static parameters, which is the degradation contract.
      */
     if (fx.bind && typeof fx.bind === 'object' && fx.bind.track && d.bind) {
-      fx.bind = {
-        track: String(fx.bind.track),
-        offX: isFinite(Number(fx.bind.offX)) ? Number(fx.bind.offX) : 0,
-        offY: isFinite(Number(fx.bind.offY)) ? Number(fx.bind.offY) : 0,
+      const b = fx.bind;
+      const nb = {
+        track: String(b.track),
+        offX: isFinite(Number(b.offX)) ? Number(b.offX) : 0,
+        offY: isFinite(Number(b.offY)) ? Number(b.offY) : 0,
+        strength: isFinite(Number(b.strength)) ? clamp(b.strength, -4, 4) : 1,
+        smooth: isFinite(Number(b.smooth)) ? clamp(b.smooth, 0, 4) : 0,
       };
+      // The clip the track lives on, when it is not this one. Absent for the ordinary
+      // case, so a same-clip binding serialises exactly as it did before cross-clip
+      // binding existed.
+      if (b.clip) nb.clip = String(b.clip);
+      /*
+       * The binding keyframes ITS OWN numbers, on its own `keys` object.
+       *
+       * `Anim` only ever touches a `.keys` object, so `bind` is a keyframe holder for
+       * free - exactly as an `fx` entry is. They have to be separate holders: `fx.keys`
+       * animates the effect's parameters, and two of those parameters are the ones the
+       * binding overwrites every frame. Putting `strength` in there would make it a
+       * parameter that does not exist, which `normalize()` would then prune away.
+       */
+      if (b.keys && typeof b.keys === 'object') {
+        const keys = {};
+        for (const k of ['strength', 'smooth', 'offX', 'offY']) {
+          if (Array.isArray(b.keys[k]) && b.keys[k].length) keys[k] = Anim.sortKeys(b.keys[k]);
+        }
+        if (Object.keys(keys).length) nb.keys = keys;
+      }
+      fx.bind = nb;
     } else if (fx.bind) {
       delete fx.bind;
     }
@@ -1739,6 +1763,37 @@
     return clip.fx.filter((f) => f && DEFS[f.type] && f.enabled !== false);
   }
 
+  /*
+   * HOW A BINDING FINDS ITS TRACK, AND WHY THAT IS NOT THIS FILE'S BUSINESS.
+   *
+   * A binding may name a track on ANOTHER clip - a logo on V2 following a button in the
+   * screen recording on V1 - and resolving that needs two things this file must never
+   * touch: the timeline, and a clip's position on it. An effect that could read
+   * `clip.start` would be putting a clip's timeline position into its own pixels, which
+   * is the one thing the render cache's key rules forbid, and the rule is worth more than
+   * the convenience.
+   *
+   * So the resolver is INJECTED. `app.js` installs one that can walk the timeline and do
+   * the time conversion, and takes on the matching duty of putting that dependency into
+   * the render key (`trackDigests()`). With no binder installed - a bare module load, a
+   * suite checking this file alone - bindings resolve against the clip's own tracks only,
+   * which is the behaviour this file can be responsible for on its own.
+   */
+  let BINDER = null;
+  function setBinder(fn) { BINDER = typeof fn === 'function' ? fn : null; }
+
+  function resolveBind(clip, entry, t, W, H) {
+    const b = entry.bind;
+    if (!b || !b.track) return null;
+    if (BINDER) return BINDER(clip, b, t, W, H);
+    const TK = (typeof Tracker !== 'undefined' && Tracker) ||
+      (typeof window !== 'undefined' && window.Tracker) || null;
+    if (!TK) return null;
+    // Same-clip only: clip-local time to source time is the clip's own in-point.
+    if (b.clip && b.clip !== clip.id) return null;
+    return TK.bindPos(clip, b, (Number(clip.in) || 0) + t, (Number(W) || 9) / (Number(H) || 16), t);
+  }
+
   /** One parameter's value at clip-local time `t` - keyed if it has keys, static if not. */
   function paramAt(entry, key, t) {
     const stat = (entry.params || {})[key];
@@ -1766,13 +1821,11 @@
     for (const k of Object.keys(d.params)) out[k] = paramAt(entry, k, t);
     const b = entry.bind;
     if (b && b.track && d.bind && clip) {
-      const TK = (typeof Tracker !== 'undefined' && Tracker) ||
-        (typeof window !== 'undefined' && window.Tracker) || null;
-      // Clip-local time to SOURCE time: the track is measured against the file, which is
-      // the only axis that survives trimming and dragging the clip.
-      const pos = TK && TK.bindPos(clip, b, (Number(clip.in) || 0) + t,
-        (Number(W) || 9) / (Number(H) || 16));
-      if (pos) d.bind.apply(out, pos, { x: b.offX, y: b.offY });
+      // The resolver hands back the tracked point AND the animated offsets, because what
+      // an offset means depends on the type: it moves the lit shape of a spotlight and the
+      // whole frame of a bound transform. Only `apply()` knows which.
+      const pos = resolveBind(clip, entry, t, W, H);
+      if (pos) d.bind.apply(out, pos, { x: pos.offX || 0, y: pos.offY || 0 });
     }
     return out;
   }
@@ -1864,7 +1917,7 @@
   }
 
   const API = {
-    DEFS, TYPES, boundParams,
+    DEFS, TYPES, boundParams, setBinder,
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
     pointerImage, preloadImages,

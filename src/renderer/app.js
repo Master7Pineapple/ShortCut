@@ -1171,7 +1171,9 @@ function drawClipTrackConf(el, c) {
   const w = Math.min(WAVE_MAX_PX, wPx);
   const h = 4;
   const key = c.id + '|' + Tracker.hasTracks(c) + '|' + c.in.toFixed(4) + '|' + c.out.toFixed(4) +
-    '|' + w + '|' + (c.tracks || []).map((t) => t.id + ':' + t.points.length).join(',');
+    '|' + w + '|' + (c.tracks || []).map((t) =>
+      t.id + ':' + t.points.length + ':' + Tracker.fixCount(t) +
+      ':' + Tracker.worstIn(t, c.in, c.out).toFixed(3)).join(',');
   let cv = trackConfCanvases.get(key);
   if (!cv) {
     cv = document.createElement('canvas');
@@ -1182,17 +1184,25 @@ function drawClipTrackConf(el, c) {
     const per = (c.out - c.in) / w;
     for (let x = 0; x < w; x++) {
       const t0 = c.in + x * per, t1 = t0 + per;
-      let worst = 1;
+      let worst = 1, repaired = false;
       for (const tk of c.tracks) {
         const s = Tracker.sampleAt(tk, (t0 + t1) / 2);
         const span = Math.min(Tracker.worstIn(tk, t0, t1), s ? s.c : 1);
         if (span < worst) worst = span;
+        // A repaired sample stops being an alarm but must not become invisible: the
+        // machine still failed here, and that is worth being able to see when the shot
+        // looks wrong later.
+        for (const q of tk.points) {
+          if (q.fix && q.t >= t0 - 1e-6 && q.t <= t1 + 1e-6) { repaired = true; break; }
+        }
       }
-      // Sure is quiet, lost is loud. A strip that shouted at a good track would be
-      // ignored by the time it mattered.
-      g.fillStyle = worst < Tracker.DEFAULTS.minConf
+      // Sure is quiet, repaired is amber, lost is loud. A strip that shouted at a good
+      // track would be ignored by the time it mattered.
+      g.fillStyle = (worst < Tracker.DEFAULTS.minConf && !repaired)
         ? 'rgba(224,83,63,.95)'
-        : 'rgba(120,220,190,' + (0.18 + 0.35 * (1 - worst)).toFixed(3) + ')';
+        : repaired
+          ? 'rgba(224,178,65,.9)'
+          : 'rgba(120,220,190,' + (0.18 + 0.35 * (1 - worst)).toFixed(3) + ')';
       g.fillRect(x, 0, 1, h);
     }
     if (trackConfCanvases.size > 300) trackConfCanvases.clear();
@@ -1668,6 +1678,8 @@ function renderInspector() {
   if (tightenAudioFor(c)) box.appendChild(tightenPanel());
   // Above the stack, because the stack READS it: a binding row on an effect is only
   // offered once something has been tracked, so the tracker is the first of the two.
+  const place = imagePlacePanel(c);
+  if (place) box.appendChild(place);
   const trk = trackPanel(c);
   if (trk) box.appendChild(trk);
   const fx = clipFxPanel(c);
@@ -1746,6 +1758,155 @@ const fxCollapsed = new Set();
  * Structural edits (add, remove, reorder, bypass) snapshot and rebuild here as ONE undo
  * entry; parameter edits go through the inspector's once-per-gesture guard above.
  */
+/**
+ * Every motion track on the timeline that something could bind to.
+ *
+ * Deliberately not just this clip's. A callout, a logo or an arrow is almost never on the
+ * same clip as the thing it points at - it is a separate clip on a track above - so a
+ * picker that only offered the clip's own tracks would be useless for the commonest case
+ * there is.
+ */
+function bindableTracks(forClip) {
+  const out = [];
+  for (const { clip } of allClips()) {
+    if (!Tracker.hasTracks(clip)) continue;
+    for (const tk of clip.tracks) {
+      const own = clip.id === forClip.id;
+      out.push({
+        clipId: clip.id,
+        trackId: tk.id,
+        value: clip.id + '::' + tk.id,
+        label: tk.name + (own ? '' : '  \u2014 ' + clip.name) +
+          (Tracker.isSolved(tk) ? '' : '  (not solved)'),
+        own,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The rows that make an effect follow a track: which track, how hard, how smoothly.
+ *
+ * Shared by the effect stack and by an image's placement panel, because they are the same
+ * controls over the same data and the second copy is always the one that goes stale.
+ */
+function fxBindSection(clip, fx, d, rowHooks, edit) {
+  const el = TextUI.el;
+  const nodes = [];
+  const opts = bindableTracks(clip);
+  const bound = fx.bind && fx.bind.track;
+  const owner = bound ? bindOwner(clip, fx.bind) : null;
+  const missing = bound && (!owner || !Tracker.trackById(owner, fx.bind.track));
+
+  const brow = el('div', 'tc-row');
+  brow.appendChild(el('label', 'tc-label', d.bind.label || 'Follow a track'));
+  const sel = el('select');
+  const none = el('option');
+  none.value = '';
+  none.textContent = 'Not bound';
+  sel.appendChild(none);
+  for (const o of opts) {
+    const opt = el('option');
+    opt.value = o.value;
+    opt.textContent = o.label;
+    sel.appendChild(opt);
+  }
+  if (missing) {
+    const opt = el('option');
+    opt.value = 'missing';
+    opt.textContent = 'a deleted track';
+    sel.appendChild(opt);
+  }
+  sel.value = missing ? 'missing'
+    : (bound ? ((fx.bind.clip || clip.id) + '::' + fx.bind.track) : '');
+  sel.disabled = !opts.length && !bound;
+  sel.title = d.bind.hint || '';
+  sel.addEventListener('change', () => edit(() => {
+    if (!sel.value || sel.value === 'missing') { delete fx.bind; return; }
+    const [clipId, trackId] = sel.value.split('::');
+    const next = Object.assign({ offX: 0, offY: 0, strength: 1, smooth: 0 }, fx.bind || {});
+    next.track = trackId;
+    // The field is absent for the ordinary same-clip case, so nothing that never crosses
+    // a clip boundary carries it at all.
+    if (clipId === clip.id) delete next.clip; else next.clip = clipId;
+    fx.bind = next;
+  }));
+  brow.appendChild(sel);
+  nodes.push(brow);
+
+  if (!opts.length && !bound) {
+    nodes.push(el('div', 'tc-hint',
+      'Nothing on the timeline has been tracked yet. Add a tracker to a video clip in ' +
+      'Motion tracking, solve it, and it will be offered here - including from other clips.'));
+    return nodes;
+  }
+  if (missing) {
+    nodes.push(el('div', 'tc-hint fx-warn',
+      'The track this follows is gone, so it is drawing the values below instead. ' +
+      'Pick another, or set it to Not bound.'));
+    return nodes;
+  }
+  if (!bound) return nodes;
+
+  if (owner && owner.id !== clip.id) {
+    nodes.push(el('div', 'tc-hint',
+      'Following a track on ' + owner.name + '. The two clips are locked together in ' +
+      'time - move one without the other and this follows the new alignment.'));
+  }
+
+  const dur = Math.max(0.001, clip.out - clip.in);
+  const bindDefaults = { bind: { offX: 0, offY: 0, strength: 1, smooth: 0 } };
+  const C = (spec) => TextUI.control(spec, fx, bindDefaults, rowHooks);
+  nodes.push(C({ path: 'bind.strength', label: 'Follow strength', type: 'range',
+    min: 0, max: 2, step: 0.01, digits: 2 }));
+  nodes.push(C({ path: 'bind.smooth', label: 'Smoothing', type: 'range',
+    min: 0, max: 1, step: 0.01, unit: 's', digits: 2 }));
+  nodes.push(C({ path: 'bind.offX', label: 'Follow offset X', type: 'range',
+    min: -1, max: 1, step: 0.002, digits: 3 }));
+  nodes.push(C({ path: 'bind.offY', label: 'Follow offset Y', type: 'range',
+    min: -1, max: 1, step: 0.002, digits: 3 }));
+  nodes.push(el('div', 'tc-hint',
+    'Strength scales how far this moves against how far the tracked point moved: 1 ' +
+    'follows exactly, 0.4 travels 40% as far, 0 pins it where the tracker was placed. ' +
+    'Smoothing averages the path over time, for a track that is accurate but jittery.'));
+
+  // The binding keyframes its OWN numbers, on its own `keys` object - which is how
+  // "follow hard through this bit, barely at all through that bit" is expressed. `Anim`
+  // only ever touches a `.keys` object, so `fx.bind` is a keyframe holder for free.
+  if (!fx.bind.keys) fx.bind.keys = {};
+  const keyHooks = Object.assign({}, rowHooks, {
+    dur,
+    getLocalTime: () => clamp(state.playhead - clip.start, 0, dur),
+    seekLocal: (t) => seek(clip.start + t),
+  });
+  const BIND_KEYS = [
+    { prop: 'strength', label: 'Follow strength', min: 0, max: 2, step: 0.01, base: 1 },
+    { prop: 'offX', label: 'Follow offset X', min: -1, max: 1, step: 0.002, base: 0 },
+    { prop: 'offY', label: 'Follow offset Y', min: -1, max: 1, step: 0.002, base: 0 },
+  ];
+  nodes.push(TextUI.section('bindkeys_' + fx.id, 'Follow keyframes', (kb) => {
+    kb.appendChild(el('div', 'tc-hint',
+      'Keys are times within this clip. Keyframe Follow strength to track hard through ' +
+      'one stretch and hold still through another.'));
+    for (const spec of BIND_KEYS) {
+      const base = isFinite(Number(fx.bind[spec.prop])) ? Number(fx.bind[spec.prop]) : spec.base;
+      kb.appendChild(TextUI.keyStrip(spec.prop, Object.assign({}, keyHooks, {
+        spec: Object.assign({}, Anim.propSpec(spec.prop), spec, { base }),
+        getKeys: () => Anim.trackFor(fx.bind, spec.prop, true),
+        clear: () => { Anim.trackFor(fx.bind, spec.prop, true).length = 0; Anim.pruneKeys(fx.bind); },
+        emptyHint: 'No keys - ' + spec.label + ' holds the value above.',
+      })));
+    }
+  }));
+
+  const taken = FX.boundParams(fx.type);
+  nodes.push(el('div', 'tc-hint',
+    'The track is writing ' + taken.join(' and ') + ' every frame, so the sliders and ' +
+    'keyframes for those are ignored while it is bound. Everything else still animates.'));
+  return nodes;
+}
+
 function clipFxPanel(clip) {
   if (!clip || !FX_KINDS.has(clip.kind)) return null;
   const el = TextUI.el;
@@ -1905,69 +2066,9 @@ function clipFxPanel(clip) {
       body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
     }
 
-    // The binding: what makes a callout stick to a moving element.
-    //
-    // Offered only on a type that knows what following MEANS - `DEFS[type].bind` - and
-    // only on a clip that has something solved to follow. A select with one dead option
-    // answers "why can I not bind this" with silence, which is the gap the pointer
-    // effects' greyed-out menu entries were added to close.
-    if (d.bind) {
-      const brow = el('div', 'tc-row');
-      brow.appendChild(el('label', 'tc-label', d.bind.label || 'Follow a track'));
-      const sel = el('select');
-      const none = el('option');
-      none.value = '';
-      none.textContent = 'Not bound';
-      sel.appendChild(none);
-      for (const tk of (clip.tracks || [])) {
-        const o = el('option');
-        o.value = tk.id;
-        o.textContent = tk.name + '  (' + tk.points.length + ')';
-        sel.appendChild(o);
-      }
-      // A binding whose track is gone keeps its value in the DOM so the panel can say so
-      // rather than silently reading as "Not bound" - the effect is still bound, it just
-      // has nothing to read.
-      const boundTo = fx.bind && fx.bind.track;
-      const missing = boundTo && !Tracker.trackById(clip, boundTo);
-      if (missing) {
-        const o = el('option');
-        o.value = boundTo;
-        o.textContent = 'a deleted track';
-        sel.appendChild(o);
-      }
-      sel.value = boundTo || '';
-      sel.disabled = !(clip.tracks || []).length && !boundTo;
-      sel.title = d.bind.hint || '';
-      sel.addEventListener('change', () => edit(() => {
-        if (sel.value) fx.bind = Object.assign({ offX: 0, offY: 0 }, fx.bind || {}, { track: sel.value });
-        else delete fx.bind;
-      }));
-      brow.appendChild(sel);
-      body.appendChild(brow);
-      if (!(clip.tracks || []).length && !boundTo) {
-        body.appendChild(el('div', 'tc-hint',
-          'Nothing tracked on this clip yet - add a tracker in Motion tracking above.'));
-      }
-      if (missing) {
-        body.appendChild(el('div', 'tc-hint fx-warn',
-          'The track this follows is gone, so it is drawing the values below instead. ' +
-          'Track again and re-bind it, or set it to Not bound.'));
-      }
-      if (fx.bind && fx.bind.track) {
-        body.appendChild(TextUI.control(
-          { path: 'bind.offX', label: 'Follow offset X', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
-          fx, { bind: { offX: 0, offY: 0 } }, rowHooks));
-        body.appendChild(TextUI.control(
-          { path: 'bind.offY', label: 'Follow offset Y', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
-          fx, { bind: { offX: 0, offY: 0 } }, rowHooks));
-        const taken = FX.boundParams(fx.type);
-        body.appendChild(el('div', 'tc-hint',
-          'The track is writing ' + taken.join(' and ') + ' every frame, so the sliders ' +
-          'and keyframes for those are ignored while it is bound. Everything else still ' +
-          'animates.'));
-      }
-    }
+    // The binding, built by the one function that knows how - the placement panel for
+    // an image shows the same rows, and two copies of this would drift within a week.
+    if (d.bind) for (const node of fxBindSection(clip, fx, d, rowHooks, edit)) body.appendChild(node);
 
     // An imported PNG pointer. A PATH, not the bytes: `clip.fx` is plain JSON that goes
     // into every undo snapshot and into the .scut file, and an inlined image would put a
@@ -3325,26 +3426,52 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
  * Mirrors the ffmpeg crop in main.js so the preview matches the render.
  */
 /** Framed draw at an explicit size, for baking at the job's resolution. */
+/**
+ * Frame one clip into a target of W x H. The ONLY framing path there is.
+ *
+ * Two modes, and `fit` names which:
+ *
+ *   'crop'     (the default, and what every clip did before stills grew a placement
+ *              panel) takes the largest source rect matching the output aspect, divides
+ *              it by `zoom` and offsets it by `pan` - so the picture FILLS the frame and
+ *              whatever does not fit is cropped away.
+ *   'contain'  fits the WHOLE picture inside the frame and leaves the rest transparent.
+ *              `zoom` becomes its size and `panX`/`panY` its position, which is what a
+ *              logo, a screenshot or a badge needs: a wide logo cropped to 9:16 is a
+ *              detail of a logo.
+ *
+ * `contain` means the layer has transparency in it, so a clip using it must be COMPOSITED
+ * rather than handed to ffmpeg's crop-and-fill chain - `clipNeedsBake()` says so.
+ */
 function drawClipTo(c, el, target, W, H) {
   const sw = elW(el) || c.srcW, sh = elH(el) || c.srcH;
   if (!sw || !sh) return;
+  if (c.fit === 'contain') {
+    // Scaled to fit inside the frame, then multiplied by `zoom` - so zoom 1 is "as large
+    // as it goes while whole", and the aspect ratio is the source's own at every size.
+    const s = Math.min(W / sw, H / sh) * Math.max(0.01, c.zoom || 1);
+    const dw = sw * s, dh = sh * s;
+    // pan 0.5 centres it; 0 and 1 put its edges against the frame's, so the whole range
+    // is reachable at any size and the control means the same thing as it does in 'crop'.
+    target.drawImage(el, 0, 0, sw, sh, (W - dw) * c.panX, (H - dh) * c.panY, dw, dh);
+    return;
+  }
   const outAspect = state.out.w / state.out.h;
   const cw = Math.min(sw, sh * outAspect) / c.zoom;
   const ch = Math.min(sh, sw / outAspect) / c.zoom;
   target.drawImage(el, (sw - cw) * c.panX, (sh - ch) * c.panY, cw, ch, 0, 0, W, H);
 }
 
+/**
+ * The same framing, at preview size. It DELEGATES rather than repeating the maths.
+ *
+ * These were two copies of the crop, which is exactly the pairing the whole bake-first
+ * architecture exists to stop: the aspect comes from the output in both, so the only
+ * thing the second copy could ever do was drift away from the first.
+ */
 function drawClip(c, el, target) {
-  const sw = elW(el) || c.srcW, sh = elH(el) || c.srcH;
-  if (!sw || !sh) return;
-  // Aspect comes from the OUTPUT, not the preview canvas: the crop must match the render.
-  const outAspect = state.out.w / state.out.h;
-  let cw = Math.min(sw, sh * outAspect) / c.zoom;
-  let ch = Math.min(sh, sw / outAspect) / c.zoom;
-  const cx = (sw - cw) * c.panX;
-  const cy = (sh - ch) * c.panY;
   const P = previewSize();
-  (target || ctx).drawImage(el, cx, cy, cw, ch, 0, 0, P.w, P.h);
+  drawClipTo(c, el, target || ctx, P.w, P.h);
 }
 
 // ---------------------------------------------------------- rendered spans
@@ -5073,7 +5200,15 @@ async function openProject(filePath) {
     for (const tr of t.transitions) Trans.normalize(tr);
     // Fill in effect parameters a project saved before they existed, and drop effect
     // types this build does not know - the same job Trans.normalize does above.
-    for (const c of t.clips) { AudioFX.normalizeClip(c); FX.normalizeClip(c); Tracker.normalizeClip(c); }
+    for (const c of t.clips) {
+      AudioFX.normalizeClip(c);
+      FX.normalizeClip(c);
+      Tracker.normalizeClip(c);
+      // 'contain' or absent, and nothing else: an unknown value from a hand-edited or
+      // newer file would fall through every branch of drawClipTo() as 'crop' anyway, so
+      // it is normalised away rather than carried around meaning nothing.
+      if (c.fit !== 'contain') delete c.fit;
+    }
   }
   preloadTransitionImages();
   state.selection.clear();
@@ -5239,7 +5374,9 @@ function mouseDigest(c) {
  * pixels.
  */
 function trackDigests(c) {
-  if (!Tracker.hasTracks(c)) return undefined;
+  // NOT gated on this clip owning tracks. A logo following a button in the recording
+  // underneath it carries no track of its own, and an early return here left exactly that
+  // case - the commonest cross-clip one there is - out of the render key entirely.
   // In STACK ORDER and without the track ids, for the same reason `jobCacheKey()` strips
   // an effect's `id`: an id is an identity handed out when the tracker was dropped, so
   // leaving it in would mean a duplicated clip never shared the original's cached render.
@@ -5247,7 +5384,25 @@ function trackDigests(c) {
   for (const f of (c.fx || [])) {
     if (!(f && f.enabled !== false && f.bind && f.bind.track)) continue;
     if (!(FX.DEFS[f.type] && FX.DEFS[f.type].bind)) continue;
-    out.push(Tracker.digest(c, f.bind.track) || null);
+    const owner = bindOwner(c, f.bind);
+    if (!owner) { out.push(null); continue; }
+    if (owner === c) { out.push(Tracker.digest(c, f.bind.track) || null); continue; }
+    /*
+     * A CROSS-CLIP binding does make these pixels depend on the relationship between two
+     * clips, and the key has to say so or a cached render outlives the truth. What the
+     * pixels actually depend on is not either clip's position but the OFFSET between
+     * them: the constant that turns this clip's local time into the owner's source time.
+     * Slide both clips down the timeline together and the picture is identical and the
+     * key is unchanged; slide one, and it is neither.
+     *
+     * The owner's framing goes in for the same reason - the track is mapped through it,
+     * so re-framing the recording moves everything bound to it.
+     */
+    out.push({
+      d: Tracker.digest(owner, f.bind.track) || null,
+      dt: Math.round((owner.in + c.start - owner.start) * 1e4) / 1e4,
+      fr: { panX: owner.panX, panY: owner.panY, zoom: owner.zoom },
+    });
   }
   return out.length ? out : undefined;
 }
@@ -5459,6 +5614,10 @@ async function bakeTransitions(job) {
  * the answer the draw path gives can never disagree.
  */
 function clipNeedsBake(c) {
+  // A 'contain' still is transparent around its edges, which ffmpeg's crop-and-fill chain
+  // cannot express - it would scale the picture up to fill the frame and crop it, which
+  // is the opposite of what the mode says. So it composites, exactly as an effect does.
+  if (c.fit === 'contain') return true;
   return FX.active(c).length > 0;
 }
 
@@ -6248,6 +6407,47 @@ function deleteTracker(clip, id) {
   renderAll();
 }
 
+/**
+ * The clip a binding's track lives on - this one, or another clip on the timeline.
+ *
+ * `bind.clip` is absent for the ordinary same-clip case, so nothing that never crosses a
+ * clip boundary carries the field at all.
+ */
+function bindOwner(clip, bind) {
+  if (!bind || !bind.clip || bind.clip === clip.id) return clip;
+  const f = findClip(bind.clip);
+  return f ? f.clip : null;
+}
+
+/**
+ * Resolve a binding, including one that reaches ACROSS CLIPS.
+ *
+ * This is the half `fx.js` deliberately cannot do. A logo on V2 following a button in the
+ * screen recording on V1 needs the timeline - the two clips' positions on it - and an
+ * effect that could read `clip.start` would be putting a timeline position into its own
+ * pixels, which the render cache's key rules forbid. So the resolver lives out here,
+ * where the timeline is legitimately visible, and the matching duty comes with it:
+ * `trackDigests()` puts the resulting dependency into the render key, so a cached render
+ * cannot survive a change to the relationship between the two clips.
+ *
+ * The point is mapped through the framing of the clip that OWNS the track, not of the
+ * clip being drawn. A track is a place on its own source; where it appears on screen is
+ * that source's pan, zoom and crop. Mapping it through the logo's framing would put the
+ * logo wherever the logo's own crop happened to point, which is nowhere in particular.
+ *
+ * Everything degrades: a binding to a clip that has been deleted, or to a track that has,
+ * answers null and the effect draws its own parameters instead.
+ */
+FX.setBinder((clip, bind, tLocal, W, H) => {
+  const owner = bindOwner(clip, bind);
+  if (!owner) return null;
+  const A = (Number(W) || 9) / (Number(H) || 16);
+  if (owner === clip) return Tracker.bindPos(clip, bind, clip.in + tLocal, A, tLocal);
+  // Across clips: this clip's local time -> the timeline -> the owner's source time.
+  const tOwner = owner.in + ((clip.start + tLocal) - owner.start);
+  return Tracker.bindPos(owner, bind, tOwner, A, tLocal);
+});
+
 /** Every track marker visible on the viewer right now, in frame fractions. */
 function trackMarkers() {
   const sel = selectedClips().map((x) => x.clip).filter((c) => Tracker.hasTracks(c));
@@ -6344,7 +6544,12 @@ canvas.addEventListener('pointerdown', (e) => {
   if (!m) return;
   e.preventDefault();
   e.stopPropagation();
-  Trk.drag = { clip: m.clip, track: m.track, x: m.x, y: m.y };
+  // ALT is "fix just this frame". The two repairs are genuinely different operations and
+  // the difference is what happens to the solved future: a plain drag says the solve went
+  // wrong from here on and re-solves it, and an Alt-drag says this one frame is wrong and
+  // leaves every other sample alone. In the middle of a long track with one bad stretch,
+  // re-solving the remaining minute to correct six frames is a bad trade.
+  Trk.drag = { clip: m.clip, track: m.track, x: m.x, y: m.y, fixOnly: !!e.altKey };
   try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
 }, true);
 
@@ -6360,7 +6565,8 @@ canvas.addEventListener('pointerup', (e) => {
   Trk.drag = null;
   e.preventDefault();
   e.stopPropagation();
-  reanchorTracker(d.clip, d.track, d.x, d.y);
+  if (d.fixOnly) fixTrackerHere(d.clip, d.track, d.x, d.y);
+  else reanchorTracker(d.clip, d.track, d.x, d.y);
 }, true);
 
 /**
@@ -6388,6 +6594,158 @@ async function reanchorTracker(clip, track, fx, fy) {
     return null;
   }
   return solveTrack(clip, track, true);
+}
+
+/**
+ * Pin one frame of a track to a point, without disturbing anything else.
+ *
+ * The Alt-drag, and the surgical half of repair. It also re-bridges the lost runs this
+ * new fixed point now bounds, which is what makes correcting the middle of a bad stretch
+ * worth doing: one drag in the right place turns a frozen span into a line through the
+ * frame the object actually crossed.
+ */
+function fixTrackerHere(clip, track, fx, fy) {
+  const p = trkSourcePoint(clip, fx, fy);
+  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  pushUndo();
+  Tracker.fixPointAt(track, tSrc, p.x, p.y);
+  Tracker.normalizeClip(clip);
+  markDirty();
+  renderAll();
+  trkStatus('Fixed this frame by hand. The rest of the track is untouched - ' +
+    Tracker.fixCount(track) + ' fixed sample(s) in all.');
+}
+
+/** Interpolate across every lost span that has solved samples on both sides. ONE undo. */
+function repairTrack(clip, track) {
+  const before = Tracker.lostSpans(track, Tracker.DEFAULTS.minConf);
+  if (!before.length) { trkStatus('Nothing lost on this track.'); return; }
+  pushUndo();
+  const r = Tracker.repairSpans(track, {});
+  Tracker.normalizeClip(clip);
+  markDirty();
+  renderAll();
+  const msg = r.bridged
+    ? 'Repaired ' + r.bridged + ' lost span' + (r.bridged === 1 ? '' : 's') +
+      ' by interpolating across ' + (r.bridged === 1 ? 'it' : 'them') + '.'
+    : 'Nothing could be interpolated.';
+  trkStatus(msg + (r.edges
+    ? ' ' + r.edges + ' span' + (r.edges === 1 ? ' is' : 's are') + ' at the start or end ' +
+      'of the track, which cannot be bridged - scrub there, drag the marker onto the ' +
+      'right pixel and it will re-solve.'
+    : ''), r.edges ? 'err' : '');
+}
+
+/**
+ * The `transform` an image's placement panel owns, created on demand.
+ *
+ * Tagged `gen:'place'` the way auto-zoom tags its own, so the panel can find the one it
+ * is responsible for among however many transforms the author has added by hand. It is
+ * put FIRST in the stack, because placement is what the picture is - a blur or a grade
+ * added later should apply to the placed image, not to a full-frame one that a later
+ * transform then shrinks.
+ */
+function placeFx(clip, create) {
+  const found = (clip.fx || []).find((f) => f && f.type === 'transform' && f.gen === 'place');
+  if (found || !create) return found || null;
+  if (!Array.isArray(clip.fx)) clip.fx = [];
+  const e = FX.create('transform');
+  e.gen = 'place';
+  clip.fx.unshift(e);
+  return e;
+}
+
+/**
+ * Size and position for a still, in one place, plus the option to follow a tracker.
+ *
+ * Everything here already existed - `fit` on the clip, a `transform` in the stack, a
+ * binding on that transform - and that was the problem: placing a logo meant knowing that
+ * an image is framed like video, that the stack is where position lives, and which effect
+ * to add. This panel is the answer to "I put an image on the timeline, how do I size and
+ * place it", and it writes the same plain JSON any of those routes would have.
+ */
+function imagePlacePanel(clip) {
+  if (!clip || clip.kind !== 'image') return null;
+  const el = TextUI.el;
+  const box = el('div', 'fx-az trk-box');
+
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'Size and position'));
+  box.appendChild(head);
+
+  const hooks = {
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
+    onChanged: () => { markDirty(); drawPreview(); },
+    rebuild: renderInspector,
+  };
+
+  // Fit first, because it decides what every control under it means.
+  const fitRow = el('div', 'tc-row');
+  fitRow.appendChild(el('label', 'tc-label', 'Fit'));
+  const fitSel = el('select');
+  for (const [value, label] of [['crop', 'Fill the frame (crop)'], ['contain', 'Whole image']]) {
+    const o = el('option');
+    o.value = value;
+    o.textContent = label;
+    fitSel.appendChild(o);
+  }
+  fitSel.value = clip.fit === 'contain' ? 'contain' : 'crop';
+  fitSel.title = 'Fill crops the image to 9:16. Whole image keeps all of it and leaves ' +
+    'the rest of the frame transparent - what a logo or a screenshot wants.';
+  fitSel.addEventListener('change', () => {
+    pushUndo();
+    if (fitSel.value === 'contain') clip.fit = 'contain'; else delete clip.fit;
+    markDirty();
+    renderAll();
+  });
+  fitRow.appendChild(fitSel);
+  box.appendChild(fitRow);
+
+  const contain = clip.fit === 'contain';
+  box.appendChild(el('div', 'tc-hint fx-note', contain
+    ? 'Size is how large the whole image is drawn; X and Y place it in the frame. It ' +
+      'composites with alpha, so a transparent PNG stays transparent.'
+    : 'The image fills the frame and is cropped to it. Size zooms into it and X and Y ' +
+      'choose which part shows. Switch to Whole image to place a logo or a screenshot.'));
+
+  const C = (spec) => TextUI.control(spec, clip, FRAMING_DEFAULTS, hooks);
+  box.appendChild(C({ path: 'zoom', label: contain ? 'Size' : 'Zoom', type: 'range',
+    min: contain ? 0.05 : 1, max: 4, step: 0.01, digits: 2 }));
+  box.appendChild(C({ path: 'panX', label: 'X', type: 'range', min: 0, max: 1, step: 0.005, digits: 3 }));
+  box.appendChild(C({ path: 'panY', label: 'Y', type: 'range', min: 0, max: 1, step: 0.005, digits: 3 }));
+
+  // Rotation, opacity and - the point of the exercise - a binding, all of which live on a
+  // transform in the stack. The panel owns one and shows the parts that belong here.
+  const d = FX.DEFS.transform;
+  const fx = placeFx(clip, false);
+  const edit = (fn) => {
+    pushUndo();
+    fn();
+    FX.normalizeClip(clip);
+    markDirty();
+    renderAll();
+  };
+
+  const ensure = el('div', 'fx-add');
+  if (!fx) {
+    const b = el('button', 'mini', 'Add rotation, opacity, or follow a tracker');
+    b.title = 'Adds a Transform to this clip\u2019s effect stack and shows its controls here.';
+    b.addEventListener('click', () => edit(() => placeFx(clip, true)));
+    ensure.appendChild(b);
+    box.appendChild(ensure);
+    return box;
+  }
+
+  const rowHooks = Object.assign({}, hooks);
+  for (const path of ['params.rotate', 'params.opacity']) {
+    const spec = d.schema.find((x) => x.path === path);
+    if (spec) box.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+  }
+  // Offset X/Y on the transform stack on top of the X/Y above. They are what a binding
+  // writes, so they are shown only to say so rather than as another pair of sliders.
+  for (const node of fxBindSection(clip, fx, d, rowHooks, edit)) box.appendChild(node);
+  return box;
 }
 
 /**
@@ -6420,11 +6778,11 @@ function trackPanel(clip) {
     bar.appendChild(el('b', null, tk.name));
     const solved = Tracker.isSolved(tk);
     const worst = Tracker.worstIn(tk, clip.in, clip.out);
-    const lost = solved && worst < Tracker.DEFAULTS.minConf;
+    const isLost = solved && worst < Tracker.DEFAULTS.minConf;
     const q = trkQuality(tk.tex);
     // Unsolved says what it IS, not a confidence of 100% over a single sample - a number
     // that would be true, meaningless, and read as "this track is fine".
-    bar.appendChild(el('span', 'tc-hint' + (lost || q.cls ? ' fx-warn' : ''),
+    bar.appendChild(el('span', 'tc-hint' + (isLost || q.cls ? ' fx-warn' : ''),
       solved
         ? tk.points.length + ' samples · lowest confidence ' + Math.round(worst * 100) + '%'
         : 'not solved yet · point quality: ' + q.word));
@@ -6436,12 +6794,20 @@ function trackPanel(clip) {
       b.addEventListener('click', fn);
       btns.appendChild(b);
     };
+    const lost = Tracker.lostSpans(tk, Tracker.DEFAULTS.minConf);
+    const inner = lost.filter((sp) => !sp.edge).length;
     mk(solved ? 'Re-solve' : 'Solve',
       solved
         ? 'Solve this track again from its anchor, in both directions.'
         : 'Follow this point across the clip, both ways from here. One undo entry.',
       () => solveTrack(clip, tk, false),
       Trk.busy || (tk.tex != null && tk.tex < Tracker.DEFAULTS.minTex));
+    if (solved && inner) {
+      mk('Repair ' + inner + ' gap' + (inner === 1 ? '' : 's'),
+        'Interpolate across every lost span that has solved samples on both sides. ' +
+        'One undo entry.',
+        () => repairTrack(clip, tk), Trk.busy);
+    }
     mk('✕', 'Delete this track. Anything bound to it keeps its own settings.',
       () => deleteTracker(clip, tk.id));
     bar.appendChild(btns);
@@ -6458,10 +6824,28 @@ function trackPanel(clip) {
         'That point is weak - it may drift. A corner holds far better than the middle ' +
         'of a shape or a soft gradient.'));
     }
-    if (lost) {
+    const fixes = Tracker.fixCount(tk);
+    if (isLost) {
+      const edges = lost.filter((sp) => sp.edge).length;
+      const bits = [];
+      if (inner) {
+        bits.push(inner + ' gap' + (inner === 1 ? '' : 's') + ' in the middle of the ' +
+          'track, which Repair can interpolate across');
+      }
+      if (edges) {
+        bits.push(edges + ' at the start or end, which cannot be interpolated - scrub ' +
+          'there, drag the marker onto the right pixel and it re-solves from there');
+      }
       row.appendChild(el('div', 'tc-hint fx-warn',
-        'This track loses the point somewhere - the strip under the clip shows where. ' +
-        'Scrub to it, drag the marker onto the right pixel, and it re-solves from there.'));
+        'This track loses the point: ' + bits.join(', and ') + '. The strip under the ' +
+        'clip shows where.'));
+    }
+    if (solved) {
+      row.appendChild(el('div', 'tc-hint',
+        'Alt-drag the marker to fix just the frame you are on, leaving the rest of the ' +
+        'track alone. A plain drag re-anchors and re-solves everything after it.' +
+        (fixes ? '  ' + fixes + ' sample' + (fixes === 1 ? '' : 's') + ' fixed by hand ' +
+          'or interpolated.' : '')));
     }
     box.appendChild(row);
   }

@@ -187,6 +187,84 @@
       }
     }
 
+    // ------------------------------------------ 'contain': the whole still, placed
+    //
+    // A still is framed like footage by default - filled to 9:16 and cropped - which is
+    // right for a photo and useless for a logo, because a wide logo cropped to 9:16 is a
+    // detail of a logo. `fit: 'contain'` draws the WHOLE image, scaled by `zoom` and
+    // placed by `panX`/`panY`, and leaves the rest of the frame transparent.
+    //
+    // The rule this has to keep is the project's oldest one: the viewer and the file must
+    // agree. They share `drawClipTo()` now - `drawClip()` delegates to it rather than
+    // keeping a second copy of the crop - so the check is that a real ffmpeg render of a
+    // contained still matches the preview at BOTH a covered and an uncovered pixel.
+    {
+      const at = (c2d, w, h, fx2, fy2) => {
+        const d = c2d.getImageData(Math.round(w * fx2), Math.round(h * fy2), 1, 1).data;
+        return [d[0], d[1], d[2]];
+      };
+      img.fit = 'contain';
+      img.zoom = 0.5;
+      img.panX = 0.5;
+      img.panY = 0.5;
+      renderAll();
+      seek(1);
+      await sleep(900);
+      drawPreview();
+      await sleep(80);
+      const midPrev = at(ctx, P.w, P.h, 0.5, 0.5);
+      const cornerPrev = at(ctx, P.w, P.h, 0.08, 0.06);
+
+      ok('a contained still leaves the frame\u2019s corners to the footage underneath',
+        cornerPrev[2] > cornerPrev[0], 'corner=' + cornerPrev.join(','));
+      ok('...and still blends where it does cover',
+        midPrev[0] > cornerPrev[0] + 20, 'mid=' + midPrev.join(','));
+      ok('a contained still leaves the ffmpeg fast path, because a crop chain cannot ' +
+        'express transparency around it',
+        clipNeedsBake(img));
+
+      const cjob = buildJob(OUT);
+      cjob.duration = 3;
+      cjob.cacheKey = jobCacheKey(cjob);
+      // The WHOLE bake, not just the cards: a contained still is composited, and
+      // `bakeOverlays()` is the entry the app itself uses for exactly that reason.
+      await bakeOverlays(cjob);
+      const cres = await window.api.startRender(cjob);
+      ok('ffmpeg rendered the contained still', cres.ok,
+        cres.ok ? '' : String(cres.error).split('\n').slice(-4).join(' | '));
+      if (cres.ok) {
+        const two = await new Promise((resolve) => {
+          const v = document.createElement('video');
+          v.src = 'file:///' + OUT.replace(/\\/g, '/') + '?c=' + Date.now();
+          v.muted = true;
+          v.addEventListener('loadeddata', () => { v.currentTime = 1; });
+          v.addEventListener('seeked', () => {
+            const cv = document.createElement('canvas');
+            cv.width = 1080; cv.height = 1920;
+            const c2 = cv.getContext('2d');
+            c2.drawImage(v, 0, 0, 1080, 1920);
+            resolve([at(c2, 1080, 1920, 0.5, 0.5), at(c2, 1080, 1920, 0.08, 0.06)]);
+          }, { once: true });
+          v.addEventListener('error', () => resolve(null));
+        });
+        ok('the contained render decoded', !!two);
+        if (two) {
+          ok('preview and render agree where the still covers the frame',
+            near(two[0][0], midPrev[0], 16) && near(two[0][1], midPrev[1], 16) &&
+            near(two[0][2], midPrev[2], 16),
+            'render=' + two[0].join(',') + ' preview=' + midPrev.join(','));
+          ok('...and where it does not, so the transparency survived the round trip',
+            near(two[1][0], cornerPrev[0], 16) && near(two[1][1], cornerPrev[1], 16) &&
+            near(two[1][2], cornerPrev[2], 16),
+            'render=' + two[1].join(',') + ' preview=' + cornerPrev.join(','));
+        }
+      }
+      delete img.fit;
+      img.zoom = 1;
+      renderAll();
+      await sleep(60);
+    }
+
     // ------------------------------------------------------ the QuickBin route
     // Double-clicking a still now places it on the timeline (no object transition
     // selected), instead of saying it has nowhere to go.

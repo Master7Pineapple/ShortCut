@@ -31,6 +31,14 @@
  *      everything lost. Plus the flow that grew out of that: placing does not solve,
  *      a drop snaps to the nearest real feature, and a point with nothing to track is
  *      refused with a reason instead of being discovered a seek-per-frame later.
+ *   8. REPAIR. A lost span with solved samples either side is interpolated across, an
+ *      edge span is reported rather than guessed at, a hand-placed fix keeps every other
+ *      sample, and a repaired span stops counting as lost while still being visible.
+ *   9. FOLLOW STRENGTH, keyframable, which is the answer to a bound thing moving further
+ *      than the thing it follows. Plus smoothing, and that both are plain JSON.
+ *  10. CROSS-CLIP BINDING: a clip following a track on ANOTHER clip, mapped through the
+ *      owner's framing, degrading when the owner goes, and putting the one thing it
+ *      genuinely depends on - the offset between the two clips - into the render key.
  *
  * Plus the worker: the Blob build answers exactly what the in-process kernel answers,
  * which is what proves the concatenation is running the same source the suite checks.
@@ -611,6 +619,260 @@
       vt.clips.splice(vt.clips.findIndex((x) => x.id === id), 1);
       state.selection.clear();
       state.playhead = 0;
+      renderAll();
+    }
+
+    // ============================================================== 7. repair
+
+    {
+      // A track with a hole in the middle and a hole at the end: the two kinds, which
+      // need two different answers.
+      const tk = Tracker.makeTrack(0, 0.10, 0.5, {});
+      const pts = [];
+      for (let i = 1; i <= 20; i++) {
+        const t = i / 10;
+        const mid = i >= 6 && i <= 10;          // lost in the middle, recovered after
+        const tail = i >= 19;                   // lost at the end, never recovered
+        pts.push({ t, x: (mid || tail) ? 0.15 : 0.10 + 0.02 * i, y: 0.5, c: (mid || tail) ? 0.05 : 0.95 });
+      }
+      Tracker.mergePoints(tk, pts);
+
+      const spans = Tracker.lostSpans(tk, Tracker.DEFAULTS.minConf);
+      ok('the lost spans are found, and the one at the end is marked as an EDGE span',
+        spans.length === 2 && !spans[0].edge && spans[1].edge === 'trail',
+        JSON.stringify(spans.map((x) => [x.t0, x.t1, x.edge])));
+
+      const frozen = tk.points.find((q) => near(q.t, 0.8)).x;
+      const r = Tracker.repairSpans(tk, {});
+      ok('repair bridges the interior span and refuses to guess at the edge one',
+        r.bridged === 1 && r.edges === 1);
+      ok('...and the bridged samples are a straight line between the solved ends, not ' +
+        'the frozen position the solver left behind',
+        near(tk.points.find((q) => near(q.t, 0.8)).x, 0.26, 1e-6) && near(frozen, 0.15),
+        frozen + ' -> ' + tk.points.find((q) => near(q.t, 0.8)).x);
+      ok('...every sample it touched is marked as a repair',
+        tk.points.filter((q) => q.fix === 1).length === 5 && Tracker.fixCount(tk) === 5);
+      ok('a repaired span stops counting as lost - a repaired track is not a broken one',
+        Tracker.worstIn(tk, 0, 1.5) > Tracker.DEFAULTS.minConf);
+      ok('...but the confidence underneath is left alone, so the strip can still show ' +
+        'where the machine actually failed',
+        near(tk.points.find((q) => near(q.t, 0.8)).c, 0.05));
+      ok('the edge span is still lost, because there is nothing to bridge towards',
+        Tracker.worstIn(tk, 1.8, 2.0) < Tracker.DEFAULTS.minConf);
+      ok('repairing twice changes nothing - it is idempotent',
+        (() => {
+          const before = JSON.stringify(tk.points);
+          Tracker.repairSpans(tk, {});
+          return JSON.stringify(tk.points) === before;
+        })());
+
+      // A hand fix: surgical, and it keeps the rest of the track.
+      const tk2 = Tracker.makeTrack(0, 0.1, 0.5, {});
+      Tracker.mergePoints(tk2, pts.map((q) => Object.assign({}, q)));
+      const tailBefore = JSON.stringify(tk2.points.filter((q) => q.t > 1.2));
+      Tracker.fixPointAt(tk2, 0.8, 0.4, 0.6, {});
+      const fixed = tk2.points.find((q) => near(q.t, 0.8));
+      ok('a hand fix lands on the sample grid and is marked as a hand fix',
+        fixed && fixed.fix === 2 && near(fixed.x, 0.4) && near(fixed.y, 0.6) && fixed.c === 1);
+      ok('...and it keeps every sample after it, unlike re-anchoring',
+        JSON.stringify(tk2.points.filter((q) => q.t > 1.2)) === tailBefore);
+      // Interpolated by TIME between the solved sample at 0.5 (x 0.20) and the hand fix
+      // at 0.8 (x 0.40), so t=0.7 is two thirds of the way across, not the midpoint.
+      ok('...and the lost samples either side of it are re-bridged towards it',
+        near(tk2.points.find((q) => near(q.t, 0.7)).x, 0.2 + 0.2 * (2 / 3), 1e-5),
+        tk2.points.find((q) => near(q.t, 0.7)).x.toFixed(5));
+      ok('the repair survives a save and reload as plain JSON',
+        (() => {
+          const c2 = { tracks: [JSON.parse(JSON.stringify(tk2))] };
+          Tracker.normalizeClip(c2);
+          const p8 = c2.tracks[0].points.find((q) => near(q.t, 0.8));
+          return p8.fix === 2 && c2.tracks[0].points.some((q) => q.fix === 1);
+        })());
+      ok('an untouched track carries no `fix` at all, so it serialises as it always did',
+        (() => {
+          const clean = { tracks: [Tracker.makeTrack(0, 0.5, 0.5, {})] };
+          Tracker.normalizeClip(clean);
+          return !('fix' in clean.tracks[0].points[0]);
+        })());
+    }
+
+    // ================================================ 8. follow strength and smoothing
+
+    {
+      const clip = { id: 'cS', kind: 'video', in: 0, out: 4, srcW: 1920, srcH: 1080,
+        panX: 0.5, panY: 0.5, zoom: 1 };
+      const tk = Tracker.makeTrack(0, 0.5, 0.5, {});
+      tk.id = 'tkS';
+      Tracker.mergePoints(tk, [{ t: 2, x: 0.7, y: 0.5, c: 1 }]);
+      clip.tracks = [tk];
+      const A = state.out.w / state.out.h;
+      const at = (bind, t) => Tracker.bindPos(clip, bind, t, A, t);
+
+      const full = at({ track: 'tkS', strength: 1 }, 2);
+      const half = at({ track: 'tkS', strength: 0.5 }, 2);
+      const none = at({ track: 'tkS', strength: 0 }, 2);
+      const anchorX = at({ track: 'tkS', strength: 1 }, 0).x;
+      ok('strength 1 follows the track exactly', full.x > anchorX + 0.5);
+      ok('strength 0.5 travels exactly half as far from the anchor',
+        near(half.x - anchorX, (full.x - anchorX) / 2, 1e-9),
+        (full.x - anchorX).toFixed(4) + ' -> ' + (half.x - anchorX).toFixed(4));
+      ok('strength 0 pins it where the tracker was placed - which is the answer to a ' +
+        'callout that travels further than the thing it follows',
+        near(none.x, anchorX, 1e-9));
+
+      // Keyframed, which is what "in specific durations" needs.
+      const keyed = { track: 'tkS', strength: 1, keys: { strength: [
+        { t: 0, v: 1, ease: 'linear' }, { t: 4, v: 0, ease: 'linear' }] } };
+      const k0 = at(keyed, 2);
+      ok('strength is keyframable, so a shot can follow hard through one stretch and ' +
+        'barely at all through another',
+        near(k0.x - anchorX, (full.x - anchorX) * 0.5, 1e-6),
+        'at t=2 the key says 0.5');
+      ok('...and the keys are ordinary Anim keys on the binding itself',
+        (() => {
+          const e = Object.assign(FX.create('spotlight'), { bind: JSON.parse(JSON.stringify(keyed)) });
+          FX.normalize(e);
+          return !!(e.bind.keys && e.bind.keys.strength.length === 2) &&
+            JSON.stringify(e) === JSON.stringify(JSON.parse(JSON.stringify(e)));
+        })());
+
+      // Smoothing, against a track that is accurate but jittery.
+      const j = Tracker.makeTrack(0, 0.5, 0.5, {});
+      j.id = 'tkJ';
+      for (let i = 1; i <= 60; i++) Tracker.mergePoints(j, [{ t: i / 30, x: 0.5 + ((i % 2) ? 0.01 : -0.01), y: 0.5, c: 1 }]);
+      const clipJ = Object.assign({}, clip, { tracks: [j] });
+      const rawX = Tracker.bindPos(clipJ, { track: 'tkJ' }, 1, A, 1).x;
+      const smoothX = Tracker.bindPos(clipJ, { track: 'tkJ', smooth: 0.2 }, 1, A, 1).x;
+      const centre = Tracker.frameMap(clipJ, A)(0.5, 0.5).x;
+      ok('smoothing pulls a jittery track back onto its own centre line',
+        Math.abs(smoothX - centre) * 5 < Math.abs(rawX - centre),
+        'raw ' + (rawX - centre).toFixed(4) + ' -> ' + (smoothX - centre).toFixed(4));
+      ok('smoothing 0 is the track exactly, so it costs nothing when it is not asked for',
+        near(Tracker.bindPos(clipJ, { track: 'tkJ', smooth: 0 }, 1, A, 1).x, rawX, 1e-12));
+    }
+
+    // ===================================================== 9. binding across clips
+
+    {
+      const vt = state.tracks.find((t) => t.type === 'video');
+      const idA = nextId(), idB = nextId();
+      // B is the recording that carries the track; A is the logo that follows it.
+      vt.clips.push({
+        id: idB, src: 'C:\\fake\\rec.mp4', name: 'rec', kind: 'video',
+        start: 0, in: 0, out: 8, mediaDuration: 8, srcW: 1920, srcH: 1080, fps: 30,
+        panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+      });
+      vt.clips.push({
+        id: idA, src: 'C:\\fake\\logo.png', name: 'logo', kind: 'image',
+        start: 2, in: 0, out: 4, mediaDuration: 3600, srcW: 400, srcH: 200, fps: 30,
+        panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+      });
+      sortTracks();
+      const liveA = () => allClips().map((x) => x.clip).find((c) => c.id === idA);
+      const liveB = () => allClips().map((x) => x.clip).find((c) => c.id === idB);
+
+      const tk = Tracker.makeTrack(0, 0.5, 0.5, {});
+      tk.id = 'tkX';
+      Tracker.mergePoints(tk, [{ t: 4, x: 0.8, y: 0.6, c: 1 }]);
+      liveB().tracks = [tk];
+
+      const logo = liveA();
+      logo.fx = [Object.assign(FX.create('transform'),
+        { gen: 'place', bind: { clip: idB, track: 'tkX', offX: 0, offY: 0, strength: 1, smooth: 0 } })];
+
+      // A's local t=2 is timeline 4, which is B's source 4 - where the track says 0.8.
+      const A = state.out.w / state.out.h;
+      const want = Tracker.frameMap(liveB(), A)(0.8, 0.6);
+      const p = FX.paramsAt(logo.fx[0], 2, logo, state.out.w, state.out.h);
+      const place = (pp, pos) => ({
+        x: pp.anchorX + (pos.x - pp.anchorX) * pp.scale + pp.x,
+        y: pp.anchorY + (pos.y - pp.anchorY) * pp.scale + pp.y,
+      });
+      const landed = place(p, want);
+      ok('a clip can follow a track on ANOTHER clip, through the OWNER clip\u2019s framing',
+        near(landed.x, 0.5, 1e-6) && near(landed.y, 0.5, 1e-6),
+        landed.x.toFixed(5) + ', ' + landed.y.toFixed(5));
+
+      ok('the panel offers tracks from other clips, named by the clip they are on',
+        (() => {
+          setSelection([idA], false);
+          renderInspector();
+          const opts = [...document.querySelectorAll('#inspector select option')]
+            .map((o) => o.textContent);
+          return opts.some((t) => /rec/.test(t));
+        })());
+
+      ok('an image clip gets a Size and position panel',
+        !!document.querySelector('#inspector .trk-box') &&
+        /Size and position/.test(document.querySelector('#inspector').textContent));
+
+      // The framing modes, which is what makes a logo placeable at all.
+      ok('a still defaults to filling the frame, exactly as it always has',
+        liveA().fit === undefined);
+      liveA().fit = 'contain';
+      ok('...and a contained still is composited rather than handed to the fast path, ' +
+        'because ffmpeg\u2019s crop chain cannot express transparency around it',
+        clipNeedsBake(liveA()));
+
+      // The render key: the OFFSET between the two clips is what the pixels depend on.
+      const job = () => buildJob('out.mp4', { from: 0, to: projectDuration() });
+      const digestOf = () => JSON.stringify((job().clips.find((x) => x.id === idA) || {}).tracks);
+      const base = digestOf();
+      ok('a cross-clip binding puts the owner\u2019s track AND the offset between the ' +
+        'clips into the key', /"dt"/.test(base) && /"d"/.test(base));
+
+      const bothMoved = (() => {
+        liveA().start += 3; liveB().start += 3;
+        sortTracks();
+        const d = digestOf();
+        liveA().start -= 3; liveB().start -= 3;
+        sortTracks();
+        return d;
+      })();
+      ok('moving BOTH clips together keeps the picture and keeps the key - the pixels ' +
+        'depend on the offset, not on where the pair sits',
+        bothMoved === base);
+
+      const oneMoved = (() => {
+        liveA().start += 1;
+        sortTracks();
+        const d = digestOf();
+        liveA().start -= 1;
+        sortTracks();
+        return d;
+      })();
+      ok('...and moving ONE of them changes it, because that genuinely is a new picture',
+        oneMoved !== base);
+
+      const reframed = (() => {
+        liveB().panX = 0.2;
+        const d = digestOf();
+        liveB().panX = 0.5;
+        return d;
+      })();
+      ok('re-framing the clip that owns the track changes it too - the point is mapped ' +
+        'through that framing',
+        reframed !== base);
+
+      // Degradation, which matters more across clips than within one.
+      const gone = (() => {
+        const i = vt.clips.findIndex((x) => x.id === idB);
+        const saved = vt.clips[i];
+        vt.clips.splice(i, 1);
+        const params = FX.paramsAt(liveA().fx[0], 2, liveA(), 540, 960);
+        vt.clips.splice(i, 0, saved);
+        sortTracks();
+        return params;
+      })();
+      ok('deleting the clip that owns the track degrades to the static parameters ' +
+        'rather than throwing',
+        gone.x === FX.DEFS.transform.params.x && gone.y === FX.DEFS.transform.params.y);
+
+      for (const id of [idA, idB]) {
+        const i = vt.clips.findIndex((x) => x.id === id);
+        if (i >= 0) vt.clips.splice(i, 1);
+      }
+      state.selection.clear();
       renderAll();
     }
 

@@ -94,7 +94,11 @@ There are twenty-five suites:
   confident** (the regression that split texture from fit), that a straight edge is
   correctly untrackable, that a drop snaps onto a real feature fast enough to run on a
   click, that placing a tracker does not solve it and dragging an unsolved one does not
-  either, that a dead point is refused with a reason, and — the load-bearing one — that moving the clip does not change what
+  either, that a dead point is refused with a reason, the repairs (an interior span
+  bridged, an edge span refused, a hand fix that keeps the solved future, repaired spans
+  no longer counting as lost, and idempotence), follow strength and its keyframes,
+  smoothing, cross-clip binding through the owner's framing with the clip offset in the
+  key, and — the load-bearing one — that moving the clip does not change what
   the binding contributes to the render key while changing a sample does. It needs no
   fixture: every frame is painted by the suite.
 - `tools/smoke-transitions.js` — transitions: finding cuts, the fast grab, length and
@@ -140,7 +144,9 @@ There are twenty-five suites:
   serialising and reloading intact), the filler-word hook joining Tighten's own plan, and
   that a missing file fails cleanly. It needs **no fixture and no whisper.cpp**: the
   transcript goes in through `setTranscript()`, the same door "Import transcript" uses.
-- `tools/smoke-layers.js` — real layers: a PNG importing as a `kind:'image'` clip on a
+- `tools/smoke-layers.js` — real layers, including `fit: 'contain'` rendered for real and
+  checked against the preview both where the still covers the frame and where it does not;
+  plus a PNG importing as a `kind:'image'` clip on a
   video track with no in-point and no source-length ceiling, that it serialises and
   reloads intact, that the job lists layers bottom-up, that a still becomes a
   `-loop 1 -t <len> -i` input and every picture chain carries `format=yuva420p`, that the
@@ -392,6 +398,9 @@ Clip = {
   keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
   captions,              // generated captions only - { gen: true, src } - see below
+  fit,                   // OPTIONAL - 'contain' draws the WHOLE picture inside the frame
+                         //   and leaves the rest transparent; absent means the default,
+                         //   which fills the frame and crops. See "Framing"
   screen,                // OPTIONAL - screen-recording telemetry, { events, displayW,
                          //   displayH, clicks }. Absent for anything not recorded here;
                          //   see "The screen recorder" for the degradation contract
@@ -420,12 +429,23 @@ Invariants worth preserving when you change things:
 The crop is defined by `panX`/`panY`/`zoom` and computed **twice**, in two languages that
 must stay in agreement:
 
-- Preview: `drawClip()` in `app.js` — takes the largest source rect matching the output
-  aspect, divides by `zoom`, offsets it by `pan * (source - crop)`.
+- Preview: `drawClip()` in `app.js`, which now **delegates to `drawClipTo()`** at preview
+  size rather than keeping a second copy of the crop — takes the largest source rect
+  matching the output aspect, divides by `zoom`, offsets it by `pan * (source - crop)`.
 - Render: the `crop=w='min(iw,ih*W/H)/zoom':...:x='(iw-ow)*panX'` filter built in
   `buildArgs()` in `main.js`.
 
 **If you change one, change the other**, or the preview will lie about the output.
+
+`drawClipTo()` has a second mode, and stills are why. `fit: 'contain'` fits the **whole**
+picture inside the frame and leaves the rest transparent — `zoom` becomes its size and
+`panX`/`panY` its position. A wide logo cropped to 9:16 is a detail of a logo, so a still
+being placed rather than filling the frame needs this, and the **Size and position** panel
+on an image clip is the front end for it. A contained still has transparency around it,
+which ffmpeg's crop-and-fill chain cannot express, so it leaves the fast path and
+composites — `clipNeedsBake()` says so, and `smoke-layers.js` renders one for real and
+checks the preview and the file agree both where the still covers the frame and where it
+does not.
 
 This is now the *only* place the same picture is still described twice, and it survives on
 purpose: it is the fast path (below), and it is exercised by every suite that renders. A
@@ -1794,10 +1814,97 @@ Those are three different answers on purpose, which is why each type owns its `a
 rather than sharing one "set x and y". Binding a cutout's *destination* would fling the
 callout around the frame, which is the one thing a callout must not do.
 
-Binding is scoped to the clip's own tracks. A cross-clip binding — a text card on another
-track following a track on the footage below it — would make one clip's pixels depend on
-another clip's position on the timeline, which is precisely what the render cache's key
-rules forbid; `bind` names a track id and nothing else, and that limit is deliberate.
+#### Following a track on ANOTHER clip
+
+`bind.clip` names the clip the track lives on, and it is absent for the ordinary same-clip
+case. This is the commonest shape there is — a logo, a badge or a callout is almost never
+on the same clip as the thing it points at — and it was left out of the first cut of this
+step for a real reason, which is worth stating because the reason had to be answered
+rather than waved away:
+
+**it makes one clip's pixels depend on another clip's position on the timeline**, and a
+clip's timeline position is the one thing the render cache's key rules keep out of the
+pixels. So two things carry it:
+
+- `fx.js` cannot resolve a cross-clip binding and does not try. The resolver is
+  **injected** — `FX.setBinder()`, installed by `app.js`, which is where the timeline is
+  legitimately visible. With no binder installed (a bare module load, a suite checking
+  that file alone) bindings resolve against the clip's own tracks only, which is what
+  `fx.js` can be responsible for by itself. An effect still cannot read `clip.start`.
+- The render key takes the matching duty. `trackDigests()` puts in the owner's track
+  digest **and the offset** between the two clips — the constant that turns this clip's
+  local time into the owner's source time — plus the owner's framing, because the point is
+  mapped through it. Slide both clips down the timeline together and the picture is
+  identical and the key is unchanged; slide one, and it is neither. `smoke-track.js`
+  asserts all three.
+
+The point is mapped through the framing of the clip that **owns** the track, not of the
+clip being drawn: a track is a place on its own source, and where it appears on screen is
+that source's pan, zoom and crop. Mapping it through the logo's framing would put the logo
+wherever the logo's own crop happened to point, which is nowhere in particular.
+
+Deleting the clip that owns the track degrades like every other binding — the effect draws
+its static parameters and the panel says why.
+
+#### Follow strength, and taming a track that moves too much
+
+A track is a measurement, and following it exactly is often more movement than the shot
+wants: the tracked element crosses half the frame and the callout chasing it reads as
+frantic. `bind.strength` scales the movement **away from the anchor** — the pixel the
+tracker was placed on:
+
+| strength | what it does |
+| --- | --- |
+| 1 | follows exactly |
+| 0.4 | travels 40% as far as the tracked point did |
+| 0 | pins it where the tracker was placed |
+
+It is **keyframable**, which is the point — follow hard through the stretch that needs to
+track and barely at all through the stretch that only needs to drift. So are the two
+offsets. Those keys live on `bind.keys`, a **separate** holder from `fx.keys`: `Anim` only
+ever touches a `.keys` object, so the binding is a keyframe holder for free, and they have
+to be separate because the parameters `fx.keys` animates include the two the binding
+overwrites every frame.
+
+`bind.smooth` averages the track's path over a window of seconds, for a track that is
+accurate but jittery. Zero is the track exactly, so it costs nothing when it is not asked
+for.
+
+The offsets are **returned** by `bindPos()` rather than applied by it, and each type's
+`apply()` puts them where they belong. An offset moves the lit shape of a spotlight and
+the whole frame of a bound `transform` — which is a camera — so applying them centrally
+inverted the transform's. `smoke-track.js` caught exactly that.
+
+#### Repairing a lost track
+
+A lost span is not a failure to live with: the solver holds the point still through one,
+which is visibly wrong when the thing it was following kept moving, and it is the jump out
+the far side that reads worst. Three repairs, and which one applies depends on the shape
+of the damage:
+
+- **Repair the gaps** (a button on the track's row) interpolates across every lost span
+  that has solved samples on **both** sides. A person looking at the two confident ends
+  can see the object travelled between them, and a straight line between them is very
+  nearly always closer to the truth than a frozen point. One undo entry, and idempotent.
+- **Alt-drag the marker** fixes just the frame you are on and leaves every other sample
+  alone — including the solved future, which is the difference from a plain drag. In the
+  middle of a long track with one bad stretch, re-solving the remaining minute to correct
+  six frames is a bad trade. The lost runs the new fixed point now bounds are re-bridged
+  towards it.
+- **A plain drag** still re-anchors and re-solves forward, which is the right answer for a
+  track that goes wrong and stays wrong.
+
+An **edge** span — lost at the start or the end, with nothing to interpolate towards —
+cannot be bridged, and guessing off the end of the data is how a repair becomes a lie. The
+panel counts the two kinds separately and says that re-anchoring is what an edge span
+needs.
+
+Repaired samples carry `fix` (1 interpolated, 2 placed by hand) and are **absent** on an
+untouched track. A repaired span stops counting as lost — `worstIn()` treats it as
+confident, so a repaired track stops reporting itself broken — but the confidence numbers
+underneath are left alone and the lane draws repairs in **amber** rather than red. The
+machine still failed there, and that is worth being able to see when the shot looks wrong
+later; it is just no longer an alarm.
 
 #### The cache key, and what a track is allowed to contribute
 
@@ -3088,6 +3195,9 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   still work from an imported transcript.
 - Captions are generated for the **selected** clips, from their linked audio, and land on
   one caption track. Regenerating replaces only the cards this generator made.
+- Stills default to filling the frame and being cropped to 9:16, exactly as they always
+  have. `fit: 'contain'` in the **Size and position** panel draws the whole image instead;
+  it composites, so it renders at bake speed rather than on the fast path.
 - Stills (PNG, JPG, WebP, GIF, BMP) are `kind:'image'` clips on video tracks: the same
   pan/zoom framing as footage, no decoder, and no source-length ceiling - `in` stays 0,
   `mediaDuration` is 3600 like a text card's, and the length is whatever `out` says. They
@@ -3123,9 +3233,10 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   replaces their own keys and leaves hand-added ones alone.
 - A mouse take needs the range PRE-RENDERED. `startMouseTake()` refuses otherwise rather
   than performing against a stuttering live composite.
-- A motion track is solved on the clip's own source and binds only within that clip. A
-  graphic or card on another track cannot follow it — see "Binding, and what each type
-  does with the point" for why that limit is deliberate.
+- A motion track is solved on the clip's own source, but anything can bind to it,
+  including an effect on another clip — see "Following a track on ANOTHER clip". Two clips
+  joined that way are locked together in time: move one without the other and the binding
+  follows the new alignment (and the render key notices).
 - A tracker needs a **corner**, not an edge and not a flat area: one point cannot follow a
   straight edge, because it slides along itself. A drop snaps to the nearest real feature
   and the panel scores it, but footage with genuinely nothing in it cannot be tracked.
