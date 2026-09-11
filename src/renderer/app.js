@@ -1826,6 +1826,7 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
     if (!sel.value || sel.value === 'missing') { delete fx.bind; return; }
     const [clipId, trackId] = sel.value.split('::');
     const next = Object.assign({ offX: 0, offY: 0, strength: 1, smooth: 0 }, fx.bind || {});
+    if (d.bind.modes && !next.mode) next.mode = d.bind.modes[0].value;
     next.track = trackId;
     // The field is absent for the ordinary same-clip case, so nothing that never crosses
     // a clip boundary carries it at all.
@@ -1853,6 +1854,32 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
     nodes.push(el('div', 'tc-hint',
       'Following a track on ' + owner.name + '. The two clips are locked together in ' +
       'time - move one without the other and this follows the new alignment.'));
+  }
+
+  // WHICH WAY it follows, above every other control, because it is the one that reads as
+  // a bug when it is wrong: a clip bound the other way moves opposite to the thing it is
+  // supposed to be stuck to.
+  if (d.bind.modes) {
+    const mrow = el('div', 'tc-row');
+    mrow.appendChild(el('label', 'tc-label', 'Follow mode'));
+    const msel = el('select');
+    for (const m of d.bind.modes) {
+      const o = el('option');
+      o.value = m.value;
+      o.textContent = m.label;
+      msel.appendChild(o);
+    }
+    msel.value = fx.bind.mode || d.bind.modes[0].value;
+    msel.title = d.bind.hint || '';
+    msel.addEventListener('change', () => edit(() => { fx.bind.mode = msel.value; }));
+    mrow.appendChild(msel);
+    nodes.push(mrow);
+    if ((fx.bind.mode || d.bind.modes[0].value) === 'camera') {
+      nodes.push(el('div', 'tc-hint',
+        'Panning the frame moves everything in it the OTHER way - which is what you want ' +
+        'for the footage the track was solved on, and not what you want for a logo or a ' +
+        'callout sitting over it.'));
+    }
   }
 
   const dur = Math.max(0.001, clip.out - clip.in);
@@ -1900,7 +1927,7 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
     }
   }));
 
-  const taken = FX.boundParams(fx.type);
+  const taken = FX.boundParams(fx.type, fx.bind.mode);
   nodes.push(el('div', 'tc-hint',
     'The track is writing ' + taken.join(' and ') + ' every frame, so the sliders and ' +
     'keyframes for those are ignored while it is bound. Everything else still animates.'));

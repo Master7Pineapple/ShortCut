@@ -258,14 +258,46 @@
       // `want` gives x = want - anchorX * (1 - s) - s * point. Doing it any other way -
       // a plain `x = -point` - drifts the moment `scale` is anything but 1, and scale is
       // exactly what a tracked push-in animates.
+      /*
+       * TWO MODES, BECAUSE "FOLLOW" MEANS TWO OPPOSITE THINGS TO A TRANSFORM.
+       *
+       *   'move'    (the default) the clip TRAVELS WITH the tracked point. It keeps the
+       *             position the author gave it and adds the distance the point has moved
+       *             since it was anchored. A logo pinned to a moving button wants this:
+       *             the button goes up, the logo goes up.
+       *   'camera'  the FRAME pans so the tracked point sits at its centre. The clip being
+       *             transformed is the footage the track was solved on, and the effect is
+       *             a camera following the action - which is the auto-zoom shape.
+       *
+       * They move in OPPOSITE directions, which is exactly why this is a control and not
+       * a cleverness: panning the camera up makes everything in the frame appear to go
+       * down, so a logo bound in 'camera' mode slides away from the thing it is meant to
+       * be stuck to. That was the first version of this, and it was wrong for the
+       * commonest use there is.
+       */
       bind: {
         label: 'Follow a track',
-        hint: 'Pans the picture so the tracked point sits at the centre of the frame, ' +
-          'plus the offset. Scale and rotation still apply on top.',
-        apply(p, pos, off) {
-          const s = clamp(p.scale, 0.001, 64);
-          p.x = (0.5 + (Number(off.x) || 0)) - clamp(p.anchorX, -4, 5) * (1 - s) - s * pos.x;
-          p.y = (0.5 + (Number(off.y) || 0)) - clamp(p.anchorY, -4, 5) * (1 - s) - s * pos.y;
+        hint: 'Move: the clip travels with the tracked point. Pan: the frame moves so the ' +
+          'point stays centred - for footage the track was solved on.',
+        modes: [
+          { value: 'move', label: 'Move this clip with the point' },
+          { value: 'camera', label: 'Pan the frame to keep the point centred' },
+        ],
+        apply(p, pos, off, mode) {
+          const ox = Number(off.x) || 0, oy = Number(off.y) || 0;
+          if (mode === 'camera') {
+            const s = clamp(p.scale, 0.001, 64);
+            p.x = (0.5 + ox) - clamp(p.anchorX, -4, 5) * (1 - s) - s * pos.x;
+            p.y = (0.5 + oy) - clamp(p.anchorY, -4, 5) * (1 - s) - s * pos.y;
+            return;
+          }
+          // 'move': the offset the author already had, plus how far the point has gone
+          // since the anchor. `pos` is already damped by `strength`, so a strength of 0
+          // leaves the clip exactly where it was placed.
+          const ax = isFinite(Number(pos.ax)) ? Number(pos.ax) : pos.x;
+          const ay = isFinite(Number(pos.ay)) ? Number(pos.ay) : pos.y;
+          p.x = (Number(p.x) || 0) + (pos.x - ax) + ox;
+          p.y = (Number(p.y) || 0) + (pos.y - ay) + oy;
         },
       },
       schema: [
@@ -1710,6 +1742,13 @@
         strength: isFinite(Number(b.strength)) ? clamp(b.strength, -4, 4) : 1,
         smooth: isFinite(Number(b.smooth)) ? clamp(b.smooth, 0, 4) : 0,
       };
+      // Which way a follow moves, for a type that has more than one answer. Anything
+      // unrecognised falls back to the type's first mode rather than to nothing, so a
+      // hand-edited file cannot leave a binding that resolves and then draws nowhere.
+      if (d.bind.modes) {
+        const known = d.bind.modes.some((m) => m.value === b.mode);
+        nb.mode = known ? b.mode : d.bind.modes[0].value;
+      }
       // The clip the track lives on, when it is not this one. Absent for the ordinary
       // case, so a same-clip binding serialises exactly as it did before cross-clip
       // binding existed.
@@ -1825,7 +1864,7 @@
       // an offset means depends on the type: it moves the lit shape of a spotlight and the
       // whole frame of a bound transform. Only `apply()` knows which.
       const pos = resolveBind(clip, entry, t, W, H);
-      if (pos) d.bind.apply(out, pos, { x: pos.offX || 0, y: pos.offY || 0 });
+      if (pos) d.bind.apply(out, pos, { x: pos.offX || 0, y: pos.offY || 0 }, b.mode);
     }
     return out;
   }
@@ -1908,11 +1947,14 @@
    * write there is exactly the pair that drifts, and the symptom would be a keyframe
    * strip that looks live and moves nothing.
    */
-  function boundParams(type) {
+  function boundParams(type, mode) {
     const d = DEFS[type];
     if (!d || !d.bind) return [];
     const probe = Object.assign({}, d.params);
-    d.bind.apply(probe, { x: 0.37, y: 0.61 }, { x: 0, y: 0 });
+    // The probe carries an anchor as a real binding does, so a 'move' apply measures a
+    // travel of 0.37 - 0.5 rather than against an undefined and writing NaN.
+    d.bind.apply(probe, { x: 0.37, y: 0.61, ax: 0.5, ay: 0.5 }, { x: 0, y: 0 },
+      mode || (d.bind.modes ? d.bind.modes[0].value : undefined));
     return Object.keys(d.params).filter((k) => probe[k] !== d.params[k]);
   }
 

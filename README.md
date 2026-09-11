@@ -1806,12 +1806,19 @@ a position to one:
 
 | Type | What follows |
 | --- | --- |
-| `transform` | the **camera**: the picture is panned so the tracked pixel sits at the centre of the frame plus the offset, solved through the effect's own scale and anchor |
+| `transform` | **two modes.** *Move* (the default) travels the clip with the point: it keeps the position you gave it and adds the distance the point has moved since it was anchored — what a logo, badge or callout wants. *Pan* is the camera: the frame pans so the tracked pixel sits at the centre, solved through the effect's own scale and anchor — for the footage the track was solved on |
 | `spotlight` | the **lit shape**, centred on the point; the picture stays still |
 | `cutout` | the **source region** being lifted; the magnified float stays where it was placed |
 
-Those are three different answers on purpose, which is why each type owns its `apply()`
-rather than sharing one "set x and y". Binding a cutout's *destination* would fling the
+Those are different answers on purpose, which is why each type owns its `apply()` rather
+than sharing one "set x and y".
+
+**The two transform modes move in OPPOSITE directions, and that is the whole reason the
+mode is a control rather than a guess.** Panning a camera up makes everything in the frame
+appear to travel down, so a logo bound in *Pan* mode slides away from the thing it is
+meant to be stuck to. The first version of this had camera semantics only, and a bound
+image therefore followed its track in reverse. `smoke-track.js` now asserts the direction
+of both modes, which is the assertion that was missing. Binding a cutout's *destination* would fling the
 callout around the frame, which is the one thing a callout must not do.
 
 #### Following a track on ANOTHER clip

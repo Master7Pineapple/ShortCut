@@ -676,8 +676,14 @@
      * So the animated values are handed back and `DEFS[type].bind.apply()` puts them
      * wherever they belong for that type.
      */
+    // The ANCHOR, mapped the same way, comes back too. A binding that MOVES something
+    // needs the distance the tracked point has travelled since it was anchored, not its
+    // absolute position - the author placed the thing where they wanted it and the track
+    // is there to carry it, not to teleport it onto the tracked pixel.
+    const ap = m(a.x, a.y);
     return {
       x: p.x, y: p.y, c: s.c,
+      ax: ap.x, ay: ap.y,
       offX: anim('offX', num(bind.offX, 0)),
       offY: anim('offY', num(bind.offY, 0)),
     };

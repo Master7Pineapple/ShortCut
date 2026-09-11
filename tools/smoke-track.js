@@ -316,7 +316,7 @@
         y: p.anchorY + (pos.y - p.anchorY) * p.scale + p.y,
       });
       const tr = FX.create('transform');
-      tr.bind = { track: tk.id, offX: 0, offY: 0 };
+      tr.bind = { track: tk.id, offX: 0, offY: 0, mode: 'camera' };
       tr.params.scale = 1.8;
       const frameOf = (sx, sy) => Tracker.frameMap(clip, A)(sx, sy);
       tk.points = [{ t: 0, x: 0.5, y: 0.5, c: 1 }, { t: 4, x: 0.56, y: 0.58, c: 1 }];
@@ -324,19 +324,82 @@
         const p = FX.paramsAt(tr, t, clip, state.out.w, state.out.h);
         const s = Tracker.sampleAt(tk, clip.in + t);
         const landed = place(p, frameOf(s.x, s.y));
-        ok('a bound transform lands the tracked point in the middle of the frame at t=' + t,
+        ok('a CAMERA-bound transform lands the tracked point in the middle of the frame at t=' + t,
           near(landed.x, 0.5, 1e-6) && near(landed.y, 0.5, 1e-6),
           landed.x.toFixed(5) + ', ' + landed.y.toFixed(5));
       }
       {
         const off = FX.create('transform');
-        off.bind = { track: tk.id, offX: 0.2, offY: -0.1 };
+        off.bind = { track: tk.id, offX: 0.2, offY: -0.1, mode: 'camera' };
         off.params.scale = 1.8;
         const p = FX.paramsAt(off, 2, clip, state.out.w, state.out.h);
         const s = Tracker.sampleAt(tk, 2);
         const landed = place(p, frameOf(s.x, s.y));
         ok('the follow offset moves the point by exactly that fraction of the frame',
           near(landed.x, 0.7, 1e-6) && near(landed.y, 0.4, 1e-6));
+      }
+
+      /*
+       * DIRECTION, WHICH IS WHAT THE TWO MODES ARE ABOUT.
+       *
+       * A logo pinned to a moving button must go the way the button goes. The first cut
+       * of this had only camera semantics, so a bound logo slid the opposite way - the
+       * frame panned up, so everything drawn in it appeared to travel down. These two
+       * assertions are the ones that would have caught it.
+       */
+      {
+        const up = Tracker.makeTrack(0, 0.5, 0.5, {});
+        up.id = 'tkUp';
+        // The tracked thing moves UP the frame (smaller y) and to the right.
+        up.points = [{ t: 0, x: 0.5, y: 0.5, c: 1 }, { t: 4, x: 0.65, y: 0.3, c: 1 }];
+        const upClip = Object.assign({}, clip, { tracks: [up] });
+
+        const mover = FX.create('transform');
+        mover.bind = { track: 'tkUp', offX: 0, offY: 0, mode: 'move' };
+        const m0 = FX.paramsAt(mover, 0, upClip, state.out.w, state.out.h);
+        const m1 = FX.paramsAt(mover, 4, upClip, state.out.w, state.out.h);
+        ok('MOVE: the tracked point goes up, and the bound clip goes UP with it',
+          m1.y < m0.y - 1e-6, 'y ' + m0.y.toFixed(4) + ' -> ' + m1.y.toFixed(4));
+        ok('MOVE: the point goes right, and the clip goes RIGHT with it',
+          m1.x > m0.x + 1e-6, 'x ' + m0.x.toFixed(4) + ' -> ' + m1.x.toFixed(4));
+
+        const cam = FX.create('transform');
+        cam.bind = { track: 'tkUp', offX: 0, offY: 0, mode: 'camera' };
+        const c0 = FX.paramsAt(cam, 0, upClip, state.out.w, state.out.h);
+        const c1 = FX.paramsAt(cam, 4, upClip, state.out.w, state.out.h);
+        ok('CAMERA: the same track moves the frame the OTHER way, which is what a camera ' +
+          'following the action does - and why this is a control rather than a guess',
+          c1.y > c0.y + 1e-6 && c1.x < c0.x - 1e-6,
+          'y ' + c0.y.toFixed(4) + ' -> ' + c1.y.toFixed(4));
+
+        ok('MOVE keeps the placement the author gave the clip and adds the travel to it',
+          near(m0.x, mover.params.x, 1e-9) && near(m0.y, mover.params.y, 1e-9));
+        ok('...so at strength 0 a bound clip does not move at all',
+          (() => {
+            const pinned = FX.create('transform');
+            pinned.bind = { track: 'tkUp', offX: 0, offY: 0, mode: 'move', strength: 0 };
+            const a = FX.paramsAt(pinned, 0, upClip, 1080, 1920);
+            const b = FX.paramsAt(pinned, 4, upClip, 1080, 1920);
+            return near(a.x, b.x, 1e-9) && near(a.y, b.y, 1e-9);
+          })());
+        ok('a new binding defaults to MOVE - the mode a logo, a badge or a callout wants',
+          (() => {
+            const fresh = FX.create('transform');
+            fresh.bind = { track: 'tkUp' };
+            FX.normalize(fresh);
+            return fresh.bind.mode === 'move';
+          })());
+        ok('an unrecognised mode from a hand-edited file falls back to a real one',
+          (() => {
+            const odd = FX.create('transform');
+            odd.bind = { track: 'tkUp', mode: 'sideways' };
+            FX.normalize(odd);
+            return odd.bind.mode === 'move';
+          })());
+        ok('the mode changes which parameters the binding writes to nothing - both write ' +
+          'x and y, so the panel says the same thing either way',
+          FX.boundParams('transform', 'move').join() === 'x,y' &&
+          FX.boundParams('transform', 'camera').join() === 'x,y');
       }
 
       // The other two bind their own thing, and the difference IS the feature.
@@ -781,17 +844,28 @@
         { gen: 'place', bind: { clip: idB, track: 'tkX', offX: 0, offY: 0, strength: 1, smooth: 0 } })];
 
       // A's local t=2 is timeline 4, which is B's source 4 - where the track says 0.8.
+      // The logo is in the default 'move' mode, so what it must do is TRAVEL with the
+      // point, by the distance that point moved through the owner clip's framing.
       const A = state.out.w / state.out.h;
-      const want = Tracker.frameMap(liveB(), A)(0.8, 0.6);
-      const p = FX.paramsAt(logo.fx[0], 2, logo, state.out.w, state.out.h);
-      const place = (pp, pos) => ({
-        x: pp.anchorX + (pos.x - pp.anchorX) * pp.scale + pp.x,
-        y: pp.anchorY + (pos.y - pp.anchorY) * pp.scale + pp.y,
-      });
-      const landed = place(p, want);
-      ok('a clip can follow a track on ANOTHER clip, through the OWNER clip\u2019s framing',
-        near(landed.x, 0.5, 1e-6) && near(landed.y, 0.5, 1e-6),
-        landed.x.toFixed(5) + ', ' + landed.y.toFixed(5));
+      const map = Tracker.frameMap(liveB(), A);
+      // The logo starts at 2 s and the recording at 0, so the logo's local 0..2 is the
+      // recording's source 2..4 - HALF the track's span, and half its travel. Reading
+      // the two ends off the track itself rather than assuming its endpoints is the
+      // difference between asserting the mapping and asserting a guess about it.
+      const s0 = Tracker.sampleAt(liveB().tracks[0], 2), s1 = Tracker.sampleAt(liveB().tracks[0], 4);
+      const travelled = {
+        x: map(s1.x, s1.y).x - map(s0.x, s0.y).x,
+        y: map(s1.x, s1.y).y - map(s0.x, s0.y).y,
+      };
+      const pA = FX.paramsAt(logo.fx[0], 0, logo, state.out.w, state.out.h);
+      const pB = FX.paramsAt(logo.fx[0], 2, logo, state.out.w, state.out.h);
+      ok('a clip can follow a track on ANOTHER clip, travelling exactly as far as the ' +
+        'point did through the OWNER clip\u2019s framing',
+        near(pB.x - pA.x, travelled.x, 1e-6) && near(pB.y - pA.y, travelled.y, 1e-6),
+        'moved ' + (pB.x - pA.x).toFixed(4) + ',' + (pB.y - pA.y).toFixed(4) +
+        ' want ' + travelled.x.toFixed(4) + ',' + travelled.y.toFixed(4));
+      ok('...and in the SAME direction the tracked point went, not the opposite one',
+        (pB.y - pA.y < 0) === (travelled.y < 0) && (pB.x - pA.x > 0) === (travelled.x > 0));
 
       ok('the panel offers tracks from other clips, named by the clip they are on',
         (() => {
