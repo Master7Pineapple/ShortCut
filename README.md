@@ -45,7 +45,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-seven suites:
+There are twenty-eight suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -124,6 +124,24 @@ There are twenty-seven suites:
   downloaded — MobileSAM itself: that it takes the square it was pointed at and not the
   identical one three squares over, and that a second prompt on the same frame is far
   cheaper than the first. It needs no fixture and no model.
+- `tools/smoke-graphics.js` — the graphics engine: that each of the nineteen types paints
+  **inside the bounds the baker crops to** and that those bounds are tight enough to be
+  worth having (the assertion that stops an object being chopped off in the export only,
+  where the preview paints the whole frame and never notices), a rect measured against the
+  unit rule to the pixel, the same picture at 1x and 3x with a chart's *labels included*,
+  the stagger being a delay per mark rather than a compression of the entry, the single
+  chart scale over seven awkward series — a flat one, a zero one, a negative one, a
+  nanometre one — with every tick inside the plot and every gridline's label distinct, the
+  bar heights measured in ink against what the scale says, a diagram spec laying out
+  identically across two runs and two resolutions (cycles, dangling edges and half-typed
+  JSON included), the model's normalisation and that an unknown type is **kept** rather
+  than lost, that a draw which throws costs a frame and not the session, the timeline
+  (one undo entry, no decoder, and that a split does not leave two halves sharing one
+  definition), the render job and that a graphic's `id` is not in its key while its
+  definition is, that a lone graphic does not push its span off the fast path while an
+  effect on it does, and — end to end — that a real ffmpeg render of a graphic lands on the
+  pixels the preview canvas painted. It needs **no fixture**: every frame is painted by the
+  suite.
 - `tools/smoke-transitions.js` — transitions: finding cuts, the fast grab, length and
   alignment, all three types drawing correctly, the render job, an end-to-end ffmpeg
   render read back from the MP4, and presets.
@@ -323,6 +341,9 @@ tools/smoke-cursor.js     pointer treatment: smoothing, ripples, selections, aut
                           take splitting and the two coordinate spaces
 tools/smoke-track.js      motion tracking: the LK kernel, occlusion, re-anchoring,
                           the binding and what it may put in the render key
+tools/smoke-graphics.js   the graphics engine: painted bounds, the unit rule at two
+                          resolutions, stagger timing, the one chart scale, deterministic
+                          diagram layout, and a real render matching the preview
 tools/smoke-longargs.js   the command-line ceiling and the filtergraph script file
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
@@ -333,6 +354,8 @@ src/renderer/styles.css   all styling; colors live in :root custom properties
 src/renderer/app.js       the editor: state, timeline, preview, editing ops, shortcuts
 src/renderer/anim.js      the keyframe engine: easing curves, tracks, the keyable registry
 src/renderer/fx.js        the visual effect stack: one draw per type, no ffmpeg half
+src/renderer/graphics.js  the graphics engine: kind:'graphic', one draw per type, the
+                          chart scale and the deterministic diagram layout
 src/renderer/cursor.js    pointer treatment, the pure half: smoothing, ripple timing,
                           the two coordinate spaces, take splitting, the auto-zoom
                           generator
@@ -358,9 +381,10 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
 files are plain `<script>` globals (`TextModel`, `TextDraw`, `TextUI`)
 loaded before `app.js`; `anim.js` (`Anim`) is loaded before all of them, then `cursor.js`
-(`Cursor`), `track.js` (`Tracker`) and `fx.js` (`FX`) — in that order, because every effect
-parameter reads its animated value through `Anim`, the pointer effects read their geometry
-through `Cursor`, and a bound effect reads its position through `Tracker`. `TextUI` never touches `app.js` globals - it is wired up through
+(`Cursor`), `track.js` (`Tracker`), `fx.js` (`FX`) and `graphics.js` (`Graphics`) — in that
+order, because every effect parameter reads its animated value through `Anim`, the pointer
+effects read their geometry through `Cursor`, a bound effect reads its position through
+`Tracker`, and a graphic reads its easing presets and its keyframes through `Anim` too. `TextUI` never touches `app.js` globals - it is wired up through
 the hooks object passed to `TextUI.init()` near the bottom of `app.js`.
 
 `app.js` is organised in ten numbered sections (search for `// ===`), in this order:
@@ -375,7 +399,7 @@ Three columns, set by the `#app` grid in `styles.css`:
 | --- | --- |
 | `#left` — the left third | **The short itself and nothing else**: the preview canvas plus the transport strip. No settings panel may be added here; anything that would squeeze the viewer belongs in the inspector. |
 | `#right` — the middle | Toolbar, ruler, timeline tracks, and the render/log footer. Gives up width when the inspector is widened. |
-| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector, and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
+| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector (which grows the graphic editor and the effect stack as the selection calls for them), and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
 
 The left column's width is `minmax(320px, 33.333%)` and never changes with panel state.
 
@@ -406,7 +430,7 @@ Track = {
 
 Clip = {
   id, src,               // absolute path to the media file; null for text cards
-  name, kind: 'video' | 'audio' | 'text',
+  name, kind: 'video' | 'audio' | 'text' | 'image' | 'graphic',
   start,                 // position on the timeline, seconds
   in, out,               // source in/out points, seconds; length = out - in
   mediaDuration,         // full length of the source, the ceiling for `out`
@@ -420,6 +444,8 @@ Clip = {
   linkId,                // clips sharing a linkId move and trim together (A/V sync)
   keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
+  graphic,               // graphic clips only - the whole object, { type, params, keys }.
+                         //   See "The graphics engine"; plain JSON, exactly like `card`
   captions,              // generated captions only - { gen: true, src } - see below
   fit,                   // OPTIONAL - 'contain' draws the WHOLE picture inside the frame
                          //   and leaves the rest transparent; absent means the default,
@@ -446,10 +472,13 @@ Invariants worth preserving when you change things:
   agreeing about what is audible.
 - `state.tracks` is in display order, top first. Anything that cares about z-order
   (`buildJob`) reverses it so the bottom video track is drawn first.
-- Text clips live on **video** tracks, so track order gives them their z-order for free.
-  They have no `src` and never open a decoder; `in` stays 0 and their length is `out`.
-  Anything that walks video clips must skip `kind === 'text'` — `activeVideoClip()` and
-  `syncMedia()` both do.
+- Text clips and graphic clips live on **video** tracks, so track order gives them their
+  z-order for free. They have no `src` and never open a decoder; `in` stays 0 and their
+  length is `out`. Anything that walks video clips must skip them, and the test for "this
+  one is drawn by the renderer, not decoded" is **`isCanvasClip()`** rather than a
+  hand-written `kind === 'text'` — `activeVideoClip()`, `syncMedia()`, the audio-chain
+  target, Tighten's cutter and the clip keyframe panel all ask it. A third such kind would
+  be one entry in `CANVAS_KINDS` rather than a sweep through `app.js`.
 
 ### Framing (16:9 → 9:16)
 
@@ -490,7 +519,8 @@ streams the RGBA into `frames.raw`. ffmpeg overlays that one layer.
 
 `buildJob()` (renderer) flattens the timeline into a list of clips with absolute
 timings and `visible` / `audible` flags. `bakeOverlays()` then bakes what has to be baked
-— the composite first, then text cards, then transitions — and `buildArgs()` (main) turns
+— the composite first, then the canvas-drawn clips (text cards and graphics, through one
+generic loop), then transitions — and `buildArgs()` (main) turns
 the result into a single `ffmpeg` invocation:
 
 - a `color=black` base of the full project duration;
@@ -560,11 +590,13 @@ stacked — or any effect at all. `clipNeedsBake()` asks `FX.active()` rather th
 the clip on the fast path — and the answer it gives can never disagree with the answer
 the draw path gives, because they are the same call.
 
-Text cards and transitions do **not** disqualify a span, and that is not a loophole. They
-are already drawn by one canvas implementation and baked from it, so the reason for the
-fast path — far faster, pixels identical — applies to them word for word. A card is baked
-cropped to its painted bounds, which is a fraction of a full frame; folding it into a
-full-frame composite would cost 20–100× the bytes for the same picture. A transition
+Text cards, graphics and transitions do **not** disqualify a span, and that is not a
+loophole. They are already drawn by one canvas implementation and baked from it, so the
+reason for the fast path — far faster, pixels identical — applies to them word for word. A
+card or a graphic is baked cropped to its painted bounds, which is a fraction of a full
+frame; folding it into a full-frame composite would cost 20–100× the bytes for the same
+picture. A graphic carrying an **effect** does disqualify its span, exactly as any other
+clip does — `clipNeedsBake()` never asks what kind of clip it is looking at. A transition
 additionally *owns* its window: its baked layer sits between tracks in the overlay chain,
 while a composite layer is appended last and would cover it, so transition windows are
 excluded from bake spans outright.
@@ -871,14 +903,21 @@ says what it costs.
 
 #### What does not get a stack, and where effects do not apply
 
-Effects are offered on **picture clips only** — `kind:'video'` and `kind:'image'`. A
-text card already owns a transform, an opacity, a rotation, a glow and a drop shadow in its
-own model, with its own keyframes and its own presets, so a second competing `transform`
-beside all of that would be a coin toss for the author every time; and `#textPanel` shares
-a scrolling column with `#inspector`, so a stack panel above it pushes the card editor off
-the bottom of the screen the moment a card is selected. `compositeLayers()` still runs a
-stack for any layer carrying one, text included, so widening `FX_KINDS` in `app.js` is all
-a later step needs to do.
+Effects are offered on `kind:'video'`, `kind:'image'` and `kind:'graphic'` — everything
+except a **text card**. A card already owns a transform, an opacity, a rotation, a glow and
+a drop shadow in its own model, with its own keyframes and its own presets, so a second
+competing `transform` beside all of that would be a coin toss for the author every time;
+and `#textPanel` shares a scrolling column with `#inspector`, so a stack panel above it
+pushes the card editor off the bottom of the screen the moment a card is selected.
+`compositeLayers()` still runs a stack for any layer carrying one, text included.
+
+A graphic is the opposite case to a card, which is why it is in the set. Its own model
+holds **shape** — a radius, a series of values, a diagram spec — and deliberately no
+transform, no rotation and no anchor, so `transform` is the one place a graphic is moved.
+That is not tidiness: a `transform` effect is the thing that carries a motion-track
+`bind`, so putting position in the effect rather than in the graphic is what makes "this
+callout sticks to that moving button" free, instead of a second binding implementation
+living in `graphics.js`.
 
 **Effects do not apply inside a transition window.** A transition owns its frame in both
 the preview (`drawTransitionFrame()`) and the render (transition windows are excluded from
@@ -2667,6 +2706,143 @@ rather than to something on one. Text cards are not routed through it either —
 panel keyframes the card, which is a richer thing than a clip property, and it calls the
 same `TextUI.keyStrip()`.
 
+### The graphics engine
+
+`src/renderer/graphics.js` is a plain `<script>` global called `Graphics`, loaded after
+`fx.js`. It owns one new clip kind — `kind: 'graphic'` — whose **whole definition lives on
+the clip**, exactly as a text card's does:
+
+```js
+clip.graphic = { type, params: {...}, keys: {...} }   // plain JSON, nothing else
+```
+
+Nineteen types ship, in four groups, and each one is **one function**:
+
+| Group | Types |
+| --- | --- |
+| Primitives | `rect` `ellipse` `line` `arrow` `path` `icon` |
+| Composites | `lowerThird` `stepChip` `bracket` `underline` `highlighter` |
+| Data | `counter` `ring` `bars` `linegraph` `donut` |
+| Diagrams | `funnel` `flow` `nodemap` |
+
+Adding a type is one entry in `Graphics.DEFS` — its label, its group, its default
+parameters, its inspector schema, its `bounds()` and its `draw()`. The panel, the keyframe
+strips, the "+ Graphic" menu, the serialisation and the normalisation all build themselves
+from that entry, and `smoke-graphics.js` walks `DEFS` rather than a list, so a new type is
+tested the moment it exists.
+
+#### It is a text card in every way that matters
+
+That is the point of the shape, not a coincidence. A graphic satisfies the **same
+paint-at-time-t contract** `TextDraw` does — `draw(ctx, clip, W, H, t, frameDur)` plus
+`animatedBounds()` — so it needed no new plumbing anywhere:
+
+- `compositeLayers()` paints it, which means the viewer and the baker get it from one
+  implementation and there is no ffmpeg half of a graphic. Writing one would be a bug.
+- `bakeTextClips()` bakes it, cropped to its painted bounds, as raw RGBA, overlaid with
+  `eof_action=pass`. That function is now generic over `CANVAS_PAINTERS`, a two-entry table
+  saying which function paints a kind and which field carries its definition. It is one
+  table rather than two copies of the loop because two copies of that loop is precisely the
+  shape that drifts.
+- `jobCacheKey()` normalises the bake away and hashes the **definition**, through the same
+  table, so the baked and unbaked forms of one job still hash identically and the cache bar
+  still lights up.
+
+The places that used to ask `kind === 'text'` to mean *"there is no source clock here"* now
+ask `isCanvasClip()`. A third canvas-drawn kind is one entry in `CANVAS_KINDS`.
+
+#### The unit rule, again
+
+Every length is a fraction of the frame's **shorter side** and every position a fraction of
+W and H. Never a pixel count — `pxMin()` converts at draw time against whatever size is
+being painted, exactly as `fx.js` does. **Font sizes go through it too**, and that is not a
+detail: a chart authored with a 24 px axis label would put its labels in a different place
+at 540×960 than at 1080×1920, so the preview would lie about the export in the one part of
+a chart that is supposed to be exact. `smoke-graphics.js` paints a bar chart at 1× and 3×
+and asserts the whole inked box — labels included — scales by three.
+
+#### One scale places marks, ticks and labels
+
+This is the whole of a chart's correctness, and it is one function, `Graphics.scale()`:
+
+```js
+const sc = Graphics.scale(values, { ticks: 4 });   // { min, max, step, ticks, at(v) }
+```
+
+Nothing in a chart may compute a position from a value any other way. The moment a label is
+placed by a second calculation it starts naming a number the bar does not reach. Two
+promises hold, and both are asserted over seven deliberately awkward series:
+
+- `at(min)` is 0 and `at(max)` is 1, so a mark cannot fall outside the plot;
+- every tick is inside `[min, max]`, so **every label names a value the chart reaches**.
+
+Two traps it exists to have already hit. Ticks are built by **multiplying the index** by
+the step rather than by repeated addition — 0.1 added thirty times is not 3, and a tick at
+2.9999999999 formats as "3" while sitting a pixel off the gridline it labels. And the
+decimal count for a label is read off the **step's own spelling** rather than from its
+logarithm: a step of 0.25 needs two places and `ceil(-log10(0.25))` says one, which prints
+"0 0.3 0.5 0.8 1" — two of those label nothing.
+
+A flat series (every value equal, zero included) still gets a usable range, or `at()` would
+divide by zero and every bar would be drawn at the same nonsense height.
+
+#### Entry timing is one calculation
+
+`Graphics.stagger(params, t, i)` answers how far into its entry the `i`th mark of an object
+is, and every type calls it — a lower third staggers its plate against its type, a bar
+chart staggers its bars, a node map staggers each edge behind the node it arrives at. The
+stagger is a **delay per mark, not a compression**: every mark travels the same curve over
+the same length of time and the group simply arrives in order. `inDur` of 0 is a hard cut
+**on** — it must answer 1 at the instant it lands, or the mark would flicker on its own
+arrival.
+
+#### A diagram is one clip, laid out from a spec
+
+`Graphics.layoutDiagram(type, spec)` is a **pure function returning normalised coordinates**
+— no canvas, no W, no H. That is what makes "identical across two runs and two resolutions"
+something the suite can assert rather than hope for: the layout does not know what a
+resolution is, so it cannot vary with one. Every position is computed from an index, and
+node columns come either from an explicit `col`/`row` or from a breadth-first walk of the
+edge **array** in written order — never from an iteration order a `Map` could reshuffle.
+
+A spec is invalid JSON for most of the time it is being typed, so an unparseable one falls
+back to the type's example layout and the panel says so, rather than the object blinking
+out between keystrokes. A cycle still lays out; an edge naming a node that does not exist
+is dropped rather than drawn to nowhere.
+
+#### Position is an effect, not a parameter
+
+A graphic's own model holds **shape** and deliberately no transform, rotation or anchor.
+Graphics are in `FX_KINDS`, so a graphic carries an ordinary effect stack, and a
+`transform` effect is what moves, scales, rotates and fades it — and a `transform` is the
+thing that carries a motion-track `bind`. So "this callout sticks to that moving button",
+across clips, with the offsets, the follow strength and the smoothing step 11 built, costs
+nothing here: it is the binding that already exists, tested by the suite that already tests
+it. A second implementation in `graphics.js` is the thing this arrangement refuses.
+
+#### An imported icon is path data, not a file
+
+`icon` stores the `d` attributes of an SVG's `<path>` elements plus its viewBox, as strings
+on the clip. Not a path to a file, which can move, and not the bytes, which would put a
+megabyte of base64 into every undo snapshot and into the `.scut`. `svg:pick` in main hands
+back the file's **text** (capped at 2 MB — an .svg that large is an embedded image, which
+this cannot draw) and `Graphics.svgPaths()` pulls the paths out. Anything other than
+`<path>` is out of scope, and an SVG with none is refused rather than half-drawn: the
+`icon` type paints a placeholder square when it has nothing, because an object that
+silently draws nothing is the failure the effect panel's `needs` warnings already exist to
+stop happening twice.
+
+#### Bounds are analytic, and generous when they are unsure
+
+Each type computes its painted extent from its parameters rather than by painting and
+measuring, because `animatedBounds()` samples it fifteen times a second across the clip and
+a `getImageData` per sample would be the slowest thing in the bake. A type whose `bounds()`
+throws or answers nonsense falls back to the **whole frame**: that bakes a bigger sequence
+than it needs and is always correct, while the other direction silently crops the object in
+a way you only notice in the exported file. `smoke-graphics.js` paints every type and
+asserts both directions — every inked pixel inside the declared bounds, and the bounds no
+more than about six times the ink.
+
 ### Text cards
 
 A text card is a clip of `kind: 'text'` whose whole definition lives in `clip.card`:
@@ -3541,7 +3717,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A timeline-wide editing op | a function in `app.js` §7 + a button in `index.html` + one `addEventListener` in section 10 + a row in `SHORTCUTS` and the `keydown` handler |
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
-| A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain |
+| A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain. If it is **drawn by the renderer** rather than decoded, it is one entry in `CANVAS_KINDS` and one in `CANVAS_PAINTERS` instead — the layer walk, the bake, the cache key and the ffmpeg branch are all already generic over that table |
+| A **graphic** type | one entry in `Graphics.DEFS` (`src/renderer/graphics.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `bounds()` tells the baker what to crop to, its `draw(c, p, W, H, t)` paints. There is no ffmpeg half; lengths and **font sizes** go through `pxMin()`, and a chart places everything through `Graphics.scale()` |
 | A position that can follow a motion track | a `bind: { label, hint, apply(p, pos, off) }` on that `FX.DEFS` entry — the panel row, the offsets and `FX.boundParams()` all build themselves from it; `apply()` decides what "follow" means for that type |
 | A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p, t, entry, clip)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
 | A **generator** that writes keyframes | a pure function returning tracks of `{t, v, ease, gen:'<name>'}` + `Cursor.applyGenerated()` to merge them + one panel with its own Generate/Clear. Never an opaque effect — see "Screen-recording treatment" |
@@ -3568,11 +3745,17 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - Tighten only cuts into the selection's own link groups. Other clips shift with the
   ripple but are never sliced, text cards shift but are never cut, and a locked track is
   left entirely alone — see "Tighten".
-- Video clips and stills carry an ordered, keyframable effect stack: transform, rounded
-  corners and shadow, crop/inset, blur, a grade, the three pointer effects, and the four
-  framing treatments — device frame, background, spotlight and cutout — see "The effect
-  stack". Text cards do not; they have their own richer animation model. There are still
-  no speed changes.
+- Video clips, stills and graphics carry an ordered, keyframable effect stack: transform,
+  rounded corners and shadow, crop/inset, blur, a grade, the three pointer effects, and the
+  four framing treatments — device frame, background, spotlight and cutout — see "The
+  effect stack". Text cards do not; they have their own richer animation model. There are
+  still no speed changes.
+- The graphics engine ships nineteen object types and **one object per clip** — a row of
+  three stat cards is three clips, not one. It has no grouping, no shared brand palette
+  (every colour is per object until step 17 wires a kit through), and its text is drawn
+  plainly rather than through `TextDraw`, so a graphic's label has no gradient, glow or
+  per-unit typewriter. An imported SVG icon is read for its `<path>` elements only —
+  gradients, masks, embedded images and `<use>` are ignored — see "The graphics engine".
 - A device frame ships four presets (browser light, browser dark, laptop, phone) drawn as
   paths, and the footage is fitted into the screen rect. It does not know what is IN the
   footage: a recording that is already 16:9 lands cleanly, and one that is not is cropped
@@ -3695,6 +3878,7 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `1` / `2` / `3` | Frame left / center / right |
 | `Shift+R` | Reset framing |
 | `Ctrl+T` | Add a text card at the playhead |
+| `Ctrl+G` | Add another graphic of the type you added last |
 | `T` | Drop a transition on the nearest cut |
 | `Ctrl+D` | Duplicate the selected clips |
 | `A` | Toggle animation on the selected text card |

@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('api', {
   pickMedia: () => ipcRenderer.invoke('media:pick'),
   pickFolder: () => ipcRenderer.invoke('media:pickFolder'),
   pickImage: () => ipcRenderer.invoke('media:pickImage'),
+  // An .svg comes back as TEXT - the graphics engine keeps the path data on the clip
+  // rather than a path to a file that can move. See Graphics.svgPaths().
+  pickSvg: () => ipcRenderer.invoke('svg:pick'),
 
   // QuickBin: a media library kept in userData, so it is there in every project.
   binRead: () => ipcRenderer.invoke('bin:read'),

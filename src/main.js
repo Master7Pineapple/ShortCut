@@ -359,6 +359,35 @@ ipcMain.handle('media:pickImage', async () => {
   return r.canceled ? null : r.filePaths[0];
 });
 
+/**
+ * Read an .svg file for the graphics engine's `icon` type.
+ *
+ * The TEXT comes back, not a path: the renderer pulls the path data out of it and stores
+ * that on the clip, so the object survives the file being moved or deleted. A cap because
+ * an .svg is a text file and nothing stops one being a hundred megabytes of embedded
+ * base64 - which would be neither an icon nor something that belongs in a .scut.
+ */
+ipcMain.handle('svg:pick', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import an SVG icon',
+    properties: ['openFile'],
+    filters: [{ name: 'SVG', extensions: ['svg'] }],
+  });
+  if (r.canceled || !r.filePaths.length) return { ok: false, reason: 'canceled' };
+  const file = r.filePaths[0];
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size > 2 * 1024 * 1024) {
+      return { ok: false, error: 'That SVG is ' + Math.round(stat.size / 1024) +
+        ' KB. Icons are a few KB - this one is probably an embedded image, which the ' +
+        'graphics engine cannot draw.' };
+    }
+    return { ok: true, name: path.basename(file), text: fs.readFileSync(file, 'utf8') };
+  } catch (e) {
+    return { ok: false, error: 'Could not read that SVG: ' + e.message };
+  }
+});
+
 ipcMain.handle('media:pickFolder', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Import folder', properties: ['openDirectory'] });
   return r.canceled ? [] : r.filePaths;
@@ -1585,7 +1614,7 @@ function jobKey(job) {
   // whose name is random, so the hash would differ on every render (never a hit) while
   // stripping it out would let two different cards collide (a wrong hit). Refuse instead:
   // callers that want caching send `cacheKey`, computed before baking.
-  if ((job.clips || []).some((c) => c.kind === 'text' || c.kind === 'baked')) return null;
+  if ((job.clips || []).some((c) => c.kind === 'text' || c.kind === 'graphic' || c.kind === 'baked')) return null;
 
   const copy = Object.assign({}, job);
   delete copy.outPath;
@@ -1744,7 +1773,7 @@ function buildArgs(job, opts) {
     if (measure ? c.audible : (c.visible || c.audible)) inputs.push(c);
   }
   for (const c of inputs) {
-    if (c.kind === 'text' || c.kind === 'trans' || c.kind === 'baked') {
+    if (c.kind === 'text' || c.kind === 'graphic' || c.kind === 'trans' || c.kind === 'baked') {
       // A raw RGBA stream straight from the canvas - see text:seq for why not PNG.
       // Transitions and composited spans bake the same way text does; the difference is
       // that their layer is opaque and covers the full frame. A 'baked' clip is the
@@ -1887,10 +1916,12 @@ function buildArgs(job, opts) {
     const idx = inputs.indexOf(c);
     const dur = c.out - c.in;
 
-    if (c.kind === 'text') {
+    if (c.kind === 'text' || c.kind === 'graphic') {
+      // A graphic bakes exactly as a card does - cropped to its painted bounds, raw RGBA,
+      // placed back at bx,by - so it takes the same branch rather than a copy of it.
       fc.push('[' + idx + ':v]setpts=PTS-STARTPTS+' + r3(c.start) + '/TB,format=rgba[v' + i + ']');
-      // eof_action=pass, not repeat: once a card's frames run out the base must show
-      // through untouched, otherwise the last text frame would stick on screen.
+      // eof_action=pass, not repeat: once the frames run out the base must show through
+      // untouched, otherwise the last drawn frame would stick on screen.
       fc.push(
         '[' + last + '][v' + i + ']overlay=' + Math.round(c.bx) + ':' + Math.round(c.by) +
         ':eof_action=pass:enable=' +

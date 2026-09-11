@@ -761,6 +761,61 @@ function addTextCard(text) {
 }
 
 /**
+ * Add a graphic at the playhead.
+ *
+ * Everything a text card does, for the same reasons: graphics live on VIDEO tracks so
+ * track order gives them their z-order for free, they have no source file, `in` stays 0
+ * and the clip length is simply `out`. The whole definition is `clip.graphic`, plain JSON,
+ * exactly as `clip.card` is.
+ */
+/**
+ * The type Ctrl+G adds. UI state, so it lives here and never on the project - which type
+ * you reached for last is not a fact about the edit.
+ */
+let lastGraphicType = 'rect';
+
+function addGraphicClip(type) {
+  if (!Graphics.DEFS[type]) return null;
+  pushUndo();
+  const DEFAULT_LEN = 4;
+  const start = state.playhead;
+
+  // Prefer a video track free at the playhead, so the graphic does not cover footage - the
+  // same courtesy `addTextCard()` does, and for the same reason.
+  let track = state.tracks.find((t) => t.type === 'video' && !t.locked &&
+    !t.clips.some((c) => start < clipEnd(c) && start + DEFAULT_LEN > c.start));
+  if (!track) track = addTrack('video', false);
+
+  const clip = {
+    id: nextId(),
+    src: null,
+    name: Graphics.DEFS[type].label,
+    kind: 'graphic',
+    start,
+    in: 0,
+    out: DEFAULT_LEN,
+    mediaDuration: 3600,      // a graphic can be stretched to any length
+    srcW: 0, srcH: 0, fps: 0,
+    panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
+    linkId: null,
+    graphic: Graphics.defaultGraphic(type),
+  };
+  track.clips.push(clip);
+  sortTracks();
+  setSelection([clip.id], false);
+  markDirty();
+  renderAll();
+  log('Added a ' + Graphics.DEFS[type].label.toLowerCase() + ' at ' + fmtTc(start) + '.');
+  return clip;
+}
+
+/** The graphic clip the panel edits: the lead of the selection, or null. */
+function selectedGraphicClip() {
+  const sel = selectedClips().filter((x) => x.clip.kind === 'graphic');
+  return sel.length ? sel[0].clip : null;
+}
+
+/**
  * Every selected text clip, in timeline order (top track first, then by start).
  *
  * `selectedClips()` already walks the tracks in display order, so the first entry is a
@@ -845,13 +900,19 @@ function syncTextPeers() {
   return changes.length;
 }
 
-/** Text clips under the playhead, bottom track first so upper tracks draw last. */
-function activeTextClips() {
+/**
+ * Canvas-drawn clips under the playhead, bottom track first so upper tracks draw last.
+ *
+ * Only the transition path uses this. A transition owns its whole window and paints the
+ * frame itself, so the cards and graphics that sit over it have to be drawn back on
+ * afterwards; everywhere else `compositeLayers()` has already done it in track order.
+ */
+function activeCanvasClips() {
   const out = [];
   for (const t of state.tracks) {
     if (t.type !== 'video' || t.hidden) continue;
     for (const c of t.clips) {
-      if (c.kind !== 'text') continue;
+      if (!isCanvasClip(c)) continue;
       if (state.playhead >= c.start && state.playhead < clipEnd(c)) out.push(c);
     }
   }
@@ -1080,9 +1141,7 @@ function renderLanes() {
       el.style.left = (c.start * state.pxPerSec) + 'px';
       el.style.width = Math.max(6, (c.out - c.in) * state.pxPerSec) + 'px';
       el.dataset.clipId = c.id;
-      const label = c.kind === 'text'
-        ? (String(c.card.text).split(/\r?\n/)[0].slice(0, 40) || 'Text')
-        : c.name;
+      const label = isCanvasClip(c) ? CANVAS_PAINTERS[c.kind].name(c) : c.name;
       el.innerHTML =
         '<div class="handle l"></div>' +
         '<div class="label">' + escapeHtml(label) + '</div>' +
@@ -1621,15 +1680,15 @@ function renderInspector() {
   const c = row.clip;
   const isText = c.kind === 'text';
   const isStill = c.kind === 'image';
-  // A still and a card share every "there is no source clock here" row: no in/out to
-  // show, no link, and nothing to set a volume on.
-  const noClock = isText || isStill;
+  const isGraphic = c.kind === 'graphic';
+  // A still, a card and a graphic share every "there is no source clock here" row: no
+  // in/out to show, no link, and nothing to set a volume on.
+  const noClock = isCanvasClip(c) || isStill;
   const source = isText ? 'text card'
+    : isGraphic ? 'graphic'
     : isStill ? (c.srcW ? c.srcW + 'x' + c.srcH + ' still' : 'still')
     : (c.srcW ? c.srcW + 'x' + c.srcH + ' @' + c.fps + 'fps' : 'audio');
-  const name = isText
-    ? (String(c.card.text).split(/\r?\n/)[0].slice(0, 40) || '(empty)')
-    : c.name;
+  const name = isCanvasClip(c) ? CANVAS_PAINTERS[c.kind].name(c) : c.name;
 
   box.innerHTML =
     '<div class="kv">' +
@@ -1686,6 +1745,10 @@ function renderInspector() {
   // the mask has to exist before the row that points at one is worth offering.
   const mm = maskPanel(c);
   if (mm) box.appendChild(mm);
+  // Above the stack, because the stack sits ON it: the graphic says what is drawn and the
+  // effects say where it is and what happens to it afterwards.
+  const gfx = graphicPanel(c);
+  if (gfx) box.appendChild(gfx);
   const fx = clipFxPanel(c);
   if (fx) box.appendChild(fx);
   const keys = clipKeyPanel(c);
@@ -1717,7 +1780,8 @@ document.addEventListener('pointercancel', inspectorEditEnd);
 /**
  * Which clips are OFFERED an effect stack.
  *
- * Picture clips, and deliberately not text cards. Two reasons, and the second is the real
+ * Picture clips and graphics, and deliberately not text cards. Two reasons, and the second
+ * is the real
  * one: a card already owns a transform, an opacity, a rotation, a glow and a drop shadow
  * in its own model, with its own keyframes and its own preset system, so a second and
  * competing `transform` effect beside all of that would be a coin toss for the author
@@ -1727,8 +1791,16 @@ document.addEventListener('pointercancel', inspectorEditEnd);
  *
  * `compositeLayers()` still runs the stack for ANY layer that carries one, text included,
  * so widening this set is all a later step needs to do.
+ *
+ * Step 13 widened it, for a graphic. A graphic is the opposite case to a card: its own
+ * model holds SHAPE - a radius, a series of values, a diagram spec - and deliberately no
+ * transform, no rotation and no anchor, precisely so that `transform` is the one place a
+ * graphic is moved. That is not tidiness either: a `transform` effect is the thing that
+ * carries a motion-track `bind`, so putting position in the effect rather than in the
+ * graphic is what makes "a callout sticks to a moving button" free rather than a second
+ * binding implementation living in `graphics.js`.
  */
-const FX_KINDS = new Set(['video', 'image']);
+const FX_KINDS = new Set(['video', 'image', 'graphic']);
 
 /**
  * Which effect rows are rolled up, by effect id.
@@ -1936,6 +2008,166 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
     'The track is writing ' + taken.join(' and ') + ' every frame, so the sliders and ' +
     'keyframes for those are ignored while it is bound. Everything else still animates.'));
   return nodes;
+}
+
+/**
+ * The graphic editor for the selected graphic clip.
+ *
+ * Built entirely from `Graphics.DEFS`, the same way `clipFxPanel()` is built from
+ * `FX.DEFS`: the rows are `TextUI.control` over each type's schema, so every value here is
+ * a slider AND a typable box AND scroll-adjustable AND resettable without any of that
+ * being written a second time, and each numeric parameter gets the same
+ * `TextUI.keyStrip()` the effect stack and the clip inspector use. Adding a graphic type
+ * is an entry in `Graphics.DEFS` and nothing else.
+ *
+ * There is no position, rotation or opacity animation here beyond the parameters
+ * themselves: a graphic is MOVED by a `transform` effect on the same clip, which is the
+ * one thing in this codebase that knows how to follow a motion track. See `FX_KINDS`.
+ */
+function graphicPanel(clip) {
+  if (!clip || clip.kind !== 'graphic' || !clip.graphic) return null;
+  const el = TextUI.el;
+  const box = el('div', 'fx-box');
+  Graphics.normalizeClip(clip);
+  const g = clip.graphic;
+  const d = Graphics.DEFS[g.type];
+
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'Graphic'));
+  if (!d) {
+    // A type this build does not know. The clip keeps its definition untouched - see
+    // `Graphics.normalizeClip()` - so saving here does not destroy it.
+    head.appendChild(el('span', 'tc-hint', 'unknown type "' + g.type + '"'));
+    box.appendChild(head);
+    box.appendChild(el('div', 'tc-hint fx-warn',
+      'This project was saved by a build that has a graphic type this one does not. The ' +
+      'object draws nothing here, but its definition is kept and will come back.'));
+    return box;
+  }
+  head.appendChild(el('span', 'tc-hint', d.group.toLowerCase()));
+  box.appendChild(head);
+
+  // A structural change - swapping the type, importing an icon - is one undo entry and a
+  // full rebuild. A value change is the per-gesture undo `inspectorEdit` already gives.
+  const edit = (fn) => {
+    pushUndo();
+    fn();
+    Graphics.normalizeClip(clip);
+    markDirty();
+    renderAll();
+  };
+  const rowHooks = {
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
+    onChanged: () => { markDirty(); drawPreview(); },
+    rebuild: renderInspector,
+  };
+
+  const pick = el('select');
+  for (const group of Graphics.GROUPS) {
+    const og = document.createElement('optgroup');
+    og.label = group;
+    for (const type of Graphics.TYPES) {
+      if (Graphics.DEFS[type].group !== group) continue;
+      const o = el('option');
+      o.value = type;
+      o.textContent = Graphics.DEFS[type].label;
+      og.appendChild(o);
+    }
+    pick.appendChild(og);
+  }
+  pick.value = g.type;
+  pick.title = 'Change what this clip draws. Parameters the new type does not have are ' +
+    'dropped, and its own defaults fill in - the reveal timing carries over.';
+  pick.addEventListener('change', () => edit(() => {
+    // Carry the reveal timing across, because it is the one block every type shares and
+    // losing it on a type swap would silently re-time the object.
+    const carry = {};
+    for (const k of Object.keys(Graphics.REVEAL)) carry[k] = g.params[k];
+    clip.graphic = Object.assign(Graphics.defaultGraphic(pick.value), {});
+    Object.assign(clip.graphic.params, carry);
+    if (clip.name === d.label) clip.name = Graphics.DEFS[pick.value].label;
+  }));
+  const prow = el('div', 'fx-add');
+  prow.appendChild(pick);
+  box.appendChild(prow);
+
+  const body = el('div', 'fx-fx-body');
+  for (const spec of d.schema) body.appendChild(TextUI.control(spec, g, { params: d.params }, rowHooks));
+
+  // An imported icon is PATH DATA on the clip, not the bytes of a file - `clip.graphic`
+  // goes into every undo snapshot and into the .scut file. See `Graphics.svgPaths()`.
+  if (g.type === 'icon') {
+    const irow = el('div', 'tc-row');
+    irow.appendChild(el('label', 'tc-label', 'SVG'));
+    const nm = el('span', 'tc-hint', g.params.name || (g.params.d ? 'imported' : 'nothing imported'));
+    nm.title = g.params.d ? g.params.d.slice(0, 160) : 'Import an .svg file to draw here.';
+    irow.appendChild(nm);
+    const imp = el('button', 'mini', 'Import...');
+    imp.addEventListener('click', async () => {
+      const r = await window.api.pickSvg();
+      if (!r || !r.ok) { if (r && r.error) log(r.error); return; }
+      const parsed = Graphics.svgPaths(r.text);
+      if (!parsed) { log('That SVG has no <path> in it, so there is nothing to draw.'); return; }
+      edit(() => {
+        g.params.d = parsed.d;
+        g.params.viewBox = parsed.viewBox;
+        g.params.name = r.name;
+      });
+      log('Imported ' + r.name + '.');
+    });
+    irow.appendChild(imp);
+    if (g.params.d) {
+      const clr = el('button', 'mini', 'Clear');
+      clr.addEventListener('click', () => edit(() => { g.params.d = ''; g.params.name = ''; }));
+      irow.appendChild(clr);
+    }
+    body.appendChild(irow);
+  }
+
+  // A diagram spec that will not parse is drawn from the type's fallback rather than
+  // vanishing - a spec is invalid JSON for most of the time it is being typed. Saying so
+  // here is what stops that being mysterious.
+  if (typeof g.params.spec === 'string') {
+    let good = true;
+    try { JSON.parse(g.params.spec); } catch (e) { good = false; }
+    if (!good) {
+      body.appendChild(el('div', 'tc-hint fx-warn',
+        'That spec is not valid JSON yet, so the example layout is being drawn instead.'));
+    }
+  }
+  box.appendChild(body);
+
+  // Every numeric parameter is keyframable, and the keys live on `clip.graphic` - `Anim`
+  // only ever touches a `.keys` object, so the graphic is a keyframe holder for free,
+  // exactly as an `fx` entry is.
+  const numeric = Object.keys(d.params).filter((k) => typeof d.params[k] === 'number');
+  if (numeric.length) {
+    const dur = Math.max(0.001, clip.out - clip.in);
+    const keyHooks = Object.assign({}, rowHooks, {
+      dur,
+      getLocalTime: () => clamp(state.playhead - clip.start, 0, dur),
+      seekLocal: (t) => seek(clip.start + t),
+    });
+    box.appendChild(TextUI.section('gfxkeys', 'Keyframes', (kb) => {
+      kb.appendChild(el('div', 'tc-hint',
+        'Keys are times within the clip, so moving the clip moves its animation with it. ' +
+        'One key pins a value across the whole clip and the slider above it stops being read.'));
+      for (const k of numeric) {
+        const spec = Object.assign({}, Anim.propSpec(k), specForParam(d, k));
+        // `base` is what a FIRST key takes, and it must be the parameter's CURRENT value:
+        // `keyStrip()` promises that adding a key never moves anything.
+        if (typeof g.params[k] === 'number') spec.base = g.params[k];
+        kb.appendChild(TextUI.keyStrip(k, Object.assign({}, keyHooks, {
+          spec,
+          getKeys: () => Anim.trackFor(g, k, true),
+          clear: () => { Anim.trackFor(g, k, true).length = 0; Anim.pruneKeys(g); },
+          emptyHint: 'No keys - ' + k + ' holds the value above.',
+        })));
+      }
+    }));
+  }
+  return box;
 }
 
 function clipFxPanel(clip) {
@@ -2449,7 +2681,7 @@ function specForParam(def, key) {
  * Step 7's effect stack is what fills the registry.
  */
 function clipKeyPanel(clip) {
-  if (!clip || clip.kind === 'text') return null;
+  if (!clip || isCanvasClip(clip)) return null;
   const props = Anim.clipPropsFor(clip);
   if (!props.length) return null;
   const dur = clip.out - clip.in;
@@ -2509,7 +2741,7 @@ function singleUnit(sel) {
  * to put effects on.
  */
 function audioFxTarget(clip) {
-  if (!clip || clip.kind === 'text') return null;
+  if (!clip || isCanvasClip(clip)) return null;
   if (clip.kind === 'audio') return { clip, viaLink: null };
   if (clip.kind !== 'video' || !clip.linkId) return null;
   const mate = linkGroup(clip).find((x) => x.kind === 'audio');
@@ -3349,6 +3581,36 @@ function resizeCanvas() {
 /** A clip that puts pixels on the canvas through an element: footage or a still. */
 function isPictureClip(c) { return c && (c.kind === 'video' || c.kind === 'image'); }
 
+/**
+ * A clip the RENDERER draws rather than a decoder: a text card or a graphic.
+ *
+ * The two are the same kind of thing everywhere it matters - no `src`, no decoder, no
+ * `mediaDuration` ceiling, `in` pinned at 0, drawn by a paint-at-time-t function, and baked
+ * into their own cropped raw sequence rather than folded into a full-frame composite. So
+ * the places that used to ask `kind === 'text'` to mean "there is no source clock here"
+ * ask this instead, and a third such kind would be one entry rather than a sweep.
+ */
+const CANVAS_KINDS = new Set(['text', 'graphic']);
+function isCanvasClip(c) { return !!c && CANVAS_KINDS.has(c.kind); }
+
+/** The painter for a canvas-drawn clip: the one place `text` and `graphic` differ. */
+const CANVAS_PAINTERS = {
+  text: {
+    draw: (ctx, c, W, H, t, fd) => TextDraw.draw(ctx, c, W, H, t, fd),
+    animatedBounds: (ctx, c, W, H, step, a, b) => TextDraw.animatedBounds(ctx, c, W, H, step, a, b),
+    // What `buildJob()` carries the definition on, and what `jobCacheKey()` hashes instead
+    // of the scratch directory the bake leaves behind in its place.
+    ref: 'textClip', keyField: 'card', defField: 'card',
+    name: (c) => String(c.card.text).split(/\r?\n/)[0].slice(0, 24) || '(empty)',
+  },
+  graphic: {
+    draw: (ctx, c, W, H, t, fd) => Graphics.draw(ctx, c, W, H, t, fd),
+    animatedBounds: (ctx, c, W, H, step, a, b) => Graphics.animatedBounds(ctx, c, W, H, step, a, b),
+    ref: 'graphicClip', keyField: 'graphic', defField: 'graphic',
+    name: (c) => Graphics.title(c),
+  },
+};
+
 /** Picture clips under the playhead, topmost visible first. */
 function activeVideoClip() {
   const eps = 1e-6;
@@ -3398,7 +3660,7 @@ function layersAt(time) {
   for (const t of state.tracks) {
     if (t.type !== 'video' || t.hidden) continue;
     for (const c of t.clips) {
-      if (!isPictureClip(c) && c.kind !== 'text') continue;
+      if (!isPictureClip(c) && !isCanvasClip(c)) continue;
       const live = time >= c.start - eps && time < clipEnd(c) - eps;
       if (live || (atEnd && Math.abs(clipEnd(c) - dur) < 0.001)) out.push(c);
     }
@@ -3448,11 +3710,14 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
   let painted = false;
   for (const c of layers) {
     const local = time - c.start;
-    if (c.kind === 'text') {
-      // TextDraw scales its sizes off the frame height, so a smaller canvas gives a
-      // proportionally smaller card - the layout is identical, there is just less to paint.
+    if (isCanvasClip(c)) {
+      // Both painters scale every size off the frame, so a smaller canvas gives a
+      // proportionally smaller picture - the layout is identical, there is just less to
+      // paint. That is what makes the preview and the export the same image, and it is
+      // asserted at two resolutions by smoke-text2.js and smoke-graphics.js alike.
+      const painter = CANVAS_PAINTERS[c.kind];
       FX.render(cctx, W, H, c, local, fxSurface,
-        (tc) => TextDraw.draw(tc, c, W, H, local, frameDur), frameDur);
+        (tc) => painter.draw(tc, c, W, H, local, frameDur), frameDur);
       painted = true;
       continue;
     }
@@ -3693,8 +3958,8 @@ function drawPreview() {
   const trans = transitionAt();
   if (trans) {
     if (drawTransitionFrame(trans, P)) {
-      const overText = activeTextClips();
-      if (overText.length) drawTextLayer(overText);
+      const over = activeCanvasClips();
+      if (over.length) drawCanvasLayer(over);
       return;
     }
     // Frames not ready yet - fall through and show the plain clip rather than black.
@@ -3798,14 +4063,14 @@ function drawTransitionFrame(r, P) {
 }
 
 /** Paint the active text cards over the current video frame. */
-function drawTextLayer(texts) {
-  if (!texts || !texts.length) return;
+function drawCanvasLayer(clips) {
+  if (!clips || !clips.length) return;
   const P = previewSize();
   const frameDur = 1 / state.out.fps;
-  // TextDraw scales its sizes off the frame height, so a smaller canvas simply gives a
-  // proportionally smaller card - the layout is identical, there is just less to paint.
-  for (const tc of texts) {
-    TextDraw.draw(ctx, tc, P.w, P.h, state.playhead - tc.start, frameDur);
+  // Both painters scale every size off the frame, so a smaller canvas simply gives a
+  // proportionally smaller picture - the layout is identical, there is just less to paint.
+  for (const tc of clips) {
+    CANVAS_PAINTERS[tc.kind].draw(ctx, tc, P.w, P.h, state.playhead - tc.start, frameDur);
   }
 }
 
@@ -3895,7 +4160,7 @@ function syncMedia() {
   }
 
   for (const { clip, track } of allClips()) {
-    if (clip.kind === 'text') continue; // drawn from canvas, nothing to decode
+    if (isCanvasClip(clip)) continue; // drawn from canvas, nothing to decode
     if (clip.kind === 'image') {
       // A still has no clock to keep in step, only a picture to have ready. Warming it
       // on approach is the same reason video clips are pre-created: arriving at the cut
@@ -4222,6 +4487,13 @@ function splitAtPlayhead() {
         in: c.in + offset,
         linkId: c.linkId ? c.linkId + '_r' + Math.random().toString(36).slice(2, 5) : null,
       });
+      // `Object.assign` is shallow, so both halves would otherwise SHARE the one object
+      // that defines what a canvas clip draws - and editing either half would edit both
+      // until the next save and reload pulled them apart. Deep-copy the definition.
+      if (isCanvasClip(c)) {
+        const field = CANVAS_PAINTERS[c.kind].defField;
+        if (c[field]) right[field] = JSON.parse(JSON.stringify(c[field]));
+      }
       c.out = c.in + offset;
       track.clips.push(right);
       did = true;
@@ -4350,7 +4622,7 @@ function tightenOpts() {
  * effect chain does.
  */
 function tightenAudioFor(clip) {
-  if (!clip || clip.kind === 'text') return null;
+  if (!clip || isCanvasClip(clip)) return null;
   if (clip.kind === 'audio') return clip.src ? clip : null;
   if (clip.kind !== 'video' || !clip.linkId) return null;
   return linkGroup(clip).find((x) => x.kind === 'audio' && x.src) || null;
@@ -4461,7 +4733,7 @@ function removeTimelineSpan(a, b, cutIds) {
     const kept = [];
     for (const c of track.clips) {
       const s = c.start, e = clipEnd(c);
-      const cuttable = cutIds.has(c.id) && c.kind !== 'text';
+      const cuttable = cutIds.has(c.id) && !isCanvasClip(c);
 
       if (e <= a + E) { kept.push(c); continue; }                     // wholly before
       if (s >= b - E) { c.start -= amount; kept.push(c); continue; }  // wholly after
@@ -5257,6 +5529,7 @@ async function openProject(filePath) {
     for (const c of t.clips) {
       AudioFX.normalizeClip(c);
       FX.normalizeClip(c);
+      Graphics.normalizeClip(c);
       Tracker.normalizeClip(c);
       MagicMask.normalizeClip(c);
       // 'contain' or absent, and nothing else: an unknown value from a hand-edited or
@@ -5343,15 +5616,15 @@ function buildJob(outPath, range) {
         // it is the prompts that matter, and `MagicMask.digest()` carries no timeline
         // position, which is what lets a masked clip keep its cached render when it moves.
         masks: maskDigests(c),
-        visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
-          t.type === 'video' && !t.hidden,
+        visible: (isPictureClip(c) || isCanvasClip(c)) && t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
       };
-      if (c.kind === 'text') {
-        // A card's animation is timed from ITS start, not the clip's source in-point, so a
-        // range that begins mid-card has to bake from that point in the animation.
+      if (isCanvasClip(c)) {
+        // A card's or a graphic's animation is timed from ITS start, not from a source
+        // in-point it does not have, so a range beginning part-way through one has to bake
+        // from that point in the animation rather than from the top of it.
         entry.tStart = headCut;
-        entry.textClip = c;
+        entry[CANVAS_PAINTERS[c.kind].ref] = c;
       }
       clips.push(entry);
     }
@@ -5505,9 +5778,18 @@ function jobCacheKey(job) {
     // Identity, not pixels: two identical cuts of the same source must key the same.
     delete e.id;
     delete e.textClip;
+    delete e.graphicClip;
     delete e.transRef;
     delete e.seqDir; delete e.bx; delete e.by; delete e.bw; delete e.bh;
-    if (c.textClip) e.card = c.textClip.card;
+    // The DEFINITION, not the scratch directory the bake swapped it for. A job that has
+    // been baked carries a randomly named `seqDir` and no card; a job built fresh for the
+    // cache bar carries the card and no seqDir. Hashing the definition is what makes the
+    // two forms of the same content hash the same - and a graphic is exactly the same
+    // problem, so it goes through the same table rather than a second `if`.
+    for (const k of Object.keys(CANVAS_PAINTERS)) {
+      const P = CANVAS_PAINTERS[k];
+      if (c[P.ref]) e[P.keyField] = c[P.ref][P.defField];
+    }
     // Same rule one level down: an effect's `id` is an identity handed out by FX.create()
     // so the panel can address it, and it is different every time one is made. Leaving it
     // in would mean two clips wearing the same grade never shared a cached render, and
@@ -5849,7 +6131,8 @@ async function bakeComposite(job) {
     const a = job.rangeFrom + e.start;
     if (covered(a, a + (e.out - e.in))) {
       e.visible = false;
-      delete e.textClip;    // its card is in the composite; there is nothing left to bake
+      // Its card or graphic is in the composite already; nothing is left to bake for it.
+      for (const k of Object.keys(CANVAS_PAINTERS)) delete e[CANVAS_PAINTERS[k].ref];
     }
   }
   return dirs;
@@ -5895,12 +6178,19 @@ function hashString(str) {
 }
 
 async function bakeTextClips(job) {
-  const entries = job.clips.filter((c) => c.kind === 'text' && c.visible);
+  // Text cards and graphics bake IDENTICALLY - cropped to their painted bounds, raw RGBA,
+  // one sequence each, overlaid with eof_action=pass. The only things that differ between
+  // them are which function paints a frame and which field carries the definition, and
+  // both come out of `CANVAS_PAINTERS`. Two copies of this loop is the shape that drifts.
+  const entries = job.clips.filter((c) => isCanvasClip(c) && c.visible);
   const dirs = [];
-  if (!entries.length) {
-    for (const c of job.clips) delete c.textClip;
-    return dirs;
-  }
+  const dropRefs = () => {
+    // Not serialisable across IPC, and not needed once the frames are on disk.
+    for (const c of job.clips) {
+      for (const k of Object.keys(CANVAS_PAINTERS)) delete c[CANVAS_PAINTERS[k].ref];
+    }
+  };
+  if (!entries.length) { dropRefs(); return dirs; }
 
   const scratch = document.createElement('canvas');
   scratch.width = job.width; scratch.height = job.height;
@@ -5911,11 +6201,12 @@ async function bakeTextClips(job) {
   let done = 0;
 
   for (const e of entries) {
-    const clip = e.textClip;
-    // Only scan the part of the card this job actually shows.
+    const P = CANVAS_PAINTERS[e.kind];
+    const clip = e[P.ref];
+    // Only scan the part of the card or graphic this job actually shows.
     const scanFrom = e.tStart || 0;
     const scanTo = scanFrom + (e.out - e.in);
-    const bounds = TextDraw.animatedBounds(sctx, clip, job.width, job.height,
+    const bounds = P.animatedBounds(sctx, clip, job.width, job.height,
       1 / Math.min(job.fps, 20), scanFrom, scanTo);
     const cv = document.createElement('canvas');
     cv.width = bounds.w; cv.height = bounds.h;
@@ -5949,8 +6240,8 @@ async function bakeTextClips(job) {
     for (let i = 0; i < frames; i++) {
       cctx.clearRect(0, 0, bounds.w, bounds.h);
       cctx.save();
-      cctx.translate(-bounds.x, -bounds.y); // TextDraw works in full-frame coordinates
-      TextDraw.draw(cctx, clip, job.width, job.height, tStart + i / job.fps, 1 / job.fps);
+      cctx.translate(-bounds.x, -bounds.y); // both painters work in full-frame coordinates
+      P.draw(cctx, clip, job.width, job.height, tStart + i / job.fps, 1 / job.fps);
       cctx.restore();
 
       batch.set(cctx.getImageData(0, 0, bounds.w, bounds.h).data, inBatch * frameBytes);
@@ -5959,18 +6250,18 @@ async function bakeTextClips(job) {
 
       done++;
       if (i % 15 === 0 || i === frames - 1) {
-        setStatus('Baking text cards... ' + done + ' / ' + totalFrames + ' frames');
+        setStatus('Baking cards and graphics... ' + done + ' / ' + totalFrames + ' frames');
         $('#renderBar').style.width = (done / totalFrames * 100) + '%';
         await new Promise((r) => setTimeout(r, 0)); // let the UI repaint
       }
     }
     await flush();
     await window.api.textSeqDone(slot.dir, frames);
-    log('Baked ' + frames + ' text frames (' + bounds.w + 'x' + bounds.h + ') for "' +
-      String(clip.card.text).split(/\r?\n/)[0].slice(0, 24) + '".');
+    log('Baked ' + frames + ' ' + e.kind + ' frames (' + bounds.w + 'x' + bounds.h +
+      ') for "' + P.name(clip) + '".');
   }
 
-  for (const c of job.clips) delete c.textClip; // not serialisable across IPC, and not needed
+  dropRefs();
   return dirs;
 }
 
@@ -8573,6 +8864,7 @@ const SHORTCUTS = [
   ['Shift+R', 'Reset framing'],
   ['1 / 2 / 3', 'Frame left / center / right'],
   ['Ctrl+T', 'Add a text card at the playhead'],
+  ['Ctrl+G', 'Add another graphic of the type you added last'],
   ['T', 'Drop a transition on the nearest cut'],
   ['Double-click a cut', 'Drop a transition there'],
   ['Ctrl+D', 'Duplicate the selected clips'],
@@ -8605,6 +8897,9 @@ document.addEventListener('keydown', (e) => {
   else if (ctrl && e.key.toLowerCase() === 'l') { e.shiftKey ? unlinkSelected() : linkSelected(); }
   else if (ctrl && e.key.toLowerCase() === 'k') { splitAtPlayhead(); }
   else if (ctrl && e.key.toLowerCase() === 't') { addTextCard(); }
+  // Ctrl+G adds ANOTHER of whatever was added last, which is what building a sequence of
+  // step chips or a row of stat cards actually looks like. Plain G is Close gaps.
+  else if (ctrl && e.key.toLowerCase() === 'g') { addGraphicClip(lastGraphicType); }
   else if (ctrl && e.key.toLowerCase() === 'd') { duplicateSelected(); }
   else if (e.key === ' ' || e.key.toLowerCase() === 'k') { togglePlay(); }
   else if (e.key.toLowerCase() === 'j') { seek(state.playhead - 1); }
@@ -8674,6 +8969,41 @@ window.addEventListener('resize', renderRuler);
 // ---- text cards ----------------------------------------------------------
 
 $('#btnAddText').addEventListener('click', () => addTextCard());
+
+/**
+ * The "add a graphic" picker.
+ *
+ * A menu rather than a button because there are nineteen types across four groups, and it
+ * RESETS to its placeholder after each pick: leaving the last choice selected makes the
+ * control read as a mode ("we are in donut mode") when it is an action.
+ */
+(() => {
+  const sel = $('#addGraphic');
+  if (!sel) return;
+  const first = document.createElement('option');
+  first.value = '';
+  first.textContent = '+ Graphic...';
+  sel.appendChild(first);
+  for (const group of Graphics.GROUPS) {
+    const og = document.createElement('optgroup');
+    og.label = group;
+    for (const type of Graphics.TYPES) {
+      if (Graphics.DEFS[type].group !== group) continue;
+      const o = document.createElement('option');
+      o.value = type;
+      o.textContent = Graphics.DEFS[type].label;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+  sel.addEventListener('change', () => {
+    const type = sel.value;
+    sel.value = '';
+    if (!type) return;
+    lastGraphicType = type;
+    addGraphicClip(type);
+  });
+})();
 $('#btnAddTransition').addEventListener('click', () => addTransition(state.lastTransitionType));
 $('#btnDelTransition').addEventListener('click', () => deleteTransition());
 
