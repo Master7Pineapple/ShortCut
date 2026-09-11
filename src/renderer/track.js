@@ -1,0 +1,446 @@
+'use strict';
+/**
+ * Point motion tracking - the pure half.
+ *
+ * Loaded as a plain <script> global `Tracker` before `fx.js`, the way `anim.js` and
+ * `cursor.js` are, and as a CommonJS module for anything outside a window. It is also
+ * loaded INSIDE the worker: `track-worker.js` is concatenated onto this file, so the
+ * optical flow that solves a clip and the optical flow a smoke suite checks are the same
+ * source and can never drift. Nothing here touches the DOM, a canvas, ffmpeg or the
+ * filesystem - the frames arrive as luma arrays and the answers leave as numbers.
+ *
+ * WHAT LANDS ON A CLIP
+ *
+ *   clip.tracks = [ { id, name, res, rate, points: [{ t, x, y, c }], anchor: {t, x, y} } ]
+ *
+ * Plain JSON, absent until a tracker is dropped, and pruned away again with the last one -
+ * undo is `JSON.stringify` of the track list and the same shape is the `.scut` file.
+ *
+ *   `t`     SOURCE seconds, from the media file's first frame. The same axis `clip.screen`
+ *           and `clip.mouse` use, and for the same reason: it is the only timebase that
+ *           survives trimming, splitting and dragging the clip afterwards.
+ *   `x`,`y` fractions of the SOURCE frame, so they are independent of the resolution the
+ *           solve happened to run at and of the clip's pan/zoom framing.
+ *   `c`     confidence, 0..1. It is a first-class part of the data, not a diagnostic:
+ *           the timeline draws it, so a lost track is VISIBLE rather than silently wrong.
+ *
+ * OCCLUSION HOLDS, IT NEVER TELEPORTS.
+ *
+ * When the window a point sits in stops looking like the window it was anchored on -
+ * something passed in front of it, it left the frame, it dissolved - the residual rises,
+ * confidence falls, and the solver keeps the LAST GOOD POSITION rather than accepting
+ * whatever the flow guessed. A tracker that jumps to the other side of the screen for
+ * six frames and comes back is worse than one that sits still and says so: the first
+ * throws a callout across the picture, the second draws a dip on the timeline.
+ *
+ * THE MEASUREMENT, which the README carries.
+ *
+ * Plain JS, no WASM. `smoke-track.js` times the kernel on a real solve and prints it;
+ * those numbers are why there is no WASM build in this file. A handful of points at
+ * preview resolution costs single-digit milliseconds a frame, and the seek that produced
+ * the frame costs far more - so the flow is not what makes a solve take time.
+ */
+(function () {
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, isFinite(Number(v)) ? Number(v) : lo));
+  const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
+  const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
+  const r5 = (x) => Math.round((Number(x) || 0) * 1e5) / 1e5;
+
+  /** Every default in one place, so the panel, the solver and the suite agree. */
+  const DEFAULTS = {
+    win: 15,          // odd; the side of the correlation window in pixels, at every level
+    levels: 3,        // pyramid levels including the full-resolution one
+    iters: 14,        // Newton steps per level
+    eps: 0.008,       // stop when a step moves less than this many pixels
+    minEig: 0.0015,   // below this the window has no texture to track (a flat wall)
+    resid: 22,        // luma RMS residual, in levels of 255, that reads as "lost"
+    minConf: 0.35,    // below this the point is HELD rather than moved
+    res: 480,         // the long side the solve runs at, in pixels
+    rate: 30,         // samples per second of source
+  };
+
+  // ------------------------------------------------------------------ the kernel
+
+  /** Luma from RGBA bytes. One Float32 per pixel, 0..255. */
+  function gray(rgba, w, h) {
+    const out = new Float32Array(w * h);
+    for (let i = 0, p = 0; i < out.length; i++, p += 4) {
+      out[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+    }
+    return out;
+  }
+
+  /** Halve an image with a 2x2 box. Cheap, and its blur is what makes the level useful. */
+  function half(d, w, h) {
+    const w2 = Math.max(1, w >> 1), h2 = Math.max(1, h >> 1);
+    const out = new Float32Array(w2 * h2);
+    for (let y = 0; y < h2; y++) {
+      const y0 = 2 * y, y1 = Math.min(h - 1, y0 + 1);
+      for (let x = 0; x < w2; x++) {
+        const x0 = 2 * x, x1 = Math.min(w - 1, x0 + 1);
+        out[y * w2 + x] = 0.25 * (d[y0 * w + x0] + d[y0 * w + x1] + d[y1 * w + x0] + d[y1 * w + x1]);
+      }
+    }
+    return { d: out, w: w2, h: h2 };
+  }
+
+  /** `[{d,w,h}, ...]`, index 0 full resolution and each one after it half the last. */
+  function buildPyramid(d, w, h, levels) {
+    const pyr = [{ d, w, h }];
+    const n = Math.max(1, Math.min(6, Math.round(num(levels, DEFAULTS.levels))));
+    for (let i = 1; i < n; i++) {
+      const prev = pyr[i - 1];
+      if (prev.w < 8 || prev.h < 8) break;
+      pyr.push(half(prev.d, prev.w, prev.h));
+    }
+    return pyr;
+  }
+
+  /** Bilinear sample, clamped at the edges so a window may hang off the frame. */
+  function sample(im, x, y) {
+    const w = im.w, d = im.d;
+    const fx = clamp(x, 0, w - 1.001), fy = clamp(y, 0, im.h - 1.001);
+    const x0 = fx | 0, y0 = fy | 0;
+    const ax = fx - x0, ay = fy - y0;
+    const i = y0 * w + x0;
+    const a = d[i], b = d[i + 1], c = d[i + w], e = d[i + w + 1];
+    return a + (b - a) * ax + (c - a) * ay + (a - b - c + e) * ax * ay;
+  }
+
+  /**
+   * One point, one pyramid level. Returns the refined displacement and what it cost.
+   *
+   * Standard Lucas-Kanade: the spatial gradient matrix of the PREVIOUS window is built
+   * once, and each iteration only re-samples the next frame. The 2x2 solve is by hand -
+   * it is two numbers, and a matrix library here would cost more than the flow does.
+   */
+  function lkLevel(prev, next, px, py, gx, gy, o) {
+    const hw = (Math.max(3, o.win | 0) - 1) >> 1;
+    let Gxx = 0, Gxy = 0, Gyy = 0;
+    const n = (2 * hw + 1) * (2 * hw + 1);
+    const Ix = new Float32Array(n), Iy = new Float32Array(n), I0 = new Float32Array(n);
+    let k = 0;
+    for (let j = -hw; j <= hw; j++) {
+      for (let i = -hw; i <= hw; i++, k++) {
+        const x = px + i, y = py + j;
+        const ix = 0.5 * (sample(prev, x + 1, y) - sample(prev, x - 1, y));
+        const iy = 0.5 * (sample(prev, x, y + 1) - sample(prev, x, y - 1));
+        Ix[k] = ix; Iy[k] = iy; I0[k] = sample(prev, x, y);
+        Gxx += ix * ix; Gxy += ix * iy; Gyy += iy * iy;
+      }
+    }
+    // The smaller eigenvalue of G, normalised by the window size and by 255^2, is
+    // "how much texture is there to track" - the Shi-Tomasi score. A flat window has
+    // none, and every displacement fits it equally well, which is how a tracker ends up
+    // sliding along a gradient or wandering across a plain background.
+    const tr = (Gxx + Gyy) / 2, det = Gxx * Gyy - Gxy * Gxy;
+    const disc = Math.max(0, tr * tr - det);
+    const minEig = (tr - Math.sqrt(disc)) / n / (255 * 255);
+    let dx = gx, dy = gy;
+    if (!(det > 1e-7)) return { dx, dy, minEig, rms: Infinity };
+
+    let rms = Infinity;
+    for (let it = 0; it < Math.max(1, o.iters | 0); it++) {
+      let bx = 0, by = 0, ss = 0;
+      k = 0;
+      for (let j = -hw; j <= hw; j++) {
+        for (let i = -hw; i <= hw; i++, k++) {
+          const dI = I0[k] - sample(next, px + dx + i, py + dy + j);
+          bx += dI * Ix[k]; by += dI * Iy[k]; ss += dI * dI;
+        }
+      }
+      rms = Math.sqrt(ss / n);
+      const ux = (Gyy * bx - Gxy * by) / det;
+      const uy = (Gxx * by - Gxy * bx) / det;
+      dx += ux; dy += uy;
+      if (ux * ux + uy * uy < o.eps * o.eps) break;
+    }
+    return { dx, dy, minEig, rms };
+  }
+
+  /**
+   * Track points from one frame to the next, coarse to fine.
+   *
+   * `pts` are pixel positions in the PREVIOUS frame, at full analysis resolution. What
+   * comes back is the position in the next frame plus a confidence, and the two are
+   * independent answers: a point can be found precisely in a window with no texture
+   * (high precision, low confidence), and a well-textured window can go behind something
+   * (the residual rises, and the confidence says so).
+   */
+  function trackPoints(prevPyr, nextPyr, pts, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const levels = Math.min(prevPyr.length, nextPyr.length);
+    return pts.map((p) => {
+      let gx = 0, gy = 0, minEig = 0, rms = 0;
+      for (let l = levels - 1; l >= 0; l--) {
+        const s = 1 / (1 << l);
+        const r = lkLevel(prevPyr[l], nextPyr[l], p.x * s, p.y * s, gx, gy, o);
+        gx = r.dx; gy = r.dy; minEig = r.minEig; rms = r.rms;
+        if (l > 0) { gx *= 2; gy *= 2; }
+      }
+      // Two independent ways to be wrong, multiplied: nothing to track, and a window
+      // that no longer looks like the one we anchored on.
+      const tex = clamp(minEig / o.minEig, 0, 1);
+      const fit = clamp(1 - rms / Math.max(1, o.resid), 0, 1);
+      const x = p.x + gx, y = p.y + gy;
+      const inFrame = x >= 0 && y >= 0 && x <= prevPyr[0].w - 1 && y <= prevPyr[0].h - 1;
+      return {
+        x, y,
+        c: isFinite(x) && isFinite(y) && inFrame ? clamp(tex * fit, 0, 1) : 0,
+      };
+    });
+  }
+
+  /**
+   * One step of a solve, in the coordinates the DATA uses.
+   *
+   * The worker holds the previous pyramid and the point it is carrying; this is the rule
+   * that turns a flow answer into a sample: below `minConf` the point is HELD at its last
+   * good position and the low confidence is recorded. Occlusion therefore costs a flat
+   * stretch on the timeline and a visible dip, never a teleport.
+   *
+   * Pure and frame-size agnostic, so the suite can drive it with synthetic pyramids.
+   */
+  function stepPoint(prevPyr, nextPyr, held, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const r = trackPoints(prevPyr, nextPyr, [{ x: held.x, y: held.y }], o)[0];
+    if (!(r.c >= o.minConf)) return { x: held.x, y: held.y, c: r.c, held: true };
+    return { x: r.x, y: r.y, c: r.c, held: false };
+  }
+
+  // ------------------------------------------------------------- the data model
+
+  let seq = 0;
+  const uid = () => 'tk' + Date.now().toString(36) + (seq++).toString(36);
+
+  /** A fresh, empty track anchored at a source time and a source-fraction point. */
+  function makeTrack(t, x, y, o) {
+    const opt = Object.assign({}, DEFAULTS, o || {});
+    return {
+      id: uid(),
+      name: (o && o.name) ? String(o.name) : 'Track',
+      res: Math.round(opt.res), rate: Math.round(opt.rate), win: Math.round(opt.win),
+      anchor: { t: r4(t), x: r5(x), y: r5(y) },
+      points: [{ t: r4(t), x: r5(x), y: r5(y), c: 1 }],
+    };
+  }
+
+  const hasTracks = (clip) => !!(clip && Array.isArray(clip.tracks) && clip.tracks.length);
+
+  function trackById(clip, id) {
+    if (!hasTracks(clip)) return null;
+    return clip.tracks.find((t) => t && t.id === id) || null;
+  }
+
+  /**
+   * Fill a clip's tracks in and drop anything malformed. Absent stays absent, and an
+   * empty array is deleted - a project that tracked nothing serialises exactly as it did
+   * before this existed, which is the rule `clip.fx` and `clip.keys` already live by.
+   */
+  function normalizeClip(clip) {
+    if (!clip || !Array.isArray(clip.tracks)) return;
+    clip.tracks = clip.tracks
+      .filter((t) => t && Array.isArray(t.points) && t.points.length)
+      .map((t) => {
+        if (!t.id) t.id = uid();
+        t.name = String(t.name || 'Track');
+        t.res = Math.round(num(t.res, DEFAULTS.res));
+        t.rate = Math.round(num(t.rate, DEFAULTS.rate));
+        t.points = t.points
+          .filter((p) => p && isFinite(Number(p.t)) && isFinite(Number(p.x)) && isFinite(Number(p.y)))
+          .map((p) => ({ t: r4(p.t), x: r5(p.x), y: r5(p.y), c: clamp(num(p.c, 1), 0, 1) }))
+          .sort((a, b) => a.t - b.t);
+        const a = t.anchor || t.points[0];
+        t.anchor = { t: r4(a.t), x: r5(a.x), y: r5(a.y) };
+        return t;
+      })
+      .filter((t) => t.points.length);
+    if (!clip.tracks.length) delete clip.tracks;
+  }
+
+  /**
+   * Where a track is at a SOURCE time - linearly between its samples, held at both ends.
+   *
+   * Confidence takes the LOWER of the two neighbours rather than interpolating it. A
+   * value halfway between a good sample and a lost one is not a half-good position; it is
+   * a position one of whose ends is wrong, and the caller has to know that.
+   */
+  function sampleAt(track, t) {
+    if (!track || !Array.isArray(track.points) || !track.points.length) return null;
+    const p = track.points;
+    const tt = num(t, 0);
+    if (tt <= p[0].t) return { x: p[0].x, y: p[0].y, c: clamp(num(p[0].c, 1), 0, 1) };
+    const last = p[p.length - 1];
+    if (tt >= last.t) return { x: last.x, y: last.y, c: clamp(num(last.c, 1), 0, 1) };
+    let lo = 0, hi = p.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (p[m].t <= tt) lo = m; else hi = m; }
+    const a = p[lo], b = p[hi];
+    const span = b.t - a.t;
+    const f = span > 1e-9 ? (tt - a.t) / span : 0;
+    return {
+      x: a.x + (b.x - a.x) * f,
+      y: a.y + (b.y - a.y) * f,
+      c: Math.min(clamp(num(a.c, 1), 0, 1), clamp(num(b.c, 1), 0, 1)),
+    };
+  }
+
+  /** A named track's position on a clip at a source time, or null. */
+  function positionAt(clip, id, t) {
+    return sampleAt(trackById(clip, id), t);
+  }
+
+  /**
+   * Re-anchoring: the solved past is kept, the solved future is thrown away.
+   *
+   * Dragging the tracker onto the right pixel on frame 200 is a statement about frame 200
+   * and everything after it. Frames 0-199 were solved either from the original anchor or
+   * from a correction the author was already happy with, and re-solving them would undo
+   * work that was right - which is the behaviour that makes people stop correcting tracks
+   * and start re-tracking from scratch. So this truncates at `t` and hands back the track
+   * for the solver to fill FORWARD of it.
+   */
+  function reanchorAt(track, t, x, y) {
+    if (!track) return null;
+    const tt = r4(t);
+    track.points = (track.points || []).filter((p) => p.t < tt - 1e-6);
+    track.points.push({ t: tt, x: r5(x), y: r5(y), c: 1 });
+    track.points.sort((a, b) => a.t - b.t);
+    track.anchor = { t: tt, x: r5(x), y: r5(y) };
+    return track;
+  }
+
+  /** Merge a solved run in, replacing samples at the same times. Keeps `points` sorted. */
+  function mergePoints(track, pts) {
+    if (!track || !Array.isArray(pts) || !pts.length) return track;
+    const by = new Map();
+    for (const p of track.points || []) by.set(r4(p.t), p);
+    for (const p of pts) {
+      by.set(r4(p.t), { t: r4(p.t), x: r5(p.x), y: r5(p.y), c: clamp(num(p.c, 1), 0, 1) });
+    }
+    track.points = Array.from(by.values()).sort((a, b) => a.t - b.t);
+    return track;
+  }
+
+  /** The lowest confidence anywhere in a source-time span - what the lane strip draws. */
+  function worstIn(track, from, to) {
+    if (!track || !track.points || !track.points.length) return 1;
+    let worst = 1;
+    for (const p of track.points) {
+      if (p.t < from - 1e-6 || p.t > to + 1e-6) continue;
+      const c = clamp(num(p.c, 1), 0, 1);
+      if (c < worst) worst = c;
+    }
+    return worst;
+  }
+
+  // ----------------------------------------------------------------- the binding
+
+  /**
+   * SOURCE fractions to FRAME fractions, through the clip's own pan/zoom framing.
+   *
+   * A track is measured against the file, so it has to go through the crop to become a
+   * place on the finished 9:16 picture - exactly the conversion `Cursor.mapper()` does
+   * for screen telemetry, and it reuses that crop rather than keeping a second copy of
+   * the framing maths. Without `Cursor` (a bare module load) it falls back inline, so the
+   * suite can check this file on its own.
+   */
+  function frameMap(clip, aspect) {
+    const A = Math.max(0.01, num(aspect, 9 / 16));
+    const C = (typeof Cursor !== 'undefined' && Cursor) ||
+      (typeof self !== 'undefined' && self.Cursor) || null;
+    let crop;
+    if (C && C.mapper) crop = C.mapper(clip, A, 1).crop;
+    else {
+      const c = clip || {};
+      const sw = num(c.srcW, 0) || A, sh = num(c.srcH, 0) || 1;
+      const zoom = Math.max(0.01, num(c.zoom, 1));
+      const cw = Math.min(sw, sh * A) / zoom, ch = Math.min(sh, sw / A) / zoom;
+      crop = {
+        x: (sw - cw) * clamp(num(c.panX, 0.5), 0, 1) / sw,
+        y: (sh - ch) * clamp(num(c.panY, 0.5), 0, 1) / sh,
+        w: cw / sw, h: ch / sh,
+      };
+    }
+    const fn = (x, y) => ({
+      x: (num(x, 0) - crop.x) / Math.max(1e-9, crop.w),
+      y: (num(y, 0) - crop.y) / Math.max(1e-9, crop.h),
+    });
+    fn.crop = crop;
+    return fn;
+  }
+
+  /**
+   * A binding resolved: where the bound thing should sit, as a fraction of the FRAME.
+   *
+   * `bind = { track, offX, offY }` and nothing else. `tSource` is source seconds, the
+   * axis the track lives on; the caller converts from clip-local time, because the clip
+   * is the only thing that knows its own `in`.
+   *
+   * The OFFSET IS NOT APPLIED HERE. What comes back is where the tracked pixel is, and
+   * nothing else. An offset means something different to each consumer - to a spotlight
+   * it moves the lit shape, to a bound `transform` it moves the whole picture the other
+   * way - so applying it here would have to pick one of those and be wrong for the rest.
+   * `FX.DEFS[type].bind.apply()` takes the offset and knows which space it is in.
+   *
+   * A binding to a track this clip does not carry answers `null`, and every caller then
+   * draws its static parameters instead. That is the same degradation contract the
+   * telemetry effects keep: a clip whose track was deleted, or that was carried into
+   * another project without one, keeps working and stops following.
+   */
+  function bindPos(clip, bind, tSource, aspect) {
+    if (!bind || !bind.track) return null;
+    const s = positionAt(clip, bind.track, tSource);
+    if (!s) return null;
+    const m = frameMap(clip, aspect);
+    const p = m(s.x, s.y);
+    return { x: p.x, y: p.y, c: s.c };
+  }
+
+  /**
+   * What a bound effect's pixels depend on, for the render cache key.
+   *
+   * The samples themselves, reduced: a count, the span, and a checksum of the numbers.
+   * The clip's timeline POSITION is not in it and must never be - a bound effect draws
+   * the same pixels wherever the clip sits, exactly like every other effect. Same shape
+   * and same reason as `mouseDigest()` in app.js.
+   */
+  function digest(clip, id) {
+    const t = trackById(clip, id);
+    if (!t || !t.points.length) return undefined;
+    let sum = 0;
+    for (const p of t.points) sum = (sum + p.t * 7919 + p.x * 104729 + p.y * 15485863 + p.c) % 1e9;
+    return {
+      n: t.points.length,
+      t0: t.points[0].t, t1: t.points[t.points.length - 1].t,
+      s: Math.round(sum * 1e3) / 1e3,
+    };
+  }
+
+  /**
+   * The disk cache key for a solve, which is why a solved clip opens already solved.
+   *
+   * Everything that changes the ANSWER: the range, the anchor and the solver's settings,
+   * over a file the main process keys by path + size + mtime the way it keys waveforms.
+   * Not the clip's id, not its position, not its name - the same file tracked from the
+   * same pixel gives the same track in every project that holds it.
+   */
+  function cacheKey(spec) {
+    const s = spec || {};
+    return [
+      'v1', r4(s.t0), r4(s.t1), r5(s.ax), r5(s.ay), r4(s.anchorT),
+      Math.round(num(s.res, DEFAULTS.res)), Math.round(num(s.rate, DEFAULTS.rate)),
+      Math.round(num(s.win, DEFAULTS.win)), Math.round(num(s.levels, DEFAULTS.levels)),
+    ].join(':');
+  }
+
+  const API = {
+    DEFAULTS,
+    gray, buildPyramid, trackPoints, stepPoint, sample,
+    makeTrack, normalizeClip, hasTracks, trackById,
+    sampleAt, positionAt, reanchorAt, mergePoints, worstIn,
+    frameMap, bindPos, digest, cacheKey,
+  };
+  if (typeof module !== 'undefined' && module.exports) module.exports = API;
+  else if (typeof window !== 'undefined') window.Tracker = API;
+  else if (typeof self !== 'undefined') self.Tracker = API;
+})();

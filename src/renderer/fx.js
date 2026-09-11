@@ -251,6 +251,23 @@
     transform: {
       label: 'Transform',
       params: { x: 0, y: 0, scale: 1, rotate: 0, opacity: 1, anchorX: 0.5, anchorY: 0.5 },
+      // Bound, this is a CAMERA: the picture is panned so that the tracked pixel sits at
+      // the frame centre plus the offset, which is what makes a zoom hold a moving button
+      // in the middle of the shot. The algebra is the draw below, solved for `x`:
+      // the point lands at anchor + (point - anchor) * scale + offset, so pinning it to
+      // `want` gives x = want - anchorX * (1 - s) - s * point. Doing it any other way -
+      // a plain `x = -point` - drifts the moment `scale` is anything but 1, and scale is
+      // exactly what a tracked push-in animates.
+      bind: {
+        label: 'Follow a track',
+        hint: 'Pans the picture so the tracked point sits at the centre of the frame, ' +
+          'plus the offset. Scale and rotation still apply on top.',
+        apply(p, pos, off) {
+          const s = clamp(p.scale, 0.001, 64);
+          p.x = (0.5 + (Number(off.x) || 0)) - clamp(p.anchorX, -4, 5) * (1 - s) - s * pos.x;
+          p.y = (0.5 + (Number(off.y) || 0)) - clamp(p.anchorY, -4, 5) * (1 - s) - s * pos.y;
+        },
+      },
       schema: [
         { path: 'params.x', label: 'Offset X', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
         { path: 'params.y', label: 'Offset Y', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
@@ -1107,6 +1124,19 @@
 
     spotlight: {
       label: 'Spotlight',
+      // Bound, the LIT SHAPE follows and the picture stays still - the opposite of a
+      // bound transform, and the reason each type owns its own `apply()`. `x`/`y` are
+      // the shape's top-left corner, so the tracked point is centred in it rather than
+      // sat in its corner; keyframing `w`/`h` still resizes the light around the point.
+      bind: {
+        label: 'Follow a track',
+        hint: 'Centres the lit shape on the tracked point, plus the offset. ' +
+          'Size, feather and dim still come from the sliders.',
+        apply(p, pos, off) {
+          p.x = pos.x + (Number(off.x) || 0) - (Number(p.w) || 0) / 2;
+          p.y = pos.y + (Number(off.y) || 0) - (Number(p.h) || 0) / 2;
+        },
+      },
       params: {
         shape: 'rect',
         x: 0.2, y: 0.35, w: 0.6, h: 0.3,
@@ -1228,6 +1258,20 @@
 
     cutout: {
       label: 'Cutout',
+      // Bound, the SOURCE REGION follows and the float stays where it was placed. That is
+      // the callout: the element being lifted moves down a scrolling page, and the
+      // magnified copy sits still in the corner where the viewer is already looking.
+      // Binding the destination instead would fling the float around the frame, which is
+      // the one thing a callout must not do.
+      bind: {
+        label: 'Follow a track',
+        hint: 'Centres the lifted region on the tracked point, plus the offset. Where the ' +
+          'float is drawn does not move.',
+        apply(p, pos, off) {
+          p.sx = pos.x + (Number(off.x) || 0) - (Number(p.sw) || 0) / 2;
+          p.sy = pos.y + (Number(off.y) || 0) - (Number(p.sh) || 0) / 2;
+        },
+      },
       params: {
         sx: 0.1, sy: 0.4, sw: 0.35, sh: 0.16,
         x: 0.5, y: 0.68,
@@ -1547,6 +1591,10 @@
   function timeVarying(entry) {
     const d = DEFS[entry.type];
     if (d && d.timeVarying) return true;
+    // A binding is an animation the effect did not have to be keyed to have: the tracked
+    // point moves every frame, so a bound effect paints a different picture at every
+    // instant and the shutter has something real to average.
+    if (entry.bind && entry.bind.track && d && d.bind) return true;
     const k = entry.keys;
     if (!k) return false;
     for (const prop of Object.keys(k)) if (k[prop] && k[prop].length > 1) return true;
@@ -1589,7 +1637,7 @@
       const sub = clean(surface, 'fxMbSub', W, H);
       sub.c.drawImage(before, 0, 0);
       const subL = { cv: sub.cv, c: sub.c, W, H, surface, base: L.base };
-      DEFS[entry.type].draw(subL, paramsAt(entry, ti), ti, entry, clip);
+      DEFS[entry.type].draw(subL, paramsAt(entry, ti, clip, W, H), ti, entry, clip);
       reset(sub.c);
       sctx.drawImage(sub.cv, 0, 0);
     }, surface, 'fxMb');
@@ -1641,6 +1689,28 @@
     } else if (fx.mblur) {
       delete fx.mblur;
     }
+    /*
+     * The binding. Plain JSON like everything else that lands on a clip, and absent by
+     * default - an effect that follows nothing serialises exactly as it did before this
+     * existed. A bind on a type that cannot be bound is DROPPED rather than kept: the
+     * panel offers it only where `DEFS[type].bind` exists, so one here came from an
+     * older or hand-edited file and would silently do nothing.
+     *
+     * A bind naming a track is NOT checked against the clip here. A clip can be carried
+     * into a project without its track, or the track can be deleted and tracked again,
+     * and the binding must survive both - `Tracker.bindPos()` answers null and the
+     * effect draws its static parameters, which is the degradation contract.
+     */
+    if (fx.bind && typeof fx.bind === 'object' && fx.bind.track && d.bind) {
+      fx.bind = {
+        track: String(fx.bind.track),
+        offX: isFinite(Number(fx.bind.offX)) ? Number(fx.bind.offX) : 0,
+        offY: isFinite(Number(fx.bind.offY)) ? Number(fx.bind.offY) : 0,
+      };
+    } else if (fx.bind) {
+      delete fx.bind;
+    }
+
     // A track for a parameter that no longer exists would evaluate into nothing. Dropping
     // it keeps `keys` honest and keeps the saved file free of dead weight - and `keys`
     // itself goes when the last track does, so an unkeyed effect serialises without it.
@@ -1676,11 +1746,34 @@
     return Anim.valueAt(entry, key, t, stat);
   }
 
-  /** The whole animated parameter set for one effect at `t`. */
-  function paramsAt(entry, t) {
+  /**
+   * The whole animated parameter set for one effect at `t`, with any binding applied.
+   *
+   * A BINDING IS THE LAST WORD, and it is applied after the keyframes on purpose. The
+   * parameters a bind writes are positions, and a position that is both keyed and tracked
+   * is a contradiction the panel says out loud rather than averaging: what the author
+   * asked for is "follow the element", and a key from before the track existed must not
+   * quietly drag the callout off it. Everything the bind does NOT write - size, feather,
+   * scale, opacity - keyframes exactly as it always did, which is what lets a tracked
+   * spotlight open up while it follows.
+   *
+   * `clip` and `W`/`H` are optional: without them nothing is bound and the static, keyed
+   * values come back, which is what every caller that is not drawing a frame wants.
+   */
+  function paramsAt(entry, t, clip, W, H) {
     const d = DEFS[entry.type];
     const out = {};
     for (const k of Object.keys(d.params)) out[k] = paramAt(entry, k, t);
+    const b = entry.bind;
+    if (b && b.track && d.bind && clip) {
+      const TK = (typeof Tracker !== 'undefined' && Tracker) ||
+        (typeof window !== 'undefined' && window.Tracker) || null;
+      // Clip-local time to SOURCE time: the track is measured against the file, which is
+      // the only axis that survives trimming and dragging the clip.
+      const pos = TK && TK.bindPos(clip, b, (Number(clip.in) || 0) + t,
+        (Number(W) || 9) / (Number(H) || 16));
+      if (pos) d.bind.apply(out, pos, { x: b.offX, y: b.offY });
+    }
     return out;
   }
 
@@ -1720,7 +1813,7 @@
         // see `timeVarying()`.
         const mb = mblurOf(e);
         if (mb && timeVarying(e)) drawBlurred(L, e, t, clip, frameDur, mb);
-        else DEFS[e.type].draw(L, paramsAt(e, t), t, e, clip);
+        else DEFS[e.type].draw(L, paramsAt(e, t, clip, W, H), t, e, clip);
       } catch (err) {
         if (typeof console !== 'undefined') console.warn('FX ' + e.type + ' failed:', err);
       }
@@ -1755,8 +1848,23 @@
     return reach > margin ? 'pushed-out' : null;
   }
 
+  /**
+   * Which parameters a binding takes over on this effect, so the panel can say so on the
+   * strips it has made pointless. Derived by RUNNING the type's own `apply()` over a
+   * marked parameter set rather than by listing names a second time: a list here and a
+   * write there is exactly the pair that drifts, and the symptom would be a keyframe
+   * strip that looks live and moves nothing.
+   */
+  function boundParams(type) {
+    const d = DEFS[type];
+    if (!d || !d.bind) return [];
+    const probe = Object.assign({}, d.params);
+    d.bind.apply(probe, { x: 0.37, y: 0.61 }, { x: 0, y: 0 });
+    return Object.keys(d.params).filter((k) => probe[k] !== d.params[k]);
+  }
+
   const API = {
-    DEFS, TYPES,
+    DEFS, TYPES, boundParams,
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
     pointerImage, preloadImages,

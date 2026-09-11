@@ -253,6 +253,15 @@ select, input[type=number], input[type=text] {
   pointer-events: none; opacity: .85;
 }
 
+/* The confidence strip of every solved motion track on the clip, along the bottom edge.
+   A lost track is the one thing a tracker must never hide, so it is on the lane itself
+   rather than behind a panel. */
+.clip .trackconf {
+  position: absolute; left: 0; bottom: 1px; width: 100%; height: 4px;
+  pointer-events: none;
+}
+.trk-box .trk-row { border-top: 1px solid var(--line); padding: 6px 0 4px; }
+
 /* ---- the QuickBin ------------------------------------------------------ */
 #binBar { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px; background: var(--panel); }
 #quickBin {

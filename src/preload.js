@@ -23,6 +23,11 @@ contextBridge.exposeInMainWorld('api', {
   waveRead: (p) => ipcRenderer.invoke('wave:read', p),
   waveWrite: (p, peaks, duration) => ipcRenderer.invoke('wave:write', { path: p, peaks, duration }),
 
+  // Solved motion tracks, cached on disk by path + size + mtime + the solve's key -
+  // the same rules the waveform cache keeps, for the same reason.
+  trackRead: (p, key) => ipcRenderer.invoke('track:read', { path: p, key }),
+  trackWrite: (p, key, points) => ipcRenderer.invoke('track:write', { path: p, key, points }),
+
   // Silence spans for Tighten, cached in main by path + size + mtime + noise floor.
   analyzeSilence: (p, noise) => ipcRenderer.invoke('analyze:silence', { path: p, noise }),
 

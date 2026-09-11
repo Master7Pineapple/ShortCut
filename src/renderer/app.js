@@ -1088,6 +1088,7 @@ function renderLanes() {
         '<div class="label">' + escapeHtml(label) + '</div>' +
         '<div class="handle r"></div>';
       if (c.kind === 'audio') drawClipWave(el, c);
+      if (Tracker.hasTracks(c)) drawClipTrackConf(el, c);
       lane.appendChild(el);
     }
 
@@ -1149,6 +1150,55 @@ function drawClipWave(el, c) {
     waveCanvases.set(key, cv);
   }
   el.insertBefore(cv, el.firstChild);
+}
+
+/**
+ * The confidence strip: where a solved track is sure, and where it is not.
+ *
+ * This is half of what makes tracking usable rather than merely present. A track that
+ * lost its point looks exactly like one that did not - the callout is simply in the wrong
+ * place for forty frames - so confidence is drawn along the clip, at the time it applies
+ * to, and a dip is visible without opening anything. The worst track wins each column:
+ * one lost point is a problem even when three others are fine.
+ *
+ * Painted into a canvas keyed like the waveform's, so dragging a clip moves the strip
+ * rather than repainting it on every mouse move.
+ */
+const trackConfCanvases = new Map();
+function drawClipTrackConf(el, c) {
+  const wPx = Math.round(Math.max(6, (c.out - c.in) * state.pxPerSec));
+  if (wPx < 12) return;
+  const w = Math.min(WAVE_MAX_PX, wPx);
+  const h = 4;
+  const key = c.id + '|' + Tracker.hasTracks(c) + '|' + c.in.toFixed(4) + '|' + c.out.toFixed(4) +
+    '|' + w + '|' + (c.tracks || []).map((t) => t.id + ':' + t.points.length).join(',');
+  let cv = trackConfCanvases.get(key);
+  if (!cv) {
+    cv = document.createElement('canvas');
+    cv.className = 'trackconf';
+    cv.width = w;
+    cv.height = h;
+    const g = cv.getContext('2d');
+    const per = (c.out - c.in) / w;
+    for (let x = 0; x < w; x++) {
+      const t0 = c.in + x * per, t1 = t0 + per;
+      let worst = 1;
+      for (const tk of c.tracks) {
+        const s = Tracker.sampleAt(tk, (t0 + t1) / 2);
+        const span = Math.min(Tracker.worstIn(tk, t0, t1), s ? s.c : 1);
+        if (span < worst) worst = span;
+      }
+      // Sure is quiet, lost is loud. A strip that shouted at a good track would be
+      // ignored by the time it mattered.
+      g.fillStyle = worst < Tracker.DEFAULTS.minConf
+        ? 'rgba(224,83,63,.95)'
+        : 'rgba(120,220,190,' + (0.18 + 0.35 * (1 - worst)).toFixed(3) + ')';
+      g.fillRect(x, 0, 1, h);
+    }
+    if (trackConfCanvases.size > 300) trackConfCanvases.clear();
+    trackConfCanvases.set(key, cv);
+  }
+  el.appendChild(cv);
 }
 
 function escapeHtml(s) {
@@ -1616,6 +1666,10 @@ function renderInspector() {
   const fxTarget = audioFxTarget(c);
   if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   if (tightenAudioFor(c)) box.appendChild(tightenPanel());
+  // Above the stack, because the stack READS it: a binding row on an effect is only
+  // offered once something has been tracked, so the tracker is the first of the two.
+  const trk = trackPanel(c);
+  if (trk) box.appendChild(trk);
   const fx = clipFxPanel(c);
   if (fx) box.appendChild(fx);
   const keys = clipKeyPanel(c);
@@ -1849,6 +1903,70 @@ function clipFxPanel(clip) {
     body.draggable = false;
     for (const spec of d.schema) {
       body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+    }
+
+    // The binding: what makes a callout stick to a moving element.
+    //
+    // Offered only on a type that knows what following MEANS - `DEFS[type].bind` - and
+    // only on a clip that has something solved to follow. A select with one dead option
+    // answers "why can I not bind this" with silence, which is the gap the pointer
+    // effects' greyed-out menu entries were added to close.
+    if (d.bind) {
+      const brow = el('div', 'tc-row');
+      brow.appendChild(el('label', 'tc-label', d.bind.label || 'Follow a track'));
+      const sel = el('select');
+      const none = el('option');
+      none.value = '';
+      none.textContent = 'Not bound';
+      sel.appendChild(none);
+      for (const tk of (clip.tracks || [])) {
+        const o = el('option');
+        o.value = tk.id;
+        o.textContent = tk.name + '  (' + tk.points.length + ')';
+        sel.appendChild(o);
+      }
+      // A binding whose track is gone keeps its value in the DOM so the panel can say so
+      // rather than silently reading as "Not bound" - the effect is still bound, it just
+      // has nothing to read.
+      const boundTo = fx.bind && fx.bind.track;
+      const missing = boundTo && !Tracker.trackById(clip, boundTo);
+      if (missing) {
+        const o = el('option');
+        o.value = boundTo;
+        o.textContent = 'a deleted track';
+        sel.appendChild(o);
+      }
+      sel.value = boundTo || '';
+      sel.disabled = !(clip.tracks || []).length && !boundTo;
+      sel.title = d.bind.hint || '';
+      sel.addEventListener('change', () => edit(() => {
+        if (sel.value) fx.bind = Object.assign({ offX: 0, offY: 0 }, fx.bind || {}, { track: sel.value });
+        else delete fx.bind;
+      }));
+      brow.appendChild(sel);
+      body.appendChild(brow);
+      if (!(clip.tracks || []).length && !boundTo) {
+        body.appendChild(el('div', 'tc-hint',
+          'Nothing tracked on this clip yet - add a tracker in Motion tracking above.'));
+      }
+      if (missing) {
+        body.appendChild(el('div', 'tc-hint fx-warn',
+          'The track this follows is gone, so it is drawing the values below instead. ' +
+          'Track again and re-bind it, or set it to Not bound.'));
+      }
+      if (fx.bind && fx.bind.track) {
+        body.appendChild(TextUI.control(
+          { path: 'bind.offX', label: 'Follow offset X', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
+          fx, { bind: { offX: 0, offY: 0 } }, rowHooks));
+        body.appendChild(TextUI.control(
+          { path: 'bind.offY', label: 'Follow offset Y', type: 'range', min: -1, max: 1, step: 0.002, digits: 3 },
+          fx, { bind: { offX: 0, offY: 0 } }, rowHooks));
+        const taken = FX.boundParams(fx.type);
+        body.appendChild(el('div', 'tc-hint',
+          'The track is writing ' + taken.join(' and ') + ' every frame, so the sliders ' +
+          'and keyframes for those are ignored while it is bound. Everything else still ' +
+          'animates.'));
+      }
     }
 
     // An imported PNG pointer. A PATH, not the bytes: `clip.fx` is plain JSON that goes
@@ -3714,6 +3832,9 @@ function loop() {
     // the person performing, not a layer. It is never composited and never baked - what
     // gets baked is the `select` effect the drag turns into when the take is committed.
     drawMouseOverlay(ctx, previewSize().w, previewSize().h);
+    // And the track markers, for the same reason and on the same terms: an
+    // affordance over the picture, never a layer in it.
+    drawTrackOverlay(ctx, previewSize().w, previewSize().h);
     drawMeter();
   } catch (e) {
     // Reported once per distinct fault, so a persistent one does not flood the log at
@@ -4952,7 +5073,7 @@ async function openProject(filePath) {
     for (const tr of t.transitions) Trans.normalize(tr);
     // Fill in effect parameters a project saved before they existed, and drop effect
     // types this build does not know - the same job Trans.normalize does above.
-    for (const c of t.clips) { AudioFX.normalizeClip(c); FX.normalizeClip(c); }
+    for (const c of t.clips) { AudioFX.normalizeClip(c); FX.normalizeClip(c); Tracker.normalizeClip(c); }
   }
   preloadTransitionImages();
   state.selection.clear();
@@ -5019,6 +5140,13 @@ function buildJob(outPath, range) {
         // a cached render. A digest is enough, because a take is recorded once and
         // replaced wholesale - what changes is which one is attached.
         mouse: mouseDigest(c),
+        // Same reasoning one step along: a BOUND effect draws where a solved track says,
+        // so those samples decide pixels the key could not otherwise see. Only the tracks
+        // something is actually bound to are digested - a solved track nothing reads
+        // changes no pixels, and putting it in the key would miss the cache of a render
+        // it is identical to. `Tracker.digest()` carries no timeline position, which is
+        // the rule that lets a bound clip keep its cached render when it is dragged.
+        tracks: trackDigests(c),
         visible: (c.kind === 'video' || c.kind === 'image' || c.kind === 'text') &&
           t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
@@ -5101,6 +5229,27 @@ function mouseDigest(c) {
   if (!uses) return undefined;
   const ev = c.mouse.events;
   return { n: ev.length, t0: ev[0].t, t1: ev[ev.length - 1].t, clicks: !!c.mouse.clicks };
+}
+
+/**
+ * The solved samples every BOUND effect on this clip reads, reduced to a checksum.
+ *
+ * Undefined when nothing is bound, so a clip that merely carries a track keys exactly as
+ * one that never had one - a solve is analysis, and analysis nothing reads changes no
+ * pixels.
+ */
+function trackDigests(c) {
+  if (!Tracker.hasTracks(c)) return undefined;
+  // In STACK ORDER and without the track ids, for the same reason `jobCacheKey()` strips
+  // an effect's `id`: an id is an identity handed out when the tracker was dropped, so
+  // leaving it in would mean a duplicated clip never shared the original's cached render.
+  const out = [];
+  for (const f of (c.fx || [])) {
+    if (!(f && f.enabled !== false && f.bind && f.bind.track)) continue;
+    if (!(FX.DEFS[f.type] && FX.DEFS[f.type].bind)) continue;
+    out.push(Tracker.digest(c, f.bind.track) || null);
+  }
+  return out.length ? out : undefined;
 }
 
 function jobCacheKey(job) {
@@ -5794,6 +5943,425 @@ window.api.onRenderProgress((d) => {
 
 $('#btnImport').addEventListener('click', async () => importPaths(await window.api.pickMedia()));
 $('#btnImportFolder').addEventListener('click', async () => importPaths(await window.api.pickFolder()));
+
+
+
+// ---- motion tracking ----------------------------------------------------
+//
+// A tracker is dropped on a pixel, solved across the clip, and then READ - by an effect
+// whose position is bound to it. Everything the solve produces is plain JSON on the clip
+// (`clip.tracks`, see track.js), so undo, save and reload carry it exactly like anything
+// else, and everything about HOW it is solved lives in the worker.
+//
+// TWO THINGS CARRY THE FEATURE, and both are here rather than in the kernel:
+//
+//   1. CONFIDENCE IS DRAWN, on the timeline lane. A lost track that looks like a solved
+//      one is the failure mode of every tracker: the callout sits in the wrong place for
+//      forty frames and nobody notices until the export. The strip under the clip is
+//      quiet where the solve is sure and red where it is not.
+//   2. DRAGGING THE MARKER RE-ANCHORS AND RE-SOLVES FORWARD ONLY. The frames before the
+//      correction were either right already or corrected earlier, and re-solving them
+//      would throw that work away - which is what turns "fix the one bad stretch" into
+//      "track the whole thing again" and stops people correcting at all.
+
+const Trk = {
+  busy: false,
+  cancel: false,
+  drag: null,      // { clip, track, x, y } while a marker is being dragged
+  worker: null,    // the Worker, built once
+  job: 0,
+};
+
+/**
+ * The worker, built from `track.js` + `track-worker.js` concatenated into one Blob.
+ *
+ * A Blob because `new Worker('track-worker.js')` is refused under `file://`, and a
+ * concatenation because the kernel then has ONE source: the window, the worker and
+ * `smoke-track.js` all run the same optical flow, and a worker build cannot drift away
+ * from the one the suite checks.
+ */
+async function trackWorker() {
+  if (Trk.worker) return Trk.worker;
+  const [kernel, driver] = await Promise.all([
+    fetch('track.js').then((r) => r.text()),
+    fetch('track-worker.js').then((r) => r.text()),
+  ]);
+  const url = URL.createObjectURL(new Blob([kernel + '\n;\n' + driver], { type: 'text/javascript' }));
+  Trk.worker = new Worker(url);
+  URL.revokeObjectURL(url);
+  return Trk.worker;
+}
+
+/** One round trip to the worker. Rejects rather than hanging if the worker answers badly. */
+function trkSend(w, msg, transfer) {
+  return new Promise((resolve, reject) => {
+    const onMsg = (e) => {
+      if (!e.data || e.data.id !== msg.id) return;
+      w.removeEventListener('message', onMsg);
+      if (e.data.ok) resolve(e.data); else reject(new Error(e.data.error || 'worker failed'));
+    };
+    w.addEventListener('message', onMsg);
+    w.postMessage(msg, transfer || []);
+  });
+}
+
+const trkCanvas = document.createElement('canvas');
+
+/**
+ * One analysis frame: the clip's SOURCE picture, unframed, at the solve resolution.
+ *
+ * Unframed on purpose. A track is stored in source fractions precisely so that panning,
+ * zooming or re-framing the clip afterwards does not move it, and solving through the
+ * crop would bake today's framing into the answer.
+ */
+async function trkFrame(el, t, aw, ah) {
+  await seekMedia(el, t);
+  if (!frameReady(el)) return null;
+  trkCanvas.width = aw; trkCanvas.height = ah;
+  const c = trkCanvas.getContext('2d', { willReadFrequently: true });
+  c.drawImage(el, 0, 0, aw, ah);
+  return c.getImageData(0, 0, aw, ah);
+}
+
+function trkStatus(msg, cls) {
+  setStatus(msg, cls);
+  renderInspector();
+}
+
+/**
+ * Solve one track across a SOURCE-time range, in one direction.
+ *
+ * `dir` is +1 forward from the anchor and -1 backward from it. Backward is a second run
+ * with the frames fed in reverse - the flow does not care which way time runs, and a
+ * separate pass keeps the worker's "previous frame" state honest in both.
+ *
+ * Nothing here mutates the clip: it answers samples, and the caller decides what to do
+ * with them under one `pushUndo()`.
+ */
+async function trkSolveRun(clip, track, el, from, to, dir, aw, ah, onProgress) {
+  const rate = Math.max(1, track.rate || Tracker.DEFAULTS.rate);
+  const step = 1 / rate;
+  const w = await trackWorker();
+  const id = 'j' + (++Trk.job);
+  const anchorT = track.anchor.t;
+  const first = await trkFrame(el, anchorT, aw, ah);
+  if (!first) throw new Error('that clip has no decodable frame at the anchor');
+  await trkSend(w, {
+    cmd: 'start', id, opts: { win: track.win, levels: Tracker.DEFAULTS.levels },
+    w: aw, h: ah, x: track.anchor.x * aw, y: track.anchor.y * ah, buf: first.data.buffer,
+  }, [first.data.buffer]);
+
+  const out = [];
+  const n = Math.max(0, Math.floor(Math.abs((dir > 0 ? to : from) - anchorT) / step));
+  try {
+    for (let i = 1; i <= n; i++) {
+      if (Trk.cancel) break;
+      const t = anchorT + dir * i * step;
+      if (t < from - 1e-6 || t > to + 1e-6) break;
+      const img = await trkFrame(el, t, aw, ah);
+      if (!img) break;
+      const r = await trkSend(w, { cmd: 'step', id, t, w: aw, h: ah, buf: img.data.buffer },
+        [img.data.buffer]);
+      out.push({ t, x: r.x / aw, y: r.y / ah, c: r.c });
+      if (onProgress && (i % 5 === 0)) onProgress(i, n);
+      // Never hang the render loop: the solve yields the thread between frames, so the
+      // viewer keeps painting and the window keeps answering while it runs.
+      await new Promise((res) => setTimeout(res, 0));
+    }
+  } finally {
+    try { await trkSend(w, { cmd: 'end', id }); } catch (e) { /* the job is over anyway */ }
+  }
+  return out;
+}
+
+/**
+ * Solve a track over a clip, both ways from its anchor, and write the result.
+ *
+ * ONE undo entry for the whole solve, taken after the frames are in and before anything
+ * is written - a solve is one operation however many hundred samples it produces.
+ * `forwardOnly` is the re-anchor path: the solved past is kept exactly as it was.
+ */
+async function solveTrack(clip, track, forwardOnly) {
+  if (Trk.busy) { setStatus('A track is already solving.', 'err'); return null; }
+  const el = mediaFor(clip);
+  if (!el) { setStatus('That clip has no media to track.', 'err'); return null; }
+  const sw = clip.srcW || 1920, sh = clip.srcH || 1080;
+  const long = Math.max(1, Math.max(sw, sh));
+  const scale = Math.min(1, (track.res || Tracker.DEFAULTS.res) / long);
+  const aw = Math.max(16, Math.round(sw * scale)), ah = Math.max(16, Math.round(sh * scale));
+  const from = forwardOnly ? track.anchor.t : clip.in;
+  const to = clip.out;
+
+  // The disk cache first, keyed by the file and by the solve - the waveform cache's
+  // rules. A solve costs a seek per frame, so a clip tracked from this pixel before
+  // comes back in a file read.
+  const key = Tracker.cacheKey({
+    t0: from, t1: to, ax: track.anchor.x, ay: track.anchor.y, anchorT: track.anchor.t,
+    res: track.res, rate: track.rate, win: track.win, levels: Tracker.DEFAULTS.levels,
+  });
+  let pts = null;
+  try { pts = clip.src ? await window.api.trackRead(clip.src, key) : null; } catch (e) { pts = null; }
+
+  Trk.busy = true;
+  Trk.cancel = false;
+  const t0 = performance.now();
+  try {
+    if (!pts) {
+      trkStatus('Tracking...');
+      const fwd = await trkSolveRun(clip, track, el, from, to, +1, aw, ah,
+        (i, n) => setStatus('Tracking... ' + Math.round(100 * i / Math.max(1, n)) + '%'));
+      const back = forwardOnly ? []
+        : await trkSolveRun(clip, track, el, from, to, -1, aw, ah, null);
+      pts = fwd.concat(back);
+      if (!Trk.cancel && clip.src) {
+        try { await window.api.trackWrite(clip.src, key, pts); } catch (e) { /* cache only */ }
+      }
+    }
+    pushUndo();
+    if (forwardOnly) {
+      // Everything after the anchor is replaced; everything before it survives, which is
+      // the whole point of correcting one frame rather than re-tracking the clip.
+      track.points = track.points.filter((p) => p.t <= track.anchor.t + 1e-6);
+    }
+    Tracker.mergePoints(track, pts);
+    Tracker.normalizeClip(clip);
+    markDirty();
+    renderAll();
+    const worst = Tracker.worstIn(track, clip.in, clip.out);
+    trkStatus('Tracked ' + track.points.length + ' samples in ' +
+      ((performance.now() - t0) / 1000).toFixed(1) + 's, lowest confidence ' +
+      Math.round(worst * 100) + '%', worst < Tracker.DEFAULTS.minConf ? 'err' : '');
+    return track;
+  } catch (e) {
+    trkStatus('Tracking failed: ' + ((e && e.message) || e), 'err');
+    return null;
+  } finally {
+    Trk.busy = false;
+  }
+}
+
+/** Drop a tracker at the playhead, on a frame-fraction point, and solve it. */
+function addTracker(clip, fx, fy) {
+  const m = Tracker.frameMap(clip, state.out.w / state.out.h);
+  // Frame fractions back to SOURCE fractions - the inverse of the map a binding reads
+  // forwards, so a point placed by eye on the viewer lands on the pixel under it.
+  const crop = m.crop;
+  const sx = clamp(crop.x + fx * crop.w, 0, 1), sy = clamp(crop.y + fy * crop.h, 0, 1);
+  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  pushUndo();
+  if (!Array.isArray(clip.tracks)) clip.tracks = [];
+  const tk = Tracker.makeTrack(tSrc, sx, sy, { name: 'Track ' + (clip.tracks.length + 1) });
+  clip.tracks.push(tk);
+  markDirty();
+  renderAll();
+  solveTrack(clip, tk, false);
+  return tk;
+}
+
+function deleteTracker(clip, id) {
+  pushUndo();
+  // A binding to a track that is gone is LEFT ALONE rather than tidied up: the effect
+  // degrades to its static parameters and the panel says why. Silently editing the stack
+  // because a track was deleted would be a second, invisible edit inside one undo entry.
+  clip.tracks = (clip.tracks || []).filter((t) => t.id !== id);
+  Tracker.normalizeClip(clip);
+  markDirty();
+  renderAll();
+}
+
+/** Every track marker visible on the viewer right now, in frame fractions. */
+function trackMarkers() {
+  const sel = selectedClips().map((x) => x.clip).filter((c) => Tracker.hasTracks(c));
+  const out = [];
+  for (const c of sel) {
+    const tLocal = state.playhead - c.start;
+    if (tLocal < -1e-6 || tLocal > (c.out - c.in) + 1e-6) continue;
+    const m = Tracker.frameMap(c, state.out.w / state.out.h);
+    for (const tk of c.tracks) {
+      const s = Tracker.sampleAt(tk, c.in + tLocal);
+      if (!s) continue;
+      const p = m(s.x, s.y);
+      out.push({ clip: c, track: tk, x: p.x, y: p.y, c: s.c });
+    }
+  }
+  return out;
+}
+
+/**
+ * The markers, drawn over the viewer and never into it.
+ *
+ * Like the take's rubber band, this is an affordance rather than a layer: it is painted
+ * after `drawPreview()`, and it is never composited, never baked and never in a cache
+ * key. A tracker you cannot see is a tracker you cannot drag onto the right pixel.
+ */
+function drawTrackOverlay(c, W, H) {
+  const marks = trackMarkers();
+  if (!marks.length) return;
+  for (const m of marks) {
+    const x = m.x * W, y = m.y * H;
+    const lost = m.c < Tracker.DEFAULTS.minConf;
+    const col = lost ? '#e0533f' : Cursor.ACCENT;
+    c.save();
+    c.strokeStyle = col;
+    c.fillStyle = col;
+    c.lineWidth = 1.5;
+    const r = 9;
+    c.beginPath();
+    c.arc(x, y, r, 0, Math.PI * 2);
+    c.stroke();
+    c.beginPath();
+    c.moveTo(x - r - 5, y); c.lineTo(x - 3, y);
+    c.moveTo(x + 3, y); c.lineTo(x + r + 5, y);
+    c.moveTo(x, y - r - 5); c.lineTo(x, y - 3);
+    c.moveTo(x, y + 3); c.lineTo(x, y + r + 5);
+    c.stroke();
+    c.font = '11px system-ui, sans-serif';
+    c.fillText(m.track.name + (lost ? '  lost' : ''), x + r + 8, y - r - 2);
+    c.restore();
+  }
+  if (Trk.drag) {
+    c.save();
+    c.strokeStyle = Cursor.ACCENT;
+    c.setLineDash([4, 3]);
+    c.beginPath();
+    c.arc(Trk.drag.x * W, Trk.drag.y * H, 11, 0, Math.PI * 2);
+    c.stroke();
+    c.restore();
+  }
+}
+
+const TRK_GRAB = 16;   // how near the pointer has to be, in canvas pixels, to grab one
+
+/** The marker under a pointer event, or null. The nearest wins when two overlap. */
+function markerAt(e) {
+  const P = previewSize();
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) / Math.max(1, r.width) * P.w;
+  const y = (e.clientY - r.top) / Math.max(1, r.height) * P.h;
+  let best = null, bestD = TRK_GRAB * TRK_GRAB;
+  for (const m of trackMarkers()) {
+    const dx = m.x * P.w - x, dy = m.y * P.h - y;
+    const d = dx * dx + dy * dy;
+    if (d <= bestD) { bestD = d; best = m; }
+  }
+  return best;
+}
+
+/**
+ * Dragging a marker RE-ANCHORS it, and re-solves forward of that frame only.
+ *
+ * These run in the capture phase, ahead of the framing drag, for the same reason the
+ * take's handlers do: while the pointer is on a tracker the viewer is a tracking surface,
+ * not a framing control. A press that lands anywhere else is a framing drag as before.
+ */
+canvas.addEventListener('pointerdown', (e) => {
+  if (Mouse.recording || Trk.busy) return;
+  const m = markerAt(e);
+  if (!m) return;
+  e.preventDefault();
+  e.stopPropagation();
+  Trk.drag = { clip: m.clip, track: m.track, x: m.x, y: m.y };
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
+}, true);
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!Trk.drag) return;
+  const p = mousePointAt(e);
+  Trk.drag.x = p.x; Trk.drag.y = p.y;
+}, true);
+
+canvas.addEventListener('pointerup', (e) => {
+  const d = Trk.drag;
+  if (!d) return;
+  Trk.drag = null;
+  e.preventDefault();
+  e.stopPropagation();
+  reanchorTracker(d.clip, d.track, d.x, d.y);
+}, true);
+
+/** Move a tracker onto a frame-fraction point at the playhead and re-solve forward. */
+function reanchorTracker(clip, track, fx, fy) {
+  const crop = Tracker.frameMap(clip, state.out.w / state.out.h).crop;
+  const sx = clamp(crop.x + fx * crop.w, 0, 1), sy = clamp(crop.y + fy * crop.h, 0, 1);
+  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  pushUndo();
+  Tracker.reanchorAt(track, tSrc, sx, sy);
+  markDirty();
+  renderAll();
+  // FORWARD ONLY. The solved past is either right already or a correction the author
+  // made earlier, and both are work this must not destroy.
+  return solveTrack(clip, track, true);
+}
+
+/**
+ * The Motion tracking section of the inspector.
+ *
+ * Only for a clip with moving media to track - an image has one frame and a text card
+ * has none, and a row of dead buttons is worse than no row. That is the same degradation
+ * contract the pointer effects keep, shown rather than described.
+ */
+function trackPanel(clip) {
+  if (!clip || clip.kind !== 'video' || !clip.src) return null;
+  const el = TextUI.el;
+  const box = el('div', 'fx-az trk-box');
+
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'Motion tracking'));
+  const n = (clip.tracks || []).length;
+  head.appendChild(el('span', 'tc-hint', n ? n + (n === 1 ? ' track' : ' tracks') : 'none'));
+  box.appendChild(head);
+
+  box.appendChild(el('div', 'tc-hint fx-note',
+    'Drop a tracker on something in the picture and it is solved across the clip. An ' +
+    'effect can then bind its position to it. Drag a marker on the viewer to correct it - ' +
+    'that re-anchors and re-solves forward of that frame only.'));
+
+  for (const tk of (clip.tracks || [])) {
+    const row = el('div', 'trk-row');
+    const bar = el('div', 'fx-fx-head');
+    bar.appendChild(el('b', null, tk.name));
+    const worst = Tracker.worstIn(tk, clip.in, clip.out);
+    const lost = worst < Tracker.DEFAULTS.minConf;
+    bar.appendChild(el('span', 'tc-hint' + (lost ? ' fx-warn' : ''),
+      tk.points.length + ' samples · lowest confidence ' + Math.round(worst * 100) + '%'));
+    const btns = el('div', 'fx-fx-btns');
+    const mk = (label, title, fn, disabled) => {
+      const b = el('button', 'mini', label);
+      b.title = title;
+      b.disabled = !!disabled;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+    };
+    mk('Re-solve', 'Solve this track again from its anchor, in both directions.',
+      () => solveTrack(clip, tk, false), Trk.busy);
+    mk('✕', 'Delete this track. Anything bound to it keeps its own settings.',
+      () => deleteTracker(clip, tk.id));
+    bar.appendChild(btns);
+    row.appendChild(bar);
+    if (lost) {
+      row.appendChild(el('div', 'tc-hint fx-warn',
+        'This track loses the point somewhere - the strip under the clip shows where. ' +
+        'Scrub to it, drag the marker onto the right pixel, and it re-solves from there.'));
+    }
+    box.appendChild(row);
+  }
+
+  const row = el('div', 'fx-add');
+  const add = el('button', 'mini', 'Add tracker at playhead');
+  add.title = 'Drops a tracker at the centre of the frame and solves it. Drag it onto ' +
+    'the feature you want and it re-solves from there.';
+  add.disabled = Trk.busy;
+  add.addEventListener('click', () => addTracker(clip, 0.5, 0.5));
+  row.appendChild(add);
+  if (Trk.busy) {
+    const stop = el('button', 'mini', 'Stop');
+    stop.title = 'Stop the solve. Whatever has been solved so far is kept.';
+    stop.addEventListener('click', () => { Trk.cancel = true; });
+    row.appendChild(stop);
+  }
+  box.appendChild(row);
+  return box;
+}
 
 
 // ---- the on-render mouse take -------------------------------------------

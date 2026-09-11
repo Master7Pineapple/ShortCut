@@ -855,6 +855,50 @@ ipcMain.handle('wave:write', (_e, { path: p, peaks, duration }) => {
   } catch (e) { return false; }
 });
 
+// ------------------------------------------------------- solved motion tracks
+
+/**
+ * Solved motion tracks, cached on disk by path + size + mtime + the solve's own key.
+ *
+ * Exactly the waveform cache's rules, and for the same reason: a solve costs a seek per
+ * frame in the renderer, which is seconds for a clip of any length, and the answer
+ * depends only on the file and the settings. So it belongs to the FILE, not to the clip -
+ * the same recording tracked from the same pixel opens already solved in every project
+ * that holds it, and moving, trimming or duplicating the clip changes nothing about it.
+ *
+ * `key` is `Tracker.cacheKey()`: the range, the anchor and the solver's settings. The
+ * clip's timeline position is deliberately not in it, which is the same rule the render
+ * cache keeps.
+ */
+const trackDir = () => {
+  const dir = path.join(app.getPath('userData'), 'cache', 'track');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const trackFile = (p, key) =>
+  path.join(trackDir(),
+    crypto.createHash('sha1').update(String(p) + '|' + String(key)).digest('hex') + '.json');
+
+ipcMain.handle('track:read', (_e, { path: p, key }) => {
+  const stamp = fileStamp(p);
+  if (!stamp) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(trackFile(p, key), 'utf8'));
+    if (j.size !== stamp.size || j.mtime !== stamp.mtime) return null;
+    return Array.isArray(j.points) ? j.points : null;
+  } catch (e) { return null; }
+});
+
+ipcMain.handle('track:write', (_e, { path: p, key, points }) => {
+  const stamp = fileStamp(p);
+  if (!stamp || !Array.isArray(points)) return false;
+  try {
+    fs.writeFileSync(trackFile(p, key),
+      JSON.stringify({ size: stamp.size, mtime: stamp.mtime, points }), 'utf8');
+    return true;
+  } catch (e) { return false; }
+});
+
 // ------------------------------------------------------- silence detection
 
 /**

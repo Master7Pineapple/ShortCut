@@ -45,7 +45,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-four suites:
+There are twenty-five suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -80,6 +80,19 @@ There are twenty-four suites:
   in, using REAL injected input (see below).
 - `tools/smoke-typewriter.js` — typing in, typing out, both at once, sweep order, exit
   direction and the pop scale.
+- `tools/smoke-track.js` — motion tracking: the pyramidal Lucas-Kanade kernel against a
+  painted, anti-aliased translating square (sub-pixel accuracy over 24 frames, a genuine
+  half-pixel shift read back as half a pixel, and a flat interior reporting low confidence
+  rather than wandering), that an occlusion drops confidence and **holds** the last good
+  position with no drift, that the Blob-built worker answers bit-for-bit what the
+  in-process kernel answers, the data model (interpolation, the lower confidence of two
+  neighbours, holding past both ends, pruning), that re-anchoring keeps the solved past to
+  the sample and drops only the future, the binding through the clip's framing for all
+  three bindable effect types plus the offset, that a bind to a deleted track degrades to
+  the sliders rather than throwing, the panel, the lane's confidence strip, one undo entry
+  for a whole solve, and — the load-bearing one — that moving the clip does not change what
+  the binding contributes to the render key while changing a sample does. It needs no
+  fixture: every frame is painted by the suite.
 - `tools/smoke-transitions.js` — transitions: finding cuts, the fast grab, length and
   alignment, all three types drawing correctly, the render job, an end-to-end ffmpeg
   render read back from the MP4, and presets.
@@ -275,6 +288,8 @@ tools/smoke-fx.js         the per-clip effect stack: each effect, order, keys, p
 tools/smoke-recorder.js   the screen recorder: telemetry shape, alignment, degradation
 tools/smoke-cursor.js     pointer treatment: smoothing, ripples, selections, auto-zoom,
                           take splitting and the two coordinate spaces
+tools/smoke-track.js      motion tracking: the LK kernel, occlusion, re-anchoring,
+                          the binding and what it may put in the render key
 tools/smoke-longargs.js   the command-line ceiling and the filtergraph script file
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
@@ -288,6 +303,10 @@ src/renderer/fx.js        the visual effect stack: one draw per type, no ffmpeg 
 src/renderer/cursor.js    pointer treatment, the pure half: smoothing, ripple timing,
                           the two coordinate spaces, take splitting, the auto-zoom
                           generator
+src/renderer/track.js     motion tracking, the pure half: pyramidal Lucas-Kanade, the
+                          track data model, and the source->frame binding map
+src/renderer/track-worker.js  its message loop; concatenated onto track.js into one Blob
+                          worker, so the kernel has exactly one source
 src/renderer/text/model.js  text cards: defaults, animation layers, how they compose with keys
 src/renderer/text/draw.js   text cards: all canvas painting (preview AND export)
 src/renderer/text/ui.js     text cards: the editor panel
@@ -306,9 +325,9 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
 files are plain `<script>` globals (`TextModel`, `TextDraw`, `TextUI`)
 loaded before `app.js`; `anim.js` (`Anim`) is loaded before all of them, then `cursor.js`
-(`Cursor`) and `fx.js` (`FX`) — in that order, because every effect parameter reads its
-animated value through `Anim` and the pointer effects read their geometry through
-`Cursor`. `TextUI` never touches `app.js` globals - it is wired up through
+(`Cursor`), `track.js` (`Tracker`) and `fx.js` (`FX`) — in that order, because every effect
+parameter reads its animated value through `Anim`, the pointer effects read their geometry
+through `Cursor`, and a bound effect reads its position through `Tracker`. `TextUI` never touches `app.js` globals - it is wired up through
 the hooks object passed to `TextUI.init()` near the bottom of `app.js`.
 
 `app.js` is organised in ten numbered sections (search for `// ===`), in this order:
@@ -369,9 +388,12 @@ Clip = {
   keys,                  // OPTIONAL - keyframe tracks, see "Keyframes" below; absent until used
   card,                  // text clips only - the whole card, see TextCard below
   captions,              // generated captions only - { gen: true, src } - see below
-  screen                 // OPTIONAL - screen-recording telemetry, { events, displayW,
+  screen,                // OPTIONAL - screen-recording telemetry, { events, displayW,
                          //   displayH, clicks }. Absent for anything not recorded here;
                          //   see "The screen recorder" for the degradation contract
+  tracks                 // OPTIONAL - solved motion tracks, [{ id, name, points, anchor }]
+                         //   in SOURCE time and SOURCE fractions; absent until one is
+                         //   dropped. See "Motion tracking"
 }
 ```
 
@@ -590,6 +612,17 @@ position into its own pixels, which is the one thing the render cache's key rule
 
 The layer's `L.base()` is the only other way past an effect's own parameters, and exactly
 one effect uses it: `background`'s blurred-copy mode. See "The framing four" below.
+
+#### Binding a position to a motion track
+
+Three types carry a `bind` descriptor — `transform`, `spotlight` and `cutout` — and an
+entry may therefore hold `bind: { track, offX, offY }`, plain JSON like everything else.
+`paramsAt()` resolves it **after** the keyframes and writes the positional parameters
+itself, which is why a bound position ignores its own sliders and keys while everything
+else on the effect keeps animating. See "Motion tracking" for what each type does with the
+point — they are deliberately three different answers, and `FX.boundParams()` derives which
+parameters each one takes over by *running* its `apply()` rather than by listing them a
+second time.
 
 `DEFS[type].needs` names what a clip has to be carrying for the effect to have anything to
 draw — `'mouse'` for the two pointer effects, absent for everything else. The panel greys
@@ -1611,6 +1644,102 @@ same picture.
 `Cursor.ACCENT` is the brand accent until step 17 hands the brand kit over. It is a single
 constant with a single reader, so that step changes one line rather than hunting for a
 colour literal in a draw function.
+
+### Motion tracking
+
+`src/renderer/track.js` is a plain `<script>` global `Tracker`, loaded between `cursor.js`
+and `fx.js`, and it is the pure half: pyramidal **Lucas-Kanade** optical flow, the data
+model, and the binding maths. No DOM, no canvas, no ffmpeg, no filesystem — frames arrive
+as luma arrays and answers leave as numbers, which is why `smoke-track.js` can paint its
+own frames and assert accuracy exactly rather than approximately.
+
+What lands on a clip:
+
+```js
+clip.tracks = [ { id, name, res, rate, win,
+                  anchor: { t, x, y },
+                  points: [ { t, x, y, c }, ... ] } ]     // absent until one is dropped
+```
+
+`t` is **source** seconds and `x`/`y` are fractions of the **source** frame — the same
+axes `clip.screen` uses, and for the same reason: they are the only ones that survive
+trimming, splitting, dragging and re-framing the clip afterwards. Re-framing in particular
+is why the solve runs on the *unframed* source picture; solving through the crop would
+bake today's pan and zoom into the answer. `c` is confidence, 0..1, and it is data rather
+than a diagnostic — the timeline draws it.
+
+#### The worker, and the measurement that justifies plain JS
+
+The flow runs in a worker built from `track.js` **concatenated with** `track-worker.js`
+into one Blob. A Blob because `new Worker('track-worker.js')` is refused under `file://`;
+a concatenation because the kernel then has exactly one source, so the window, the worker
+and the suite cannot run three different versions of it.
+
+Plain JS, no WASM, and the measurement is in the suite's own output: **~1.3–2 ms per frame
+per point** at 256x160 with three pyramid levels, on this machine. A solve is *seek-bound*
+— parking a decoder on an exact frame costs far more than the flow does — so a WASM build
+would speed up the part that is not the problem. What the worker buys is not throughput but
+that those milliseconds are off the UI thread: the solve yields between frames, the viewer
+keeps painting, and `loop()` keeps re-arming.
+
+#### Occlusion holds, it never teleports
+
+Confidence is two independent things multiplied: the window's Shi-Tomasi score (is there
+any texture here to track at all) and the residual after the fit (does this still look like
+what we anchored on). Below `minConf` the solver **keeps the last good position** and
+records the low confidence. A tracker that leaps across the screen for six frames and
+comes back is far worse than one that sits still and says so: the first throws a callout
+across the picture, the second draws a dip on the timeline. The worker still advances its
+"previous frame" through a held stretch — comparing frame 40 against the stale frame 12 we
+last trusted is exactly how a tracker recovers from an occlusion by leaping.
+
+#### The two things that make it usable rather than merely present
+
+- **Confidence is drawn on the lane.** A strip along the bottom of the clip, quiet where
+  the solve is sure and red where it is below the hold threshold, with the worst track
+  winning each column. A lost track looks identical to a good one in the picture until the
+  export; this is what makes it visible instead.
+- **Dragging the marker on the viewer re-anchors and re-solves FORWARD ONLY.** The frames
+  before the correction were either right already or corrected earlier, and re-solving them
+  would destroy that work — which is what turns "fix the one bad stretch" into "track the
+  whole clip again" and stops people correcting at all. The markers are drawn *over* the
+  viewer, after `drawPreview()`, on the same terms as the mouse take's rubber band: an
+  affordance, never a layer, never baked, never in a cache key.
+
+#### Binding, and what each type does with the point
+
+A solved track does nothing until something reads it. `FX` entries of three types can bind
+a position to one:
+
+| Type | What follows |
+| --- | --- |
+| `transform` | the **camera**: the picture is panned so the tracked pixel sits at the centre of the frame plus the offset, solved through the effect's own scale and anchor |
+| `spotlight` | the **lit shape**, centred on the point; the picture stays still |
+| `cutout` | the **source region** being lifted; the magnified float stays where it was placed |
+
+Those are three different answers on purpose, which is why each type owns its `apply()`
+rather than sharing one "set x and y". Binding a cutout's *destination* would fling the
+callout around the frame, which is the one thing a callout must not do.
+
+Binding is scoped to the clip's own tracks. A cross-clip binding — a text card on another
+track following a track on the footage below it — would make one clip's pixels depend on
+another clip's position on the timeline, which is precisely what the render cache's key
+rules forbid; `bind` names a track id and nothing else, and that limit is deliberate.
+
+#### The cache key, and what a track is allowed to contribute
+
+A track that **nothing is bound to** is not in the render key at all: a solve is analysis,
+and analysis nobody reads changes no pixels. The moment an enabled effect binds to one,
+`trackDigests()` puts a reduction of that track's samples into the job — count, span and a
+checksum — in stack order and **without the track's id**, exactly as an effect's `id` is
+stripped, so a duplicated clip still shares the original's cached render. The digest
+carries no timeline position, so moving a bound clip keeps its cached render; changing a
+sample it reads loses it. `smoke-track.js` asserts both.
+
+Solves are cached on disk in `userData/cache/track`, keyed by path + size + mtime (the
+waveform cache's rule) plus `Tracker.cacheKey()` — the range, the anchor and the solver's
+settings. So the same file tracked from the same pixel opens already solved, in every
+project that holds it.
 
 ### Transcription and captions
 
@@ -2832,6 +2961,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A keyboard shortcut | the `SHORTCUTS` table **and** the `keydown` handler, both in section 10 |
 | A clip property | the `Clip` shape in `importPaths()`, `renderInspector()`, and `buildJob()` |
 | A new clip **kind** | `importPaths()` (the shape), `mediaFor()` (its element, or none), `activeLayers()` + `drawPreview()` (how it paints), `buildJob()`'s `visible`, and `buildArgs()`'s input + chain |
+| A position that can follow a motion track | a `bind: { label, hint, apply(p, pos, off) }` on that `FX.DEFS` entry — the panel row, the offsets and `FX.boundParams()` all build themselves from it; `apply()` decides what "follow" means for that type |
 | A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p, t, entry, clip)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
 | A **generator** that writes keyframes | a pure function returning tracks of `{t, v, ease, gen:'<name>'}` + `Cursor.applyGenerated()` to merge them + one panel with its own Generate/Clear. Never an opaque effect — see "Screen-recording treatment" |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
@@ -2920,6 +3050,14 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   replaces their own keys and leaves hand-added ones alone.
 - A mouse take needs the range PRE-RENDERED. `startMouseTake()` refuses otherwise rather
   than performing against a stuttering live composite.
+- A motion track is solved on the clip's own source and binds only within that clip. A
+  graphic or card on another track cannot follow it — see "Binding, and what each type
+  does with the point" for why that limit is deliberate.
+- Tracking is one point per track, on `kind:'video'` clips with a source. An image has one
+  frame and a text card has none, so neither offers the panel.
+- A track that loses its point HOLDS rather than guessing, and says so on the lane and in
+  the panel. Correcting it is dragging the marker onto the right pixel, which re-solves
+  forward of that frame only.
 - A recorded clip and its telemetry are joined by the file name alone. Move or rename the
   `.webm` without its `.screen.json` and the next import of it has no cursor data.
 
