@@ -90,7 +90,11 @@ There are twenty-five suites:
   the sample and drops only the future, the binding through the clip's framing for all
   three bindable effect types plus the offset, that a bind to a deleted track degrades to
   the sliders rather than throwing, the panel, the lane's confidence strip, one undo entry
-  for a whole solve, and — the load-bearing one — that moving the clip does not change what
+  for a whole solve, that **a soft button corner is followed exactly and reported
+  confident** (the regression that split texture from fit), that a straight edge is
+  correctly untrackable, that a drop snaps onto a real feature fast enough to run on a
+  click, that placing a tracker does not solve it and dragging an unsolved one does not
+  either, that a dead point is refused with a reason, and — the load-bearing one — that moving the clip does not change what
   the binding contributes to the render key while changing a sample does. It needs no
   fixture: every frame is painted by the suite.
 - `tools/smoke-transitions.js` — transitions: finding cuts, the fast grab, length and
@@ -1657,9 +1661,78 @@ What lands on a clip:
 
 ```js
 clip.tracks = [ { id, name, res, rate, win,
+                  tex,                                   // the anchor's texture score
                   anchor: { t, x, y },
                   points: [ { t, x, y, c }, ... ] } ]     // absent until one is dropped
 ```
+
+A track with exactly one sample is a marker that has been placed and not yet solved —
+`Tracker.isSolved()` — which is what decides `Solve` versus `Re-solve`, whether dragging
+re-solves, and whether the marker on the viewer can be described as "lost" at all.
+
+#### The flow: place, drag, THEN solve
+
+Three steps, in this order, and the order is the whole of what makes it usable:
+
+1. **Add tracker** drops a marker at the playhead. It does **not** solve.
+2. **Drag it on the viewer** onto the thing you want to follow. Dragging an unsolved
+   marker is still placing it, so it still does not solve.
+3. **Solve** follows that point across the clip, both ways from the anchor.
+
+The first build fused (1) and (3): adding a tracker placed it in the middle of the frame
+and immediately solved. The middle of a frame is almost never the thing anyone wants
+followed, and it is usually flat — so the result was a seek per frame spent proving it
+could not follow it, several hundred samples of zero confidence, a solid red strip and no
+clue that the answer was "you put it somewhere with nothing to follow". Placing and
+solving are now separate actions, and the button that solves says `Solve` until there is
+something to re-solve.
+
+A drop **snaps to the strongest feature within a short reach** (`bestFeatureNear()`, about
+3.5% of the frame's shorter side). This is not a convenience. People aim at the middle of
+the thing they want to follow, and the middle of a button, a card or an icon is its
+flattest, least trackable part — the corners a few pixels away are what optical flow can
+actually hold. The snap walks the drop over to one, and the panel then says how good the
+point it found is.
+
+A point with nothing to track is **refused before the solve**, with a sentence saying what
+to do instead, and `Solve` is disabled while it stays that way.
+
+#### Texture and confidence are different questions
+
+They were multiplied into one number once, and the result was a tracker that called
+almost everything lost:
+
+- **Texture** — the window's Shi-Tomasi score — asks *is there anything here worth
+  anchoring to*. It is a property of the **point**, asked **once**, when the tracker is
+  dropped. It drives the snap, the quality readout and the refusal.
+- **Confidence** — the residual after the fit — asks *does this window still look like the
+  one we anchored on*. It is a property of each **frame**, and it is what occlusion makes
+  fail, which is what confidence is for.
+
+Most of a real interface is soft: antialiased text, a gentle edge, a button corner with a
+few levels of contrast. Those score modestly on texture and track perfectly, so folding
+texture into a per-frame confidence marked every one of them lost while the point sat
+exactly where it belonged.
+
+Texture still acts as a **floor**, because a perfectly flat window matches everywhere: its
+residual is tiny, its fit is excellent and its fit is meaningless. Below `minTex` the
+answer is zero rather than a good-looking number.
+
+The calibration, which is where `minTex = 0.03` comes from — all measured by
+`smoke-track.js`, which prints them:
+
+| Feature | Texture |
+| --- | --- |
+| a hard, high-contrast corner | 1.000 |
+| an ordinary soft button corner (40 levels, 4 px transition) | 0.113 |
+| a fainter one (25 levels, 3 px) | 0.055 |
+| dither on a flat wall (±7 levels) | 0.012 |
+| a flat wall | 0.000 |
+
+A **straight edge scores near zero at any contrast**, and that is correct rather than a
+shortcoming: one point cannot track an edge, because it slides along itself. That is the
+aperture problem, and walking a drop off an edge and onto a corner is exactly what the
+snap is for.
 
 `t` is **source** seconds and `x`/`y` are fractions of the **source** frame — the same
 axes `clip.screen` uses, and for the same reason: they are the only ones that survive
@@ -3053,6 +3126,9 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
 - A motion track is solved on the clip's own source and binds only within that clip. A
   graphic or card on another track cannot follow it — see "Binding, and what each type
   does with the point" for why that limit is deliberate.
+- A tracker needs a **corner**, not an edge and not a flat area: one point cannot follow a
+  straight edge, because it slides along itself. A drop snaps to the nearest real feature
+  and the panel scores it, but footage with genuinely nothing in it cannot be tracked.
 - Tracking is one point per track, on `kind:'video'` clips with a source. An image has one
   frame and a text card has none, so neither offers the panel.
 - A track that loses its point HOLDS rather than guessing, and says so on the lane and in

@@ -6102,6 +6102,19 @@ async function solveTrack(clip, track, forwardOnly) {
   let pts = null;
   try { pts = clip.src ? await window.api.trackRead(clip.src, key) : null; } catch (e) { pts = null; }
 
+  // A point with nothing to track is refused BEFORE the solve, not discovered after it.
+  //
+  // This is what the first build got wrong and it was the whole of the bad experience:
+  // dropping a tracker on a flat area and solving produced four hundred samples of zero
+  // confidence, a lane strip of solid red, and no hint that the answer was "you put it
+  // somewhere there is nothing to follow". A seek per frame is an expensive way to learn
+  // that, and the texture score answers it from one frame.
+  if (!(track.tex == null) && track.tex < Tracker.DEFAULTS.minTex) {
+    trkStatus('Nothing to track at that point - it is a flat area. Drag the marker onto ' +
+      'an edge, a corner, an icon or some text and try again.', 'err');
+    return null;
+  }
+
   Trk.busy = true;
   Trk.cancel = false;
   const t0 = performance.now();
@@ -6140,21 +6153,87 @@ async function solveTrack(clip, track, forwardOnly) {
   }
 }
 
-/** Drop a tracker at the playhead, on a frame-fraction point, and solve it. */
-function addTracker(clip, fx, fy) {
-  const m = Tracker.frameMap(clip, state.out.w / state.out.h);
-  // Frame fractions back to SOURCE fractions - the inverse of the map a binding reads
-  // forwards, so a point placed by eye on the viewer lands on the pixel under it.
-  const crop = m.crop;
-  const sx = clamp(crop.x + fx * crop.w, 0, 1), sy = clamp(crop.y + fy * crop.h, 0, 1);
+/** The analysis frame size for a clip - one place, so a drop and a solve agree. */
+function trkAnalysisSize(clip, res) {
+  const sw = clip.srcW || 1920, sh = clip.srcH || 1080;
+  const scale = Math.min(1, (res || Tracker.DEFAULTS.res) / Math.max(1, Math.max(sw, sh)));
+  return { aw: Math.max(16, Math.round(sw * scale)), ah: Math.max(16, Math.round(sh * scale)) };
+}
+
+/** Frame fractions to SOURCE fractions - the inverse of the map a binding reads forwards. */
+function trkSourcePoint(clip, fx, fy) {
+  const crop = Tracker.frameMap(clip, state.out.w / state.out.h).crop;
+  return {
+    x: clamp(crop.x + fx * crop.w, 0, 1),
+    y: clamp(crop.y + fy * crop.h, 0, 1),
+  };
+}
+
+// How far a drop is allowed to snap, as a fraction of the analysis frame's shorter side.
+const TRK_SNAP = 0.035;
+
+/**
+ * Score a point on one frame, and snap it to the best feature within a short reach.
+ *
+ * SNAPPING IS NOT A CONVENIENCE, it is most of what makes the feature usable by a person
+ * rather than by someone who knows what an eigenvalue is. People aim at the MIDDLE of the
+ * thing they want to follow, and the middle of a button, a card or an icon is its
+ * flattest, least trackable part - its corners, a few pixels away, are what optical flow
+ * can actually hold. So a drop lands on the best point near where it was aimed, and the
+ * panel then says how good that point is.
+ *
+ * Answers `null` when no frame can be decoded, and the caller places the point unscored
+ * rather than refusing - a clip whose decoder is busy must not swallow the interaction.
+ */
+async function trkScorePoint(clip, tSrc, sx, sy) {
+  const el = mediaFor(clip);
+  if (!el) return null;
+  const { aw, ah } = trkAnalysisSize(clip, Tracker.DEFAULTS.res);
+  const img = await trkFrame(el, tSrc, aw, ah);
+  if (!img) return null;
+  const pyr = Tracker.buildPyramid(Tracker.gray(img.data, aw, ah), aw, ah, Tracker.DEFAULTS.levels);
+  const reach = clamp(Math.round(TRK_SNAP * Math.min(aw, ah)), 6, 24);
+  const best = Tracker.bestFeatureNear(pyr, sx * aw, sy * ah, reach, {});
+  return { x: best.x / aw, y: best.y / ah, tex: best.tex };
+}
+
+/** How a texture score reads in the panel and in the status line. */
+function trkQuality(tex) {
+  // The bands are calibrated against the measurements in track.js: an ordinary soft
+  // button corner scores around 0.11, a hard high-contrast corner scores 1.0, and dither
+  // on a flat wall scores about 0.012. Calling everything under 0.3 weak would flag most
+  // real interface footage, which is how a warning stops being read.
+  if (tex == null) return { word: 'not measured', cls: '' };
+  if (tex < Tracker.DEFAULTS.minTex) return { word: 'nothing to track here', cls: 'err' };
+  if (tex < 0.08) return { word: 'weak', cls: 'err' };
+  if (tex < 0.4) return { word: 'usable', cls: '' };
+  return { word: 'strong', cls: '' };
+}
+
+/**
+ * Drop a tracker at the playhead. IT DOES NOT SOLVE.
+ *
+ * Placing and solving used to be one action, and that was the wrong order: the marker
+ * landed in the middle of the frame - which is almost never the thing anyone wants to
+ * follow - and immediately spent a seek per frame proving it could not follow it. Place,
+ * look, drag it onto the feature, THEN solve. The button that solves says so.
+ */
+async function addTracker(clip, fx, fy) {
   const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const p = trkSourcePoint(clip, fx, fy);
+  const scored = await trkScorePoint(clip, tSrc, p.x, p.y);
   pushUndo();
   if (!Array.isArray(clip.tracks)) clip.tracks = [];
-  const tk = Tracker.makeTrack(tSrc, sx, sy, { name: 'Track ' + (clip.tracks.length + 1) });
+  const tk = Tracker.makeTrack(tSrc, scored ? scored.x : p.x, scored ? scored.y : p.y, {
+    name: 'Track ' + (clip.tracks.length + 1),
+    tex: scored ? scored.tex : null,
+  });
   clip.tracks.push(tk);
   markDirty();
   renderAll();
-  solveTrack(clip, tk, false);
+  const q = trkQuality(tk.tex);
+  trkStatus('Tracker placed (' + q.word + '). Drag it onto what you want to follow, ' +
+    'then press Solve.', q.cls);
   return tk;
 }
 
@@ -6199,7 +6278,11 @@ function drawTrackOverlay(c, W, H) {
   if (!marks.length) return;
   for (const m of marks) {
     const x = m.x * W, y = m.y * H;
-    const lost = m.c < Tracker.DEFAULTS.minConf;
+    // "Lost" is only a thing a SOLVED track can be. A marker that has not been solved yet
+    // is not failing at anything - it is waiting to be put somewhere and solved, and
+    // painting it in the alarm colour was half of why the first build read as broken.
+    const solved = Tracker.isSolved(m.track);
+    const lost = solved && m.c < Tracker.DEFAULTS.minConf;
     const col = lost ? '#e0533f' : Cursor.ACCENT;
     c.save();
     c.strokeStyle = col;
@@ -6216,7 +6299,8 @@ function drawTrackOverlay(c, W, H) {
     c.moveTo(x, y + 3); c.lineTo(x, y + r + 5);
     c.stroke();
     c.font = '11px system-ui, sans-serif';
-    c.fillText(m.track.name + (lost ? '  lost' : ''), x + r + 8, y - r - 2);
+    c.fillText(m.track.name + (lost ? '  lost' : (solved ? '' : '  drag me, then Solve')),
+      x + r + 8, y - r - 2);
     c.restore();
   }
   if (Trk.drag) {
@@ -6279,17 +6363,30 @@ canvas.addEventListener('pointerup', (e) => {
   reanchorTracker(d.clip, d.track, d.x, d.y);
 }, true);
 
-/** Move a tracker onto a frame-fraction point at the playhead and re-solve forward. */
-function reanchorTracker(clip, track, fx, fy) {
-  const crop = Tracker.frameMap(clip, state.out.w / state.out.h).crop;
-  const sx = clamp(crop.x + fx * crop.w, 0, 1), sy = clamp(crop.y + fy * crop.h, 0, 1);
+/**
+ * Move a tracker onto a frame-fraction point at the playhead.
+ *
+ * Whether that re-solves depends on whether there was a solve to correct, and the
+ * difference matters: dragging a FRESH marker into place is still placing it, and firing
+ * a solve off every time someone nudges an unsolved tracker is the same impatience that
+ * made the first build unusable. A SOLVED track dragged is a correction, and that does
+ * re-solve - forward of that frame only, because the past is work already accepted.
+ */
+async function reanchorTracker(clip, track, fx, fy) {
+  const wasSolved = Tracker.isSolved(track);
   const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const p = trkSourcePoint(clip, fx, fy);
+  const scored = await trkScorePoint(clip, tSrc, p.x, p.y);
   pushUndo();
-  Tracker.reanchorAt(track, tSrc, sx, sy);
+  Tracker.reanchorAt(track, tSrc, scored ? scored.x : p.x, scored ? scored.y : p.y);
+  if (scored) track.tex = Math.round(scored.tex * 1e5) / 1e5;
   markDirty();
   renderAll();
-  // FORWARD ONLY. The solved past is either right already or a correction the author
-  // made earlier, and both are work this must not destroy.
+  const q = trkQuality(track.tex);
+  if (!wasSolved) {
+    trkStatus('Tracker moved (' + q.word + '). Press Solve when it is where you want it.', q.cls);
+    return null;
+  }
   return solveTrack(clip, track, true);
 }
 
@@ -6312,18 +6409,25 @@ function trackPanel(clip) {
   box.appendChild(head);
 
   box.appendChild(el('div', 'tc-hint fx-note',
-    'Drop a tracker on something in the picture and it is solved across the clip. An ' +
-    'effect can then bind its position to it. Drag a marker on the viewer to correct it - ' +
-    'that re-anchors and re-solves forward of that frame only.'));
+    'Three steps: add a tracker, drag it on the viewer onto the thing you want to ' +
+    'follow, then Solve. Put it on an edge, a corner, an icon or some text - the middle ' +
+    'of a flat button has nothing to follow. Once it is solved, an effect can bind its ' +
+    'position to it, and dragging the marker corrects the track from that frame forward.'));
 
   for (const tk of (clip.tracks || [])) {
     const row = el('div', 'trk-row');
     const bar = el('div', 'fx-fx-head');
     bar.appendChild(el('b', null, tk.name));
+    const solved = Tracker.isSolved(tk);
     const worst = Tracker.worstIn(tk, clip.in, clip.out);
-    const lost = worst < Tracker.DEFAULTS.minConf;
-    bar.appendChild(el('span', 'tc-hint' + (lost ? ' fx-warn' : ''),
-      tk.points.length + ' samples · lowest confidence ' + Math.round(worst * 100) + '%'));
+    const lost = solved && worst < Tracker.DEFAULTS.minConf;
+    const q = trkQuality(tk.tex);
+    // Unsolved says what it IS, not a confidence of 100% over a single sample - a number
+    // that would be true, meaningless, and read as "this track is fine".
+    bar.appendChild(el('span', 'tc-hint' + (lost || q.cls ? ' fx-warn' : ''),
+      solved
+        ? tk.points.length + ' samples · lowest confidence ' + Math.round(worst * 100) + '%'
+        : 'not solved yet · point quality: ' + q.word));
     const btns = el('div', 'fx-fx-btns');
     const mk = (label, title, fn, disabled) => {
       const b = el('button', 'mini', label);
@@ -6332,12 +6436,28 @@ function trackPanel(clip) {
       b.addEventListener('click', fn);
       btns.appendChild(b);
     };
-    mk('Re-solve', 'Solve this track again from its anchor, in both directions.',
-      () => solveTrack(clip, tk, false), Trk.busy);
+    mk(solved ? 'Re-solve' : 'Solve',
+      solved
+        ? 'Solve this track again from its anchor, in both directions.'
+        : 'Follow this point across the clip, both ways from here. One undo entry.',
+      () => solveTrack(clip, tk, false),
+      Trk.busy || (tk.tex != null && tk.tex < Tracker.DEFAULTS.minTex));
     mk('✕', 'Delete this track. Anything bound to it keeps its own settings.',
       () => deleteTracker(clip, tk.id));
     bar.appendChild(btns);
     row.appendChild(bar);
+    // Said BEFORE a solve, which is the whole point of measuring the point at all: a
+    // seek per frame is an expensive way to find out the answer was always going to be
+    // "there is nothing there".
+    if (tk.tex != null && tk.tex < Tracker.DEFAULTS.minTex) {
+      row.appendChild(el('div', 'tc-hint fx-warn',
+        'There is nothing to follow at that point - it is flat. Drag the marker onto an ' +
+        'edge, a corner, an icon or some text. Solve is disabled until then.'));
+    } else if (!solved && tk.tex != null && tk.tex < 0.08) {
+      row.appendChild(el('div', 'tc-hint fx-warn',
+        'That point is weak - it may drift. A corner holds far better than the middle ' +
+        'of a shape or a soft gradient.'));
+    }
     if (lost) {
       row.appendChild(el('div', 'tc-hint fx-warn',
         'This track loses the point somewhere - the strip under the clip shows where. ' +
@@ -6348,8 +6468,8 @@ function trackPanel(clip) {
 
   const row = el('div', 'fx-add');
   const add = el('button', 'mini', 'Add tracker at playhead');
-  add.title = 'Drops a tracker at the centre of the frame and solves it. Drag it onto ' +
-    'the feature you want and it re-solves from there.';
+  add.title = 'Drops a tracker at the centre of the frame. It does not solve yet - ' +
+    'drag it onto what you want to follow first, then press Solve.';
   add.disabled = Trk.busy;
   add.addEventListener('click', () => addTracker(clip, 0.5, 0.5));
   row.appendChild(add);

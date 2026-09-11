@@ -25,6 +25,12 @@
  *      to the sliders rather than throwing.
  *   6. THE CACHE KEY. A bound clip keeps its cached render when it is MOVED, and loses it
  *      when the samples change. That is the same rule the whole render cache lives by.
+ *   7. TEXTURE AND CONFIDENCE ARE DIFFERENT QUESTIONS. A softly textured point that the
+ *      flow follows perfectly must read as CONFIDENT, not lost - the two were multiplied
+ *      together in the first build and the result was a tracker that called almost
+ *      everything lost. Plus the flow that grew out of that: placing does not solve,
+ *      a drop snaps to the nearest real feature, and a point with nothing to track is
+ *      refused with a reason instead of being discovered a seek-per-frame later.
  *
  * Plus the worker: the Blob build answers exactly what the in-process kernel answers,
  * which is what proves the concatenation is running the same source the suite checks.
@@ -103,6 +109,59 @@
       const flat = Tracker.trackPoints(pyr(0, 0), pyr(3, 0), [{ x: 65, y: 65 }], {})[0];
       ok('a point in a flat interior reports LOW confidence rather than wandering',
         flat.c < Tracker.DEFAULTS.minConf, 'c = ' + flat.c.toFixed(3));
+      ok('...because there is nothing there, which is a TEXTURE answer, not a fit one',
+        flat.tex < Tracker.DEFAULTS.minTex, 'tex = ' + flat.tex.toFixed(3));
+
+      /*
+       * THE REGRESSION THIS FILE EXISTS FOR.
+       *
+       * Confidence used to be texture x fit, so a soft feature - antialiased text, a
+       * gentle edge, most of a real UI - was reported LOST even while the flow sat exactly
+       * on it. Texture is now asked once, at the anchor; per-frame confidence is the fit.
+       * A soft but real edge, followed perfectly, must come back confident.
+       */
+      /*
+       * A SOFT CORNER, which is what real interface footage is made of: a button edge, a
+       * card corner, antialiased text. `contrast` is levels of 255 and `soft` is the width
+       * of the transition in pixels, so these are the two numbers that describe how much
+       * of a feature something is.
+       *
+       * It must be a CORNER and not an edge. A straight edge cannot be tracked by a single
+       * point at all - it slides along itself, which is the aperture problem - and it
+       * correctly scores near zero however high its contrast. The snap exists precisely to
+       * move a drop off an edge and onto the nearest corner.
+       */
+      const softCorner = (dx, contrast, soft) => {
+        const a = new Uint8ClampedArray(AW * AH * 4);
+        const ss = (v) => { const t = Math.max(0, Math.min(1, v)); return t * t * (3 - 2 * t); };
+        for (let y = 0; y < AH; y++) {
+          for (let x = 0; x < AW; x++) {
+            const i = (y * AW + x) * 4;
+            const v = 120 + contrast * ss((x - (120 + dx)) / soft + 0.5) * ss((y - 80) / soft + 0.5);
+            a[i] = a[i + 1] = a[i + 2] = v;
+            a[i + 3] = 255;
+          }
+        }
+        return Tracker.buildPyramid(Tracker.gray(a, AW, AH), AW, AH, 3);
+      };
+      const softTex = Tracker.textureAt(softCorner(0, 40, 4), 120, 80, {});
+      const soft = Tracker.stepPoint(softCorner(0, 40, 4), softCorner(3, 40, 4),
+        { x: 120, y: 80, c: 1 }, {});
+      ok('an ordinary soft button corner scores LOW on texture - it is not a hard corner',
+        softTex > Tracker.DEFAULTS.minTex && softTex < 0.4, 'tex = ' + softTex.toFixed(3));
+      ok('...and is followed exactly all the same',
+        Math.abs(soft.x - 123) < 0.05, 'x = ' + soft.x.toFixed(3) + ' (want 123)');
+      ok('...and is therefore reported CONFIDENT, not lost. THIS IS THE BUG THIS SPLIT ' +
+        'FIXED: multiplied together, a texture of ' + softTex.toFixed(2) + ' called a ' +
+        'perfectly tracked point lost',
+        !soft.held && soft.c > 0.8, 'c = ' + soft.c.toFixed(3));
+      ok('a straight EDGE is not trackable by one point at any contrast - the aperture ' +
+        'problem, which is what the snap exists to walk away from',
+        Tracker.textureAt(softCorner(0, 200, 2), 120, 20, {}) < Tracker.DEFAULTS.minTex);
+      note('calibration, which is where minTex comes from: a 40-level/4px soft corner ' +
+        'scores ' + softTex.toFixed(3) + ', a 25-level one about 0.055, dither on a flat ' +
+        'wall about 0.012, and a hard corner 1.000. minTex is ' +
+        Tracker.DEFAULTS.minTex + '.')
 
       note('kernel cost: ' + msPerFrame.toFixed(2) + ' ms per frame per point at ' +
         AW + 'x' + AH + ', plain JS, 3 pyramid levels. A solve is seek-bound, not ' +
@@ -128,7 +187,34 @@
         })());
     }
 
-    // ====================================================== 3. the worker build
+    // ============================== 3. scoring a point, and snapping to a real one
+
+    {
+      const p0 = pyr(0, 0);
+      ok('a corner scores high and a flat wall scores nothing',
+        Tracker.textureAt(p0, 40.5, 40.5, {}) > 0.9 &&
+        Tracker.textureAt(p0, 200, 140, {}) < Tracker.DEFAULTS.minTex);
+
+      // The snap is what turns "click roughly on the thing" into a tracker that works.
+      const t0 = performance.now();
+      const snapped = Tracker.bestFeatureNear(p0, 55, 55, 20, {});
+      const ms = performance.now() - t0;
+      ok('a drop near a corner snaps onto the feature rather than staying in the flat middle',
+        snapped.tex > 0.9, 'tex ' + Tracker.textureAt(p0, 55, 55, {}).toFixed(3) +
+        ' -> ' + snapped.tex.toFixed(3) + ' at ' + snapped.x + ',' + snapped.y);
+      ok('...and never further than the reach it was given',
+        Math.hypot(snapped.x - 55, snapped.y - 55) <= 20 + 1e-9);
+      ok('...and it is fast enough to run on a click, at any radius',
+        ms < 80, ms.toFixed(1) + ' ms');
+      ok('a drop in the middle of nowhere snaps to nothing and says so',
+        Tracker.bestFeatureNear(p0, 210, 140, 12, {}).tex < Tracker.DEFAULTS.minTex);
+
+      ok('a fresh tracker is NOT solved, and one with samples is',
+        !Tracker.isSolved(Tracker.makeTrack(0, 0.5, 0.5, {})) &&
+        Tracker.isSolved({ points: [{ t: 0, x: 0, y: 0, c: 1 }, { t: 1, x: 0, y: 0, c: 1 }] }));
+    }
+
+    // ====================================================== 3b. the worker build
 
     {
       const w = await trackWorker();
@@ -467,6 +553,58 @@
             { fx: [Object.assign(FX.create('spotlight'), { bind: { track: 'gone', offX: 0, offY: 0 } })] })));
         ok('...and a clip WITH one paints something different, or the binding does nothing',
           shot(withTrack) !== shot(bareFx));
+      }
+
+      // ---------------------------------------------------- the placement flow
+      //
+      // The order that was wrong in the first build: adding a tracker SOLVED it, from the
+      // middle of the frame, which is almost never what anyone wants followed.
+      {
+        const c3 = live();
+        c3.tracks = [];
+        Tracker.normalizeClip(c3);
+        const undoA = undoStack.length;
+        const tk2 = await addTracker(c3, 0.5, 0.5);
+        ok('adding a tracker is ONE undo entry', undoStack.length === undoA + 1);
+        ok('...and it does NOT solve: it is a marker waiting to be put somewhere',
+          !Tracker.isSolved(tk2) && tk2.points.length === 1 && !Trk.busy);
+        note('this clip has no decodable media in the suite, so the drop is placed ' +
+          'unscored - which is the other half of the contract: a decoder that cannot ' +
+          'answer must not swallow the interaction');
+        renderInspector();
+        const btn = [...document.querySelectorAll('#inspector .trk-box button')]
+          .map((b) => b.textContent);
+        ok('the panel offers Solve, not Re-solve, on a tracker nobody has solved',
+          btn.includes('Solve') && !btn.includes('Re-solve'));
+        ok('...and the panel says it is not solved rather than quoting a meaningless 100%',
+          /not solved yet/.test(document.querySelector('#inspector .trk-box').textContent));
+
+        // Dragging an UNSOLVED marker is still placing it: no solve, no busy flag.
+        const undoB = undoStack.length;
+        await reanchorTracker(c3, tk2, 0.3, 0.4);
+        ok('dragging an unsolved marker moves it and starts no solve',
+          !Trk.busy && !Tracker.isSolved(tk2) && undoStack.length === undoB + 1);
+
+        // A point with nothing to track is refused BEFORE a seek per frame proves it.
+        tk2.tex = 0.001;
+        const refused = await solveTrack(c3, tk2, false);
+        ok('solving a point with nothing to track is refused, with a reason',
+          refused === null && /Nothing to track/.test($('#renderStatus').textContent));
+        renderInspector();
+        ok('...and the panel disables Solve and says what to do instead',
+          [...document.querySelectorAll('#inspector .trk-box button')]
+            .some((b) => b.textContent === 'Solve' && b.disabled) &&
+          /flat/.test(document.querySelector('#inspector .trk-box').textContent));
+
+        // Once it IS solved, the panel changes its mind about the verb.
+        tk2.tex = 0.9;
+        Tracker.mergePoints(tk2, [{ t: tk2.anchor.t + 0.1, x: 0.31, y: 0.41, c: 0.9 }]);
+        renderInspector();
+        ok('a solved track offers Re-solve',
+          [...document.querySelectorAll('#inspector .trk-box button')]
+            .some((b) => b.textContent === 'Re-solve'));
+        c3.tracks = [];
+        Tracker.normalizeClip(c3);
       }
 
       // Leave the timeline as it was found.

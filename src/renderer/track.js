@@ -52,7 +52,8 @@
     levels: 3,        // pyramid levels including the full-resolution one
     iters: 14,        // Newton steps per level
     eps: 0.008,       // stop when a step moves less than this many pixels
-    minEig: 0.0015,   // below this the window has no texture to track (a flat wall)
+    minEig: 0.0015,   // the scale the texture score is measured against
+    minTex: 0.03,     // below this there is NOTHING here to track - a flat wall
     resid: 22,        // luma RMS residual, in levels of 255, that reads as "lost"
     minConf: 0.35,    // below this the point is HELD rather than moved
     res: 480,         // the long side the solve runs at, in pixels
@@ -178,17 +179,99 @@
         gx = r.dx; gy = r.dy; minEig = r.minEig; rms = r.rms;
         if (l > 0) { gx *= 2; gy *= 2; }
       }
-      // Two independent ways to be wrong, multiplied: nothing to track, and a window
-      // that no longer looks like the one we anchored on.
+      /*
+       * TEXTURE AND FIT ARE DIFFERENT QUESTIONS, AND CONFIDENCE IS ONLY THE SECOND ONE.
+       *
+       * They were multiplied together once, and the result was a tracker that reported
+       * "lost" on footage it was following perfectly. Texture - the window's Shi-Tomasi
+       * score - asks "is there anything here worth anchoring to", and most of a real UI
+       * is soft: antialiased text, a gentle gradient, a button with one crisp edge. Those
+       * score modestly and track beautifully, so folding texture into a per-frame
+       * confidence marked every one of them lost while the point sat exactly where it
+       * belonged.
+       *
+       * Texture is a property of the POINT and is asked ONCE, when the tracker is
+       * anchored - `textureAt()` below, which is what the panel warns from and what
+       * `bestFeatureNear()` searches with. Confidence is a property of each FRAME and is
+       * the fit: does this window still look like the one we anchored on. That is exactly
+       * the question occlusion makes fail, which is what confidence is for.
+       *
+       * The one thing texture still does here is act as a FLOOR. A perfectly flat window
+       * matches everywhere, so its residual is tiny and its fit is excellent and utterly
+       * meaningless - it would report high confidence while sliding anywhere at all. Below
+       * `minTex` there is no information, so the answer is zero rather than a good-looking
+       * number, and `smoke-track.js` asserts exactly that on a flat interior.
+       */
       const tex = clamp(minEig / o.minEig, 0, 1);
       const fit = clamp(1 - rms / Math.max(1, o.resid), 0, 1);
       const x = p.x + gx, y = p.y + gy;
       const inFrame = x >= 0 && y >= 0 && x <= prevPyr[0].w - 1 && y <= prevPyr[0].h - 1;
-      return {
-        x, y,
-        c: isFinite(x) && isFinite(y) && inFrame ? clamp(tex * fit, 0, 1) : 0,
-      };
+      const usable = isFinite(x) && isFinite(y) && inFrame && tex >= o.minTex;
+      return { x, y, tex, fit, c: usable ? fit : 0 };
     });
+  }
+
+  /**
+   * How much there is to track at a point: 0 (a flat wall) to 1 (a hard corner).
+   *
+   * Measured on ONE frame against itself, so it is a property of the picture rather than
+   * of any motion. The scale is calibrated against soft corners rather than hard ones,
+   * because real interface footage is made of soft corners: a 40-level, 4-pixel-soft
+   * corner - an ordinary button edge - scores about 0.11 and tracks perfectly, while a
+   * flat wall scores 0.000 and a field of ±7-level dither scores about 0.012. That is
+   * why `minTex` sits at 0.03 and not somewhere that sounds more confident: everything
+   * above it is genuinely trackable, and the panel warns separately about the weak end
+   * of that range. This is the number the panel shows before a solve and the number a
+   * refusal quotes, because "there is nothing at that point to follow" is a question that
+   * can be answered the instant the tracker is dropped - long before a solve has spent a
+   * seek per frame proving it the expensive way.
+   */
+  function textureAt(pyr, x, y, opts) {
+    return trackPoints(pyr, pyr, [{ x, y }], opts)[0].tex;
+  }
+
+  /**
+   * The strongest feature within `radius` of a point, or the point itself.
+   *
+   * What turns "click roughly on the button" into a tracker that works. A person aims at
+   * the middle of a thing; the middle of a thing is usually its flattest part, and its
+   * corners - a few pixels away - are what an optical flow can actually hold on to. So a
+   * drop snaps to the best point nearby rather than demanding the author understand why
+   * the centre of a button is the worst place to put a tracker.
+   *
+   * Coarse-to-fine over a small grid: exhaustive at this radius is a few hundred window
+   * scores, which is under a millisecond and happens once per drop.
+   */
+  function bestFeatureNear(pyr, x, y, radius, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const r = Math.max(0, num(radius, 0));
+    let best = { x, y, tex: textureAt(pyr, x, y, o) };
+    if (!(r > 0)) return best;
+    // A COARSE PASS OVER THE DISC, then refinement around the winner only. The refinement
+    // must not re-scan the whole disc at a finer step - that is quadratic in the radius
+    // and cost 444 ms at r=30, which is a visible stall on a click. Scanning a fixed
+    // ~9x9 grid however wide the disc is, then narrowing twice, is a couple of hundred
+    // window scores whatever the radius.
+    const scan = (cx, cy, reach, step) => {
+      for (let dy = -reach; dy <= reach; dy += step) {
+        for (let dx = -reach; dx <= reach; dx += step) {
+          const px = clamp(Math.round(cx + dx), 0, pyr[0].w - 1);
+          const py = clamp(Math.round(cy + dy), 0, pyr[0].h - 1);
+          if ((px - x) * (px - x) + (py - y) * (py - y) > r * r) continue;   // outside the disc
+          const tex = textureAt(pyr, px, py, o);
+          // Ties go to the point nearer where the author actually aimed.
+          if (tex > best.tex + 1e-6) best = { x: px, y: py, tex };
+        }
+      }
+    };
+    let step = Math.max(1, Math.round(r / 4));
+    scan(x, y, r, step);
+    while (step > 1) {
+      const next = Math.max(1, Math.floor(step / 2));
+      scan(best.x, best.y, step, next);
+      step = next;
+    }
+    return best;
   }
 
   /**
@@ -220,12 +303,27 @@
       id: uid(),
       name: (o && o.name) ? String(o.name) : 'Track',
       res: Math.round(opt.res), rate: Math.round(opt.rate), win: Math.round(opt.win),
+      // The anchor's texture score, as measured when it was dropped. A plain number on
+      // plain JSON, so the panel can say how good the point is without decoding a frame
+      // every time it rebuilds, and `solved` stays the one thing that says whether a
+      // solve has happened yet.
+      tex: (o && isFinite(Number(o.tex))) ? r5(o.tex) : null,
       anchor: { t: r4(t), x: r5(x), y: r5(y) },
       points: [{ t: r4(t), x: r5(x), y: r5(y), c: 1 }],
     };
   }
 
   const hasTracks = (clip) => !!(clip && Array.isArray(clip.tracks) && clip.tracks.length);
+
+  /**
+   * Has this track been solved, or is it still just a marker somebody dropped?
+   *
+   * A fresh tracker holds exactly one sample - its anchor - and that distinction drives
+   * the whole flow: an unsolved tracker is dragged freely, and a solved one re-solves
+   * forward when it is dragged, because then there is solved work in front of it to
+   * replace. The panel reads it too, for Solve versus Re-solve.
+   */
+  const isSolved = (track) => !!(track && Array.isArray(track.points) && track.points.length > 1);
 
   function trackById(clip, id) {
     if (!hasTracks(clip)) return null;
@@ -252,6 +350,7 @@
           .sort((a, b) => a.t - b.t);
         const a = t.anchor || t.points[0];
         t.anchor = { t: r4(a.t), x: r5(a.x), y: r5(a.y) };
+        t.tex = isFinite(Number(t.tex)) ? r5(t.tex) : null;
         return t;
       })
       .filter((t) => t.points.length);
@@ -437,7 +536,8 @@
     DEFAULTS,
     gray, buildPyramid, trackPoints, stepPoint, sample,
     makeTrack, normalizeClip, hasTracks, trackById,
-    sampleAt, positionAt, reanchorAt, mergePoints, worstIn,
+    sampleAt, positionAt, reanchorAt, mergePoints, worstIn, isSolved,
+    textureAt, bestFeatureNear,
     frameMap, bindPos, digest, cacheKey,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
