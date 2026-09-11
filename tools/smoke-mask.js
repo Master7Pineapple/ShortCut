@@ -572,6 +572,106 @@
         renderAll();
       }
 
+      // ---- test one frame, THEN commit to the clip.
+      //
+      // A solve costs the encoder once per matte, which is minutes on a clip of any length.
+      // Everything else in the panel changes what a solve would produce, so committing to
+      // one before checking a single frame is committing to finding out slowly.
+      {
+        const c1 = live();
+        pushUndo();
+        c1.masks = [MagicMask.makeMask('Staged')];
+        MagicMask.addStroke(c1.masks[0], 1.0, +1, [0.4, 0.5, 0.45, 0.55], 0.03);
+        MagicMask.normalizeClip(c1);
+        Mask.perFrame = 0;
+        renderInspector();
+        const mk = c1.masks[0];
+
+        const labels = () => [...document.querySelectorAll('#inspector .mm-box button')]
+          .map((b) => b.textContent.trim());
+        ok('the panel offers a one-frame TEST beside the whole-clip solve, as two buttons ' +
+          'rather than one - they cost seconds and minutes respectively',
+          labels().some((t) => /Test this frame/.test(t)) &&
+          labels().some((t) => /Solve clip/.test(t)));
+
+        // The estimate: what a solve would cost, BEFORE it is run.
+        const est = mmEstimate(c1, mk);
+        ok('Solve prices itself before it runs - a button that might mean four minutes and ' +
+          'does not say so is how a feature gets abandoned halfway through its first use',
+          !!est && est.frames === MagicMask.plan(mk, c1.in, c1.out, mk.rate).length &&
+          est.seconds > 0,
+          est.frames + ' mattes, ~' + mmDur(est.seconds));
+        ok('...and the button carries that figure rather than hiding it in a tooltip',
+          labels().some((t) => /Solve clip\s+\(~/.test(t)),
+          labels().find((t) => /Solve clip/.test(t)));
+        ok('...and it says the figure is an ESTIMATE until a frame has actually been cut ' +
+          'here - a measured number and a guessed one must not look the same',
+          est.measured === false);
+
+        Mask.perFrame = 3;
+        const measured = mmEstimate(c1, mk);
+        ok('...and once a frame HAS been cut, the estimate is that measurement times the ' +
+          'frame count - this machine, this engine, this clip, which is the only number ' +
+          'that would ever be right',
+          measured.measured === true && near(measured.seconds, measured.frames * 3, 1e-6));
+
+        ok('a duration is written for a person to act on, not in seconds',
+          mmDur(38) === '38 s' && /min/.test(mmDur(161)), mmDur(38) + ' / ' + mmDur(161));
+
+        // Halving the rate halves the cost, which is the whole point of exposing it.
+        const fast = (() => {
+          mk.rate = 24;
+          MagicMask.normalizeMask(mk);
+          const e = mmEstimate(c1, mk);
+          mk.rate = 12;
+          MagicMask.normalizeMask(mk);
+          return e;
+        })();
+        ok('doubling the mattes-a-second roughly doubles what a solve costs, so the ' +
+          'accuracy/time trade is visible before it is paid for',
+          fast.seconds > measured.seconds * 1.8,
+          mmDur(measured.seconds) + ' at 12/s -> ' + mmDur(fast.seconds) + ' at 24/s');
+
+        // Coverage: the number a test answers, and the case it exists to name.
+        const full = new Uint8ClampedArray(100);
+        full.fill(255);
+        ok('a test reports COVERAGE, so "it selected the whole picture" is a number rather ' +
+          'than something to infer from a wash of tint - the exact failure the 128px bug ' +
+          'presented as',
+          mmCoverage(full) === 100 && mmCoverage(new Uint8ClampedArray(100)) === 0);
+
+        // The two accuracy controls, and what changing one must do.
+        const setRows = [...document.querySelectorAll('#inspector .mm-box .mm-set .tc-row label')]
+          .map((l) => l.textContent.trim());
+        ok('the panel exposes the two things that actually change the answer - the detail ' +
+          'the segmenter runs at, and how often the object is re-cut',
+          setRows.length === 2 && /Detail/.test(setRows[0]) && /Mattes/.test(setRows[1]),
+          setRows.join(' | '));
+
+        const keyAt = (res, rate) => {
+          const save = [mk.res, mk.rate];
+          mk.res = res; mk.rate = rate;
+          MagicMask.normalizeMask(mk);
+          const k = MagicMask.cacheKey({ t0: c1.in, t1: c1.out, res: mk.res, rate: mk.rate,
+            engine: 'local', mask: mk });
+          mk.res = save[0]; mk.rate = save[1];
+          MagicMask.normalizeMask(mk);
+          return k;
+        };
+        const std = keyAt(1024, 12);
+        ok('turning Detail down is a different cache key, so the mattes cut at the old ' +
+          'setting are not served back', keyAt(512, 12) !== std);
+        ok('...and turning it back up serves them straight out of the disk cache again, ' +
+          'because a key is content and not a timestamp',
+          keyAt(1024, 12) === std);
+        ok('the rate is in the key too - it decides which frames exist, not just how many',
+          keyAt(1024, 24) !== std);
+
+        delete c1.masks;
+        Mask.perFrame = 0;
+        renderAll();
+      }
+
       const c = live();
       ok('a clip with no mask carries no `masks` key at all - absent by default, exactly ' +
         'as `fx`, `keys` and `tracks` are',

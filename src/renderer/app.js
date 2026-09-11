@@ -6992,6 +6992,7 @@ const Mask = {
   mattes: new Map(),   // clipId|maskId -> { key, w, h, frames: [{ t, alpha }] }
   live: null,          // { clipId, maskId, t, w, h, alpha } - the frame being painted on
   plate: null,         // the last plate handed to fx.js, memoised by its own signature
+  perFrame: 0,         // seconds one matte actually took here, so a solve can be priced
   active: new Map(),   // clipId -> maskId, which mask the panel is painting into
 };
 
@@ -7247,6 +7248,9 @@ async function mmSolve(clip, mask) {
     }
     markDirty();
     renderAll();
+    // A completed solve is a better measurement than a test frame, because it includes the
+    // seek the test frame does not.
+    Mask.perFrame = Math.max(0.01, (performance.now() - t0) / 1000 / frames.length);
     mmStatus('Mask cut: ' + frames.length + ' mattes in ' +
       ((performance.now() - t0) / 1000).toFixed(1) + 's, by ' +
       (Mask.engine === 'sam' ? 'MobileSAM' : 'the built-in colour engine') + '.');
@@ -7267,9 +7271,10 @@ async function mmSolve(clip, mask) {
  * frame's embedding under the same key. The key is the clip's source and the frame time,
  * which is exactly "the same picture" and nothing else.
  */
-async function mmLive(clip, mask) {
+async function mmLive(clip, mask, force) {
   const el = mediaFor(clip);
-  if (!el || Mask.busy) return null;
+  if (!el || (Mask.busy && !force)) return null;
+  const t0 = performance.now();
   const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
   const { aw, ah } = mmSize(clip, mask);
   const img = await trkFrame(el, tSrc, aw, ah);
@@ -7283,8 +7288,100 @@ async function mmLive(clip, mask) {
   if (!alpha) return null;
   Mask.live = { clipId: clip.id, maskId: mask.id, t: tSrc, w: aw, h: ah, alpha };
   Mask.plate = null;
+  /*
+   * WHAT ONE FRAME COST, kept so the panel can price a whole solve BEFORE it is run.
+   *
+   * A solve is minutes, not seconds - the encoder is the expensive half and it runs once
+   * per matte. Asking someone to commit to that with no idea whether it is thirty seconds
+   * or six minutes is how a feature gets abandoned halfway through its first use. The
+   * estimate is measured rather than assumed, and it is measured on THIS machine with
+   * THIS engine on THIS clip, which is the only number that would ever be right.
+   *
+   * A test frame is the fair measurement for a propagated one: both run the encoder once
+   * and the decoder once. What it does not include is the seek, which is why the panel
+   * says "about".
+   */
+  Mask.perFrame = Math.max(0.01, (performance.now() - t0) / 1000);
   renderAll();
   return alpha;
+}
+
+/** How much of the frame this matte covers, as a percentage. The number a test answers. */
+function mmCoverage(alpha) {
+  if (!alpha || !alpha.length) return 0;
+  let n = 0;
+  for (let i = 0; i < alpha.length; i++) if (alpha[i] >= 128) n++;
+  return 100 * n / alpha.length;
+}
+
+/**
+ * TEST ONE FRAME, then commit to the clip. The two-stage flow this feature needs.
+ *
+ * Every stroke already re-cuts the frame under the brush - that is what the tint is - but
+ * it happens implicitly, and "implicitly" is not something anybody can rely on before
+ * spending four minutes of inference. This is the same work with a button on it and a
+ * NUMBER at the end, so the settings above can be dialled in against one frame and the
+ * clip solved once, rather than solved three times to find out.
+ *
+ * The coverage is the honest read. A matte over 92% of the frame has selected the picture
+ * rather than the object, which is what a too-small analysis resolution does and what the
+ * first build shipped doing - so the panel names that case rather than leaving someone to
+ * infer it from a wash of tint.
+ */
+async function mmTestFrame(clip, mask) {
+  if (Mask.busy) { setStatus('A mask is already solving.', 'err'); return null; }
+  if (!MagicMask.anchors(mask).length) {
+    setStatus('Paint a stroke first - a test needs something to cut from.', 'err');
+    return null;
+  }
+  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  if (!MagicMask.promptsAt(mask, tSrc, 100, 100).length) {
+    const at = MagicMask.anchorFor(mask, tSrc);
+    setStatus('No strokes on this frame. Scrub to ' + (at == null ? 'a painted frame' :
+      (at - clip.in).toFixed(2) + 's into the clip') + ', or paint here first.', 'err');
+    return null;
+  }
+  Mask.busy = true;
+  renderInspector();
+  try {
+    setStatus('Cutting this frame...');
+    const alpha = await mmLive(clip, mask, true);
+    if (!alpha) { mmStatus('That frame could not be cut - no decodable picture there.', 'err'); return null; }
+    const cov = mmCoverage(alpha);
+    const eng = Mask.engine === 'sam' ? 'MobileSAM' : 'the built-in colour engine';
+    if (cov > 92) {
+      mmStatus('This frame came back covering ' + cov.toFixed(0) + '% of the picture - that ' +
+        'is the whole frame, not the object. Raise Detail, or add a Subtract stroke on ' +
+        'the background.', 'err');
+    } else if (cov < 0.4) {
+      mmStatus('This frame came back nearly empty (' + cov.toFixed(1) + '%). Try a longer ' +
+        'stroke across the middle of the object.', 'err');
+    } else {
+      mmStatus('This frame: the matte covers ' + cov.toFixed(1) + '% of the picture, cut by ' +
+        eng + ' in ' + Mask.perFrame.toFixed(1) + 's. Happy with it? Press Solve clip.');
+    }
+    return alpha;
+  } finally {
+    Mask.busy = false;
+    renderInspector();
+  }
+}
+
+/** What a whole solve would cost, from what one frame actually took. */
+function mmEstimate(clip, mask) {
+  const n = MagicMask.plan(mask, clip.in, clip.out, mask.rate).length;
+  if (!n) return null;
+  // Until a frame has been measured, price it with the engine's own order of magnitude -
+  // and say "about" either way, because the seek is not in the measurement.
+  const per = Mask.perFrame || ((Mask.state && Mask.state.ready) ? 2.2 : 0.15);
+  return { frames: n, seconds: n * per, measured: !!Mask.perFrame };
+}
+
+/** "4 min 10 s", "38 s" - a duration a person can act on. */
+function mmDur(sec) {
+  if (sec < 90) return Math.max(1, Math.round(sec)) + ' s';
+  const m = Math.floor(sec / 60);
+  return m + ' min ' + Math.round(sec - m * 60) + ' s';
 }
 
 /** The mask the panel paints into on this clip - the first one unless told otherwise. */
@@ -7611,8 +7708,35 @@ function maskPanel(clip) {
       (store ? ', ' + store.frames.length + ' mattes' : ', not solved')));
     mrow.appendChild(bar);
 
+    /*
+     * TEST ONE FRAME, THEN SOLVE THE CLIP - and the two are deliberately different buttons.
+     *
+     * A solve costs the encoder once per matte, which is minutes on a clip of any length.
+     * Every other control in this panel changes what a solve would produce, so committing
+     * to one before checking a single frame is committing to finding out slowly. The test
+     * is the same work on one frame with a NUMBER at the end, and Solve then prices itself
+     * from what that frame actually took on this machine.
+     */
     const b2 = el('div', 'fx-add');
-    const solve = el('button', 'mini', store ? 'Re-solve' : 'Solve');
+
+    const test = el('button', 'mini', 'Test this frame');
+    test.title = 'Cuts the frame at the playhead and nothing else, and says how much of ' +
+      'the picture the matte covers. Free to repeat - use it to dial in the settings ' +
+      'below before spending a whole solve.';
+    test.disabled = Mask.busy || !anch.length;
+    test.addEventListener('click', () => mmTestFrame(clip, mask));
+    b2.appendChild(test);
+
+    const est = mmEstimate(clip, mask);
+    const solve = el('button', 'mini', (store ? 'Re-solve' : 'Solve') + ' clip' +
+      (est ? '  (~' + mmDur(est.seconds) + ')' : ''));
+    solve.title = est
+      ? est.frames + ' mattes at ' + mask.rate + ' a second, about ' +
+        (Mask.perFrame || 0).toFixed(1) + 's each' +
+        (est.measured ? ' as measured on the last frame cut here.'
+          : ' - an estimate until a frame has actually been cut.') +
+        '  Cached on disk afterwards, so it comes back instantly next time.'
+      : 'Paint a stroke first.';
     solve.disabled = Mask.busy || !anch.length;
     solve.addEventListener('click', () => mmSolve(clip, mask));
     b2.appendChild(solve);
@@ -7654,13 +7778,67 @@ function maskPanel(clip) {
     del.addEventListener('click', () => mmRemoveMask(clip, mask));
     b2.appendChild(del);
     mrow.appendChild(b2);
+
+    /*
+     * THE TWO THINGS THAT ACTUALLY CHANGE THE ANSWER, and nothing else.
+     *
+     * Both already live on the mask and both are already in the matte cache key, so
+     * exposing them is genuinely only UI - turning either one down and back up serves the
+     * old mattes straight back out of the disk cache.
+     *
+     *   Detail  the long side the segmenter runs at. This is the one that matters most and
+     *           the one that has already gone wrong once: MobileSAM is trained at 1024 and
+     *           degrades sharply below it - measured on a plate whose answer is known to
+     *           the pixel, 1024 came back exact, 512 a third too big, and the 128 the first
+     *           build shipped by accident returned 99.9% of the frame. So Fast is offered
+     *           with its cost stated rather than as a neutral choice.
+     *   Mattes   how often the object is re-cut. It is the whole cost of a solve and the
+     *   a second whole of how well a fast-moving object is followed, in one number.
+     *
+     * Changing either is a real edit to the clip - undo, dirty, repaint - and it drops the
+     * mattes that were cut under the old value, because they are no longer what this
+     * mask's key names.
+     */
+    const settings = el('div', 'mm-set');
+    const reCut = () => {
+      MagicMask.normalizeClip(clip);
+      Mask.mattes.delete(mmKey(clip, mask));
+      Mask.live = null;
+      Mask.plate = null;
+      Mask.perFrame = 0;          // a different size is a different cost; re-measure it
+      markDirty();
+      renderAll();
+      renderInspector();
+    };
+    // The inspector's own once-per-gesture guard for the undo snapshot, and `onChanged`
+    // for the work - the same three hooks every other clip panel passes. Dragging the
+    // rate slider is ONE undo entry, not one per notch.
+    const setHooks = { onEdit: inspectorEdit, onEditEnd: inspectorEditEnd, onChanged: reCut };
+    settings.appendChild(TextUI.control({
+      path: 'res', label: 'Detail', type: 'select',
+      options: [
+        { value: 512, label: 'Fast - 512 (coarser, misses fine edges)' },
+        { value: 1024, label: 'Standard - 1024 (the model’s own scale)' },
+        { value: 2048, label: 'Fine - 2048 (crisper edge, 4x the memory)' },
+      ],
+    }, mask, { res: MagicMask.DEFAULTS.res }, setHooks));
+    settings.appendChild(TextUI.control({
+      path: 'rate', label: 'Mattes a second', type: 'range',
+      min: MagicMask.RATE_MIN, max: 30, step: 1, digits: 0,
+    }, mask, { rate: MagicMask.DEFAULTS.rate }, setHooks));
+    mrow.appendChild(settings);
+
     box.appendChild(mrow);
   }
 
   if (MagicMask.hasMasks(clip)) {
+    // The brush is a TOOL, not project state: it takes no undo entry and does not dirty
+    // the file, which is why it passes empty begin/end hooks the way the Tighten panel's
+    // own settings do.
     box.appendChild(TextUI.control(
       { path: 'brush', label: 'Brush size', type: 'range', min: 0.004, max: 0.2, step: 0.002, digits: 3 },
-      Mask, { brush: MagicMask.DEFAULTS.brush }, { onEdit: () => renderAll() }));
+      Mask, { brush: MagicMask.DEFAULTS.brush },
+      { onEdit: () => {}, onEditEnd: () => {}, onChanged: () => renderAll() }));
   }
   return box;
 }

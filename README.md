@@ -2254,6 +2254,43 @@ output of those prompts over that file at that resolution, so hashing them as we
 be hashing the same fact twice — and it would drag fifty megabytes through a function the
 timeline calls on every repaint.
 
+#### Test one frame, then commit to the clip
+
+A solve runs the encoder once per matte, so it is minutes on a clip of any length — and
+everything else in the panel changes what a solve would *produce*. Committing to one before
+checking a single frame is committing to finding out slowly, three solves later.
+
+So the panel has two buttons, not one:
+
+- **Test this frame** cuts the frame at the playhead and nothing else, and reports what
+  came back: *"the matte covers 9.4% of the picture, cut by MobileSAM in 2.1 s."* Free to
+  repeat, so the settings below it can be dialled in against one frame.
+- **Solve clip (~2 min 41 s)** prices itself *before* it runs, from what a frame actually
+  took on **this** machine with **this** engine on **this** clip — the only number that
+  would ever be right. Until a frame has been cut it says so: an estimate and a measurement
+  must not look the same.
+
+Coverage is the honest read, and it exists to name a specific failure. A matte over 92% of
+the frame has selected the *picture*, not the object — which is exactly what the 128 px bug
+produced, and it presented as an unexplained wash of tint. The panel now says it in a
+sentence. Under 0.4% gets the opposite advice.
+
+Two settings, and deliberately only the two that change the answer:
+
+| | what it does | cost |
+| --- | --- | --- |
+| **Detail** | the long side the segmenter runs at — Fast 512, Standard 1024, Fine 2048 | memory, and accuracy below 1024 |
+| **Mattes a second** | how often the object is re-cut, 4–30 | linear: it *is* the solve time |
+
+Both already lived on the mask and both were already in the matte cache key, so exposing
+them is genuinely only UI — turn Detail down and back up and the old mattes come straight
+back out of the disk cache, because a key is content and not a timestamp. Changing either
+is a real edit: one undo entry for a slider drag, and the mattes cut under the old value
+are dropped because they are no longer what this mask's key names.
+
+`Fast — 512` is offered with its cost stated rather than as a neutral choice, because it is
+not one: MobileSAM is trained at 1024 and degrades sharply below it.
+
 #### The panel and the brush
 
 **Magic Mask** sits above the effect stack in the clip inspector, for the same reason
