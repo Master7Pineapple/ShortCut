@@ -7302,10 +7302,14 @@ function mmAddMask(clip) {
   MagicMask.normalizeClip(clip);
   Mask.active.set(clip.id, m.id);
   Mask.on = true;
+  // A fresh mask always starts by ADDING. Leaving the brush in Subtract from the last mask
+  // means the first stroke on a new one paints background and selects nothing, which reads
+  // as the model failing rather than as the brush being in the other mode.
+  Mask.sign = 1;
   markDirty();
   renderAll();
-  mmStatus('Brush armed. Scrub to a frame and drag across the object. Hold Alt to paint ' +
-    'BACKGROUND - that is how a gap between an arm and a torso gets cut away.');
+  mmStatus('Brush armed, set to Add. Scrub to a frame and drag across the object. If it ' +
+    'picks up something you did not want, switch to Subtract and drag over that.');
   return m;
 }
 
@@ -7346,7 +7350,12 @@ canvas.addEventListener('pointerdown', (e) => {
   // ALT is the negative brush, read ONCE at the press: a modifier that could change
   // halfway through a drag would give one stroke two meanings.
   Mask.stroke = {
-    clip, mask, sign: e.altKey ? -1 : Mask.sign,
+    // ALT INVERTS THE CURRENT MODE rather than hardwiring "subtract", which is what every
+    // painting tool that has both does: in Add it gives you Subtract, and in Subtract it
+    // gives you Add. A modifier that always meant the same thing would leave someone in
+    // Subtract mode with no momentary way back. Read ONCE, at the press: one that could
+    // change halfway through a drag would give a single stroke two meanings.
+    clip, mask, sign: e.altKey ? -Mask.sign : Mask.sign,
     pts: [s.x, s.y],
     t: clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out),
   };
@@ -7519,10 +7528,11 @@ function maskPanel(clip) {
   }
 
   box.appendChild(el('div', 'tc-hint fx-note',
-    'Add a mask, then drag across the object on the viewer. Alt-drag paints BACKGROUND - ' +
-    'that is how the gap between an arm and a torso gets cut away, and a click-only tool ' +
-    'cannot say it. Solve propagates across the clip; when it drifts, scrub to that frame, ' +
-    'paint a correction and solve again - everything before the correction is kept.'));
+    'Add a mask, then drag across the object on the viewer. When the brush picks up ' +
+    'something you did not want, switch to Subtract and drag over that - it is how the gap ' +
+    'between an arm and a torso gets cut away, and a tool with only one brush cannot say ' +
+    'it. Solve propagates across the clip; when it drifts, scrub to that frame, paint a ' +
+    'correction and solve again - everything before the correction is kept.'));
 
   const row = el('div', 'fx-add');
   const add = el('button', 'mini', 'Add a mask');
@@ -7544,6 +7554,48 @@ function maskPanel(clip) {
     row.appendChild(stop);
   }
   box.appendChild(row);
+
+  /*
+   * ADD and SUBTRACT as two visible buttons, not a modifier anybody has to be told about.
+   *
+   * Both brushes existed from the start - Alt-drag has always painted background - and it
+   * may as well not have: the first person to use the feature hit exactly the problem
+   * subtraction solves, read the panel that described Alt-drag, and asked for the minus
+   * brush to be added. A capability nobody can find is not a capability, and a line of
+   * hint text in a four-sentence paragraph is not a control.
+   *
+   * So the MODE is a pair of buttons that show which one is live and colour-match the
+   * strokes on the viewer, and Alt stays as the momentary override for the other one.
+   */
+  if (MagicMask.hasMasks(clip)) {
+    const signRow = el('div', 'fx-add mm-sign');
+    for (const [val, label, hint] of [
+      [+1, '+  Add', 'Paint the object. Everything you drag across is kept.'],
+      [-1, '−  Subtract',
+        'Paint background. Drag over anything the brush picked up that you did not want - ' +
+        'the region under the stroke is cut back out.'],
+    ]) {
+      const b = el('button', 'mini', label);
+      const live = Mask.sign === val;
+      b.classList.toggle('on', live);
+      b.classList.add(val > 0 ? 'mm-add' : 'mm-sub');
+      b.title = hint + '  (hold Alt while dragging for the other one.)';
+      b.addEventListener('click', () => {
+        Mask.sign = val;
+        // Switching the brush arms it: reaching for Subtract is already the decision to
+        // paint, and making someone press Brush afterwards is a step with no question in it.
+        Mask.on = true;
+        renderAll();
+        renderInspector();
+      });
+      signRow.appendChild(b);
+    }
+    box.appendChild(signRow);
+    box.appendChild(el('div', 'tc-hint',
+      Mask.sign < 0
+        ? 'Subtracting: drag over what the mask should NOT include. Hold Alt to add instead.'
+        : 'Adding: drag over the object. Hold Alt to subtract instead.'));
+  }
 
   for (const mask of (clip.masks || [])) {
     const mrow = el('div', 'mm-row');

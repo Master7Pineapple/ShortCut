@@ -503,6 +503,75 @@
           return !!o && o.disabled && /painted mask/.test(o.textContent);
         })());
 
+      // ---- the two brushes, as CONTROLS rather than as a modifier nobody finds.
+      //
+      // Both brushes shipped from the start and Alt-drag has always painted background.
+      // It may as well not have: the first person to use the feature hit exactly the
+      // problem subtraction solves, read the panel that described Alt-drag, and asked for
+      // the minus brush to be added. So the mode is a pair of buttons now, and these
+      // assertions are about the thing that was actually missing - being able to SEE it.
+      {
+        const c0 = live();
+        pushUndo();
+        c0.masks = [MagicMask.makeMask('Brushes')];
+        MagicMask.normalizeClip(c0);
+        renderInspector();
+
+        const btns = [...document.querySelectorAll('#inspector .mm-box .mm-sign button')];
+        ok('the panel offers TWO brushes as buttons, not one brush and a modifier in a ' +
+          'paragraph of hint text - a capability nobody can find is not a capability',
+          btns.length === 2 && /Add/.test(btns[0].textContent) && /Subtract/.test(btns[1].textContent),
+          btns.map((b) => b.textContent.trim()).join(' | '));
+
+        ok('a fresh mask starts in Add - a first stroke that painted background would ' +
+          'select nothing and read as the model failing rather than the brush being in the ' +
+          'other mode',
+          Mask.sign === 1 && btns[0].classList.contains('on') && !btns[1].classList.contains('on'));
+
+        btns[1].click();
+        const after = [...document.querySelectorAll('#inspector .mm-box .mm-sign button')];
+        ok('pressing Subtract switches the mode and the panel SHOWS which one is live',
+          Mask.sign === -1 && after[1].classList.contains('on') && !after[0].classList.contains('on'));
+        ok('...and it arms the brush, because reaching for Subtract is already the decision ' +
+          'to paint', Mask.on === true);
+        ok('...and the panel says so in words as well as in colour',
+          /Subtracting/.test(document.querySelector('#inspector .mm-box').textContent));
+
+        // ALT IS AN INVERT, NOT A HARDWIRED MINUS. In Subtract it has to give Add back, or
+        // someone in Subtract mode has no momentary way to the other brush at all.
+        const signFor = (alt) => (alt ? -Mask.sign : Mask.sign);
+        ok('Alt held in Add mode paints a NEGATIVE stroke', (() => {
+          Mask.sign = 1;
+          return signFor(true) === -1 && signFor(false) === 1;
+        })());
+        ok('...and Alt held in SUBTRACT mode paints a positive one - it inverts the current ' +
+          'brush rather than always meaning the same thing', (() => {
+          Mask.sign = -1;
+          return signFor(true) === 1 && signFor(false) === -1;
+        })());
+
+        // The strokes each brush makes, and that the sign survives into the data.
+        Mask.sign = -1;
+        MagicMask.addStroke(c0.masks[0], 1.0, Mask.sign, [0.3, 0.3, 0.4, 0.4], Mask.brush);
+        Mask.sign = 1;
+        MagicMask.addStroke(c0.masks[0], 1.0, Mask.sign, [0.6, 0.6, 0.7, 0.7], Mask.brush);
+        MagicMask.normalizeClip(c0);
+        const signs = c0.masks[0].strokes.map((x) => x.sign);
+        ok('each brush writes its own sign onto the stroke, and both survive normalisation',
+          signs.includes(-1) && signs.includes(1), signs.join(','));
+        ok('...and both are prompts on the same frame, one as label 0 and one as label 1 - ' +
+          'which is what actually reaches the decoder',
+          (() => {
+            const P = MagicMask.promptsAt(c0.masks[0], 1.0, 256, 256);
+            return P.some((q) => q.label === 0) && P.some((q) => q.label === 1);
+          })());
+
+        Mask.sign = 1;
+        Mask.on = false;
+        delete c0.masks;
+        renderAll();
+      }
+
       const c = live();
       ok('a clip with no mask carries no `masks` key at all - absent by default, exactly ' +
         'as `fx`, `keys` and `tracks` are',

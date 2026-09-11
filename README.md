@@ -2015,8 +2015,22 @@ undo entry — the same reasoning a waveform scan and a preview render already f
 A click-only UI cannot say "the bright gap between the arm and the torso is background".
 One positive scribble down the arm and one negative in that gap is the difference between
 a cut-out and a cut-out wearing a halo, and no amount of positive painting expresses it.
-So the brush carries a sign — **Alt-drag paints background** — the sign becomes the
-decoder's point label, and it is in the cache key.
+So the brush carries a sign, the sign becomes the decoder's point label, and it is in the
+cache key.
+
+There are **two brushes, as two buttons** — `+ Add` and `− Subtract` — and Alt held during
+a drag is a momentary **invert** of whichever is live, not a hardwired minus: in Add it
+gives Subtract and in Subtract it gives Add, so someone working in Subtract still has a
+momentary way to the other one. The buttons carry the same green and red the strokes are
+painted in on the viewer, so *which brush am I holding* and *which strokes did it make* are
+one question. A fresh mask always starts in Add, because a first stroke that painted
+background would select nothing and read as the model failing.
+
+That pair started life as Alt-drag alone, described in the panel's hint text, and it may as
+well not have existed: the first person to use the feature hit exactly the problem
+subtraction solves, read the paragraph describing Alt-drag, and asked for the minus brush
+to be added. **A capability nobody can find is not a capability, and a line in a
+four-sentence paragraph is not a control.**
 
 `smoke-mask.js` holds that down with the case that makes it unavoidable: two squares of
 **identical colour**, one of them wanted. Nothing about colour can separate them; only
