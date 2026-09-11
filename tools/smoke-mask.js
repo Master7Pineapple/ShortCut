@@ -81,6 +81,72 @@
     const inside = (alpha, w, x, y) => alpha[Math.round(y) * w + Math.round(x)] >= 128;
     const count = (alpha) => { let n = 0; for (let i = 0; i < alpha.length; i++) if (alpha[i] >= 128) n++; return n; };
 
+    // ========================================= 0. the defaults actually reach the mask
+    //
+    // THE REGRESSION THIS SECTION EXISTS FOR, and it shipped.
+    //
+    // `clamp()` answers `lo` for a value that is not a number, so `clamp(undefined, 128,
+    // 2048)` is 128, and the `|| DEFAULTS.res` written after it never fired because 128 is
+    // truthy. Every mask painted by that build was cut at 128 px instead of 1024, and
+    // MobileSAM at 128 returns 99.9% of the frame - so the feature drew a wash of tint over
+    // the picture instead of a cut-out, silently, on the very first stroke.
+    //
+    // The suite did not catch it because every mask it built passed explicit options. So
+    // these assertions pin the NO-ARGUMENT case specifically, which is the only case the
+    // app ever uses: there is no control for either value.
+
+    {
+      const m = MagicMask.makeMask('Fresh');
+      ok('makeMask() with no options uses the DEFAULTS, not the bottom of their clamps - ' +
+        'the bug that cut every mask at 128 px and returned the whole frame',
+        m.res === MagicMask.DEFAULTS.res && m.rate === MagicMask.DEFAULTS.rate,
+        'res ' + m.res + ', rate ' + m.rate);
+
+      const bare = MagicMask.normalizeMask({ strokes: [] });
+      ok('...and so does normalizeMask() on a mask that carries neither',
+        bare.res === MagicMask.DEFAULTS.res && bare.rate === MagicMask.DEFAULTS.rate);
+
+      const broken = MagicMask.normalizeMask({ res: 128, rate: 1, strokes: [] });
+      ok('a project saved by the broken build opens REPAIRED rather than clamped to the ' +
+        'band floor - neither value has a control, so anything out of band was written by ' +
+        'that bug and no author ever asked for it',
+        broken.res === MagicMask.DEFAULTS.res && broken.rate === MagicMask.DEFAULTS.rate,
+        'res ' + broken.res + ', rate ' + broken.rate);
+
+      const legal = MagicMask.normalizeMask({ res: 768, rate: 24, strokes: [] });
+      ok('...while a value INSIDE the band is left exactly alone',
+        legal.res === 768 && legal.rate === 24);
+
+      const sm = MagicMask.makeMask('S');
+      const st = MagicMask.addStroke(sm, 0, +1, [0.1, 0.1, 0.2, 0.2]);
+      ok('a stroke with no radius gets the default brush, not the smallest one allowed - ' +
+        'the same mistake, on the same line shape',
+        st.r === MagicMask.DEFAULTS.brush, 'r ' + st.r);
+
+      // And the fourth instance of it, which made the built-in engine's reach 4 instead of
+      // 42 - tight enough to refuse a faintly textured region, which is every real one.
+      const W = 48, H = 48;
+      const rgba = new Uint8ClampedArray(W * H * 4);
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const i = (y * W + x) * 4;
+          const inIt = x >= 12 && x < 36 && y >= 12 && y < 36;
+          // +/- 12 levels of texture: far more than a reach of 4 admits, and utterly
+          // ordinary for real footage.
+          const t = ((x * 7 + y * 5) % 25) - 12;
+          const v = (inIt ? 200 : 60) + t;
+          rgba[i] = v; rgba[i + 1] = v; rgba[i + 2] = v; rgba[i + 3] = 255;
+        }
+      }
+      const got = MagicMask.localEngine({
+        w: W, h: H, rgba, points: [{ x: 24, y: 24, label: 1 }],
+      }).alpha;
+      let n = 0;
+      for (let i = 0; i < got.length; i++) if (got[i] >= 128) n++;
+      ok('the built-in engine’s default reach admits a TEXTURED region rather than ' +
+        'stopping at the first noisy pixel', n > 24 * 24 * 0.8, n + ' px of ' + 24 * 24);
+    }
+
     // ================================================== 1. prompt encoding
 
     {
@@ -417,6 +483,17 @@
 
       ok('a video clip gets the Magic Mask panel',
         !!document.querySelector('#inspector .mm-box'));
+
+      // THE END-TO-END VERSION of section 0, which is the assertion that would have caught
+      // the shipped bug on its own: what matters is not that `DEFAULTS.res` says 1024, it is
+      // that the frame handed to the segmenter is 1024 on its long side.
+      ok('a default mask on a 1920x1080 clip is analysed at 1024 on the long side - the ' +
+        'scale MobileSAM works at, rather than whatever a clamp floor happened to be',
+        (() => {
+          const sz = mmSize(live(), MagicMask.makeMask('probe'));
+          return sz.aw === 1024 && sz.ah === 576;
+        })(),
+        (() => { const z = mmSize(live(), MagicMask.makeMask('probe')); return z.aw + 'x' + z.ah; })());
       ok('...and `matte` is offered in the stack menu but DISABLED with a reason until ' +
         'something is painted - the gap that let the pointer effects be added to any clip ' +
         'and then silently draw nothing',

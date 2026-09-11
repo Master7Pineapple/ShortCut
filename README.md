@@ -2089,7 +2089,8 @@ frame `key` — the key is what says *this is the same picture you encoded a mom
 `smoke-mask.js` measures the two and asserts the second prompt is the cheaper one.
 
 `MagicMask.DEFAULTS.res` is **1024**, which is SAM's own scale rather than an arbitrary
-number. The encoder resizes whatever it is handed so its long side is 1024 and pads to a
+number, and `res`/`rate` are repaired to the defaults rather than clamped when a stored
+value is out of band — see "The clamp that ate the mask" below. The encoder resizes whatever it is handed so its long side is 1024 and pads to a
 square, so feeding it 512 buys no speed at all — the graph does the same work — and it
 costs accuracy: measured on a synthetic plate whose answer is known to the pixel, a 1024
 frame comes back exact and a 512 one comes back with a region a third too big. Nothing
@@ -2100,6 +2101,37 @@ Prompt coordinates go into the graph scaled by that same `1024 / max(w, h)`, and
 `orig_im_size` is the untouched frame size. Getting that scale wrong does not throw — it
 segments confidently around the wrong pixel — which is why it is a named constant and why
 the suite checks the box lands on the square.
+
+#### The clamp that ate the mask
+
+Worth writing down, because it shipped and because the shape of it will recur.
+
+`clamp(v, lo, hi)` in this codebase answers `lo` for anything that is not a number. So
+`clamp(undefined, 128, 2048)` is `128`, and a `|| DEFAULTS.res` written after it **never
+fires**, because 128 is truthy. Four values in `magicmask.js` were written that way, and
+the visible one was `res`: every mask painted by the first build was cut at 128 px instead
+of 1024, where MobileSAM returns **99.9% of the frame**. The symptom was not an error — it
+was a wash of tint over the whole picture on the very first stroke, which reads as "this
+feature does not work" rather than as a number being wrong.
+
+The suite missed it because every mask it built passed explicit options, and the app never
+passes any: there is no control for `res` or `rate`. The fix is one helper, `fill(v, d, lo,
+hi)` — default **then** clamp — and `smoke-mask.js` now pins the no-argument case
+specifically, plus the end-to-end version of it, which is the one that would have caught it
+alone: *the analysis frame the app actually builds for a default mask on a 1920x1080 clip is
+1024 x 576.*
+
+`res` and `rate` are **repaired to the default** when a stored value is out of band, not
+clamped to the band's floor. Neither has a control, so the only value either has ever
+legitimately held is the default, which means anything out of band was written by the
+broken build — clamping would leave a mask cut at 512 that nobody asked for. A project
+saved by that build opens repaired. When a control for these arrives, it must offer values
+inside the bands (`res` 512–2048, `rate` 4–60) and this becomes an ordinary clamp.
+
+The other three instances were quieter and would have been reported as vague quality
+complaints: a stroke saved without a radius got the smallest brush allowed rather than the
+default one, and the built-in colour engine's reach was **4** instead of 42 — tight enough
+to refuse a faintly textured region, which is every real one.
 
 #### Propagation drifts, and the answer is a correction
 

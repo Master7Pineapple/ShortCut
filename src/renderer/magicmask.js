@@ -51,6 +51,18 @@
   const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
   const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
 
+  /**
+   * A default, THEN a clamp - and never `clamp()` on its own for a value that may be absent.
+   *
+   * `clamp()` answers `lo` for anything that is not a number, so `clamp(undefined, 128, 2048)`
+   * is 128, and a `|| DEFAULTS.res` written after it never fires because 128 is truthy.
+   * That is not a hypothetical: it shipped, and every mask painted by that build was cut at
+   * 128 px instead of 1024, where MobileSAM answers "the whole frame" - a blue wash over the
+   * picture rather than a cut-out. Four values in this file were written that way. One
+   * helper, so there cannot be a fifth.
+   */
+  const fill = (v, d, lo, hi) => clamp(num(v, d), lo, hi);
+
   /** Every default in one place, so the panel, the loop and the suite agree. */
   const DEFAULTS = {
     /*
@@ -71,7 +83,21 @@
     maxPts: 24,        // point prompts a single stroke may contribute
     minR: 0.004,       // the smallest brush that still means something
     brush: 0.03,       // the default brush radius, a fraction of the frame's shorter side
+    tol: 42,           // the built-in colour engine's reach, in RGB distance
   };
+
+  /*
+   * The bands `res` and `rate` are allowed to hold.
+   *
+   * `res` stops at 512 rather than at something small because MobileSAM degrades sharply
+   * below its own scale: measured on a plate whose answer is known to the pixel, 1024 comes
+   * back exact, 512 a third too big, and 128 returns 99.9% of the frame. A resolution that
+   * cannot produce a usable matte is not a resolution, it is a bug waiting to be reported
+   * as "the mask does nothing but tint the picture".
+   */
+  const RES_MIN = 512, RES_MAX = 2048;
+  const RATE_MIN = 4, RATE_MAX = 60;
+  const inBand = (v, lo, hi) => isFinite(Number(v)) && Number(v) >= lo && Number(v) <= hi;
 
   // ------------------------------------------------------------------- the data model
 
@@ -84,8 +110,8 @@
     return {
       id: uid(),
       name: name || 'Mask 1',
-      res: Math.round(clamp(o.res, 128, 2048)) || DEFAULTS.res,
-      rate: Math.round(clamp(o.rate, 1, 60)) || DEFAULTS.rate,
+      res: Math.round(fill(o.res, DEFAULTS.res, RES_MIN, RES_MAX)),
+      rate: Math.round(fill(o.rate, DEFAULTS.rate, RATE_MIN, RATE_MAX)),
       strokes: [],
     };
   }
@@ -107,8 +133,18 @@
     if (!m || typeof m !== 'object') return null;
     if (!m.id) m.id = uid();
     m.name = String(m.name || 'Mask');
-    m.res = Math.round(clamp(m.res, 128, 2048)) || DEFAULTS.res;
-    m.rate = Math.round(clamp(m.rate, 1, 60)) || DEFAULTS.rate;
+    /*
+     * OUT OF BAND IS REPAIRED TO THE DEFAULT, not clamped to the nearest edge.
+     *
+     * Neither of these has a control, so the only value either has ever legitimately held
+     * is the default - which means anything outside the band was written by the build that
+     * shipped the `clamp()` bug above, and lifting it to the band's floor would leave a
+     * mask cut at 512 that the author never asked for. So a project saved by that build
+     * opens repaired. When a control for these does arrive, it must offer values inside
+     * the bands, and this becomes an ordinary clamp.
+     */
+    m.res = inBand(m.res, RES_MIN, RES_MAX) ? Math.round(Number(m.res)) : DEFAULTS.res;
+    m.rate = inBand(m.rate, RATE_MIN, RATE_MAX) ? Math.round(Number(m.rate)) : DEFAULTS.rate;
     const out = [];
     for (const s of (Array.isArray(m.strokes) ? m.strokes : [])) {
       if (!s || !Array.isArray(s.pts) || s.pts.length < 2) continue;
@@ -122,7 +158,7 @@
       out.push({
         t: r4(num(s.t, 0)),
         sign: Number(s.sign) < 0 ? -1 : 1,
-        r: r4(clamp(s.r, DEFAULTS.minR, 0.5)) || DEFAULTS.brush,
+        r: r4(fill(s.r, DEFAULTS.brush, DEFAULTS.minR, 0.5)),
         pts,
       });
     }
@@ -142,7 +178,8 @@
   /** Add one painted stroke. `pts` is a flat [x,y,x,y,...] in SOURCE fractions. */
   function addStroke(mask, t, sign, pts, r) {
     if (!mask || !Array.isArray(pts) || pts.length < 2) return null;
-    const s = { t: r4(num(t, 0)), sign: sign < 0 ? -1 : 1, r: r4(clamp(r, DEFAULTS.minR, 0.5)), pts: pts.slice() };
+    const s = { t: r4(num(t, 0)), sign: sign < 0 ? -1 : 1,
+      r: r4(fill(r, DEFAULTS.brush, DEFAULTS.minR, 0.5)), pts: pts.slice() };
     mask.strokes = Array.isArray(mask.strokes) ? mask.strokes : [];
     mask.strokes.push(s);
     normalizeMask(mask);
@@ -462,7 +499,7 @@
     const out = new Uint8ClampedArray(w * h);
     if (!pos.length) return { alpha: out };
 
-    const tol = clamp(req.tol, 4, 160) || 42;
+    const tol = fill(req.tol, DEFAULTS.tol, 4, 160);
     const box = req.box;
     const bx0 = box ? Math.max(0, Math.floor(box.x0)) : 0;
     const by0 = box ? Math.max(0, Math.floor(box.y0)) : 0;
@@ -710,7 +747,7 @@
   }
 
   const API = {
-    DEFAULTS,
+    DEFAULTS, RES_MIN, RES_MAX, RATE_MIN, RATE_MAX,
     makeMask, normalizeMask, normalizeClip, hasMasks, maskById,
     addStroke, clearStrokesAt, anchors, anchorFor,
     strokePoints, promptsAt, plan,
