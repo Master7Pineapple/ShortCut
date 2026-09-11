@@ -234,6 +234,27 @@ const TextUI = (() => {
       });
       row.insertBefore(input, lab);
       row.classList.add('tc-check');
+    } else if (spec.type === 'text') {
+      // A single line of content - a lower third's name, a chart's axis labels, a
+      // counter's prefix. Same shape as `area` below, which is the multi-line version:
+      // undo is taken once on focus and closed on blur, so typing a whole word is one
+      // entry rather than one per keystroke, and the value is written through on every
+      // keystroke so the picture follows the typing.
+      const input = el('input');
+      input.type = 'text';
+      input.value = val == null ? '' : String(val);
+      input.spellcheck = false;
+      if (spec.placeholder) input.placeholder = spec.placeholder;
+      setUI = (v) => { input.value = v == null ? '' : String(v); };
+      input.addEventListener('focus', beginEdit);
+      input.addEventListener('blur', endEdit);
+      input.addEventListener('input', () => { set(obj, spec.path, input.value); changed(); });
+      // The editor's shortcuts are single letters - S splits, G closes gaps, Delete
+      // deletes - and the global handler already skips events whose target is an input.
+      // This is the second line of defence for a panel that reparents its rows: it costs
+      // nothing and the alternative is a caption you cannot put an S in.
+      input.addEventListener('keydown', (e) => e.stopPropagation());
+      row.appendChild(input);
     } else if (spec.type === 'area') {
       const input = el('textarea');
       input.rows = 3;

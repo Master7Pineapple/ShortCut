@@ -440,6 +440,57 @@
         !!clipFxPanel(clip));
     }
     {
+      // EVERY SCHEMA ROW MUST RENDER A CONTROL YOU CAN ACTUALLY USE.
+      //
+      // This is the general form of a real bug: `type: 'text'` was not a case `control()`
+      // knew, so every single-line string row - a lower third's name, a chart's axis
+      // labels, a counter's prefix and suffix - rendered its label and its reset button
+      // and NO INPUT. Nothing threw and nothing looked obviously broken; the field was
+      // simply not there. So the assertion is over the whole table rather than over the
+      // types that happened to be checked by hand.
+      const missing = [];
+      for (const type of Graphics.TYPES) {
+        const probe = { kind: 'graphic', in: 0, out: 3, start: 0, graphic: Graphics.defaultGraphic(type) };
+        for (const spec of Graphics.DEFS[type].schema) {
+          const row = TextUI.control(spec, probe.graphic, { params: Graphics.DEFS[type].params }, {
+            onEdit: () => {}, onEditEnd: () => {}, onChanged: () => {}, rebuild: () => {},
+          });
+          if (!row.querySelector('input, select, textarea')) missing.push(type + '.' + spec.path + ' (' + spec.type + ')');
+        }
+      }
+      ok('every schema row in every graphic type renders a usable control',
+        missing.length === 0, missing.length ? missing.join(', ') : 'all rows');
+
+      // And that a text row is wired both ways: it shows what is on the object, and typing
+      // into it writes through to the object.
+      const g = Graphics.defaultGraphic('lowerThird');
+      g.params.title = 'Existing name';
+      const spec = Graphics.DEFS.lowerThird.schema.find((x) => x.path === 'params.title');
+      let changes = 0, edits = 0;
+      const row = TextUI.control(spec, g, { params: Graphics.DEFS.lowerThird.params }, {
+        onEdit: () => { edits++; }, onEditEnd: () => {}, onChanged: () => { changes++; }, rebuild: () => {},
+      });
+      const input = row.querySelector('input[type=text]');
+      ok('a text row shows the value already on the object',
+        !!input && input.value === 'Existing name', input ? input.value : 'no input');
+      if (input) {
+        input.dispatchEvent(new Event('focus'));
+        input.value = 'Jane Okafor';
+        input.dispatchEvent(new Event('input'));
+        ok('typing into it writes through to the graphic', g.params.title === 'Jane Okafor', g.params.title);
+        ok('...and repaints the picture', changes > 0);
+        ok('undo is taken once on focus, not once per keystroke', edits === 1, String(edits));
+        // The editor's shortcuts are single letters, so a caption has to be able to hold
+        // an S without splitting the clip underneath it.
+        let escaped = false;
+        const spy = () => { escaped = true; };
+        document.addEventListener('keydown', spy);
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 's', bubbles: true }));
+        document.removeEventListener('keydown', spy);
+        ok('a keystroke in a text row never reaches the editor’s shortcuts', !escaped);
+      }
+    }
+    {
       // Splitting must not leave the two halves sharing one definition.
       seek(clip.start + 1);
       setSelection([clip.id], false);

@@ -135,7 +135,11 @@ There are twenty-eight suites:
   bar heights measured in ink against what the scale says, a diagram spec laying out
   identically across two runs and two resolutions (cycles, dangling edges and half-typed
   JSON included), the model's normalisation and that an unknown type is **kept** rather
-  than lost, that a draw which throws costs a frame and not the session, the timeline
+  than lost, that a draw which throws costs a frame and not the session, that **every schema
+  row in every type renders a control you can actually use** (the general form of a real
+  bug: `text` was not a case `TextUI.control()` knew, so every single-line string row drew
+  its label and no input at all, silently) and that a text row is wired both ways and takes
+  one undo entry per gesture rather than per keystroke, the timeline
   (one undo entry, no decoder, and that a split does not leave two halves sharing one
   definition), the render job and that a graphic's `id` is not in its key while its
   definition is, that a lone graphic does not push its span off the fast path while an
