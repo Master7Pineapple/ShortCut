@@ -14,6 +14,10 @@ const AudioFX = require('./audiofx.js');
 // which loads this exact file as a <script> global.
 const ScreenTel = require('./screen.js');
 
+// Magic Mask: MobileSAM through onnxruntime-node, the model downloads, and the matte
+// cache. It registers its own handlers in install() below, next to the window.
+const Mask = require('./mask.js');
+
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ts']);
 const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma']);
 /** Stills. The timeline cannot hold one yet, but the QuickBin keeps them for transitions. */
@@ -161,6 +165,14 @@ function createWindow() {
 
   win.on('closed', () => { win = null; });
 }
+
+// Magic Mask's handlers - the model downloads, MobileSAM itself and the matte cache.
+// Registered once, before the window exists, so a renderer that asks for `mask:state`
+// during its first paint gets an answer rather than a rejected invoke.
+Mask.install({
+  app, ipcMain,
+  send: (ch, d) => { if (win && !win.isDestroyed()) win.webContents.send(ch, d); },
+});
 
 app.whenReady().then(createWindow);
 

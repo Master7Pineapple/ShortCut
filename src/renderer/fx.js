@@ -1408,7 +1408,75 @@
         reset(L.c);
       },
     },
+
+    /**
+     * MAGIC MASK. The matte cut from `clip.masks` is applied to the layer.
+     *
+     * By step 12 this needed no new plumbing at all, which is exactly why it sits here
+     * and not at the start: step 5 gave the compositor alpha, step 6 made the bake the
+     * single draw path, and step 7 made an effect one function. So an extracted object is
+     * one `destination-in` and a stack order.
+     *
+     * THE MATTE COMES FROM A PROVIDER, for the same reason a binding does. The pixels of
+     * a matte are the output of a neural network over a decoded frame, which is neither
+     * synchronous nor something this file could reach: it would need the media element,
+     * the disk cache, the clip's framing and an IPC round trip. So `app.js` installs
+     * `FX.setMatteProvider()`, hands back a W x H plate whose ALPHA is the matte, and
+     * takes on the matching duty of putting the prompts into the render key
+     * (`maskDigest()`). With no provider installed - a bare module load, a suite checking
+     * this file alone - the effect draws the clip untouched, which is the honest answer:
+     * "there is no matte yet" must never mean "there is no clip".
+     *
+     * The provider applies `feather`, `grow`, `invert` and `mix` because it holds the
+     * matte as a plane and those operations are plane operations; they are parameters
+     * HERE so that every one of them keyframes through `Anim` for free - which is what
+     * lets a matte open up over two seconds, or a choke ride in as a face turns.
+     */
+    matte: {
+      label: 'Magic Mask',
+      needs: 'mask',
+      // The matte moves every frame whether or not anything is keyed, so the shutter has
+      // something real to average and `timeVarying` must say so - see `drawBlurred()`.
+      timeVarying: true,
+      params: { mask: '', feather: 0.004, grow: 0, invert: 0, mix: 1 },
+      schema: [
+        {
+          path: 'params.mask', label: 'Mask', type: 'select',
+          // Built from the CLIP, not from a fixed list: the options are the masks painted
+          // on this clip, and there is no second place that knows their names.
+          optionsFor: (clip) => [{ value: '', label: 'First mask on this clip' }].concat(
+            ((clip && clip.masks) || []).map((m) => ({ value: m.id, label: m.name }))),
+        },
+        { path: 'params.feather', label: 'Feather', type: 'range', min: 0, max: 0.08, step: 0.001, digits: 3 },
+        { path: 'params.grow', label: 'Grow / choke', type: 'range', min: -0.04, max: 0.04, step: 0.001, digits: 3 },
+        { path: 'params.mix', label: 'Amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.invert', label: 'Invert (cut the object out)', type: 'check' },
+      ],
+      draw(L, p, t, entry, clip) {
+        const plate = MATTE ? MATTE(clip, entry, t, L.W, L.H, p) : null;
+        if (!plate) return;                       // no matte yet: the clip is untouched
+        const src = take(L, 'fxA');
+        L.c.save();
+        L.c.drawImage(src, 0, 0);
+        // `destination-in` keeps the layer where the plate has ALPHA. The plate is built
+        // as transparency, never as black-and-white - this codebase has now hit that four
+        // times, and the symptom is never an error, it is a matte that masks nothing.
+        L.c.globalCompositeOperation = 'destination-in';
+        L.c.drawImage(plate, 0, 0, L.W, L.H);
+        L.c.restore();
+        reset(L.c);
+      },
+    },
   };
+
+  /**
+   * The matte provider, injected by `app.js`. See the `matte` type above for why.
+   *
+   *   provider(clip, entry, t, W, H, params) -> a W x H canvas whose ALPHA is the matte,
+   *                                             or null when there is not one yet.
+   */
+  let MATTE = null;
+  function setMatteProvider(fn) { MATTE = typeof fn === 'function' ? fn : null; }
 
   const TYPES = Object.keys(DEFS);
 
@@ -1959,7 +2027,7 @@
   }
 
   const API = {
-    DEFS, TYPES, boundParams, setBinder,
+    DEFS, TYPES, boundParams, setBinder, setMatteProvider,
     create, normalize, normalizeClip, active,
     paramAt, paramsAt, render,
     pointerImage, preloadImages,

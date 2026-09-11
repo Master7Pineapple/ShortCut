@@ -48,6 +48,20 @@ contextBridge.exposeInMainWorld('api', {
   onScreenHotkeyToggle: (cb) => ipcRenderer.on('screen:hotkeyToggle', () => cb()),
   onScreenFailed: (cb) => ipcRenderer.on('screen:failed', (_e, m) => cb(m)),
 
+  // Magic Mask. Everything degrades to `{ ok:false, reason }` - no onnxruntime, no model,
+  // no network - and the renderer falls back to the local region-grow engine, which needs
+  // nothing. `mask:segment` is the injected engine `MagicMask` runs its loop through.
+  maskState: () => ipcRenderer.invoke('mask:state'),
+  maskFetch: () => ipcRenderer.invoke('mask:fetch'),
+  maskCancelFetch: () => ipcRenderer.invoke('mask:cancelFetch'),
+  maskSegment: (req) => ipcRenderer.invoke('mask:segment', req),
+  onMaskProgress: (cb) => ipcRenderer.on('mask:progress', (_e, d) => cb(d)),
+
+  // Mattes, cached on disk by path + size + mtime + the mask's own key - the waveform
+  // cache's rules, and the clip's timeline position is deliberately not in the key.
+  matteRead: (p, key) => ipcRenderer.invoke('mask:read', { path: p, key }),
+  matteWrite: (p, key, w, h, frames) => ipcRenderer.invoke('mask:write', { path: p, key, w, h, frames }),
+
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),
   onOpenOnLaunch: (cb) => ipcRenderer.on('project:openOnLaunch', (_e, p) => cb(p)),

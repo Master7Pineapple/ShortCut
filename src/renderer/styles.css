@@ -262,6 +262,12 @@ select, input[type=number], input[type=text] {
 }
 .trk-box .trk-row { border-top: 1px solid var(--line); padding: 6px 0 4px; }
 
+/* Magic Mask: one block per painted mask, on the tracking panel's terms. */
+.mm-box .mm-row { border-top: 1px solid var(--line); padding: 6px 0 4px; }
+.mm-box .mm-row .fx-bar { display: flex; align-items: baseline; gap: 8px; }
+.mm-box .mm-row .fx-bar b { cursor: pointer; }
+.mm-box .fx-add button.on { background: var(--accent); color: #0c0d10; }
+
 /* ---- the QuickBin ------------------------------------------------------ */
 #binBar { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px; background: var(--panel); }
 #quickBin {
