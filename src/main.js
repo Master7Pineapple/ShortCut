@@ -391,6 +391,55 @@ ipcMain.handle('svg:pick', async () => {
   }
 });
 
+/**
+ * A .cube LUT, for the finishing pass.
+ *
+ * The TEXT comes back and the renderer parses it - `FX.parseCube()` is the only cube
+ * parser in the app, and a second one in main would be the two-implementations mistake
+ * this codebase has spent a whole step ending. Size and mtime come back with it because
+ * the render key needs them: a cube swapped for a different grade at the same path is a
+ * different picture, and without them the cached render of the old one would come back.
+ *
+ * The cap is generous but real. A 33-cube is about 700 KB of text and a 64-cube about
+ * 5 MB; past that it is not a grade, and parsing it would stall the renderer.
+ */
+const LUT_MAX = 24 * 1024 * 1024;
+
+function readLutFile(file) {
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size > LUT_MAX) {
+      return { ok: false, error: 'That .cube is ' + Math.round(stat.size / 1024 / 1024) +
+        ' MB. Even a 64-point cube is about 5 MB - this one is not a LUT.' };
+    }
+    return {
+      ok: true,
+      path: file,
+      name: path.basename(file),
+      size: stat.size,
+      mtime: Math.round(stat.mtimeMs),
+      text: fs.readFileSync(file, 'utf8'),
+    };
+  } catch (e) {
+    return { ok: false, error: 'Could not read that .cube: ' + e.message };
+  }
+}
+
+ipcMain.handle('lut:pick', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Load a .cube LUT',
+    properties: ['openFile'],
+    filters: [{ name: 'Cube LUT', extensions: ['cube'] }],
+  });
+  if (r.canceled || !r.filePaths.length) return { ok: false, reason: 'canceled' };
+  return readLutFile(r.filePaths[0]);
+});
+
+ipcMain.handle('lut:read', async (_e, file) => {
+  if (typeof file !== 'string' || !file) return { ok: false, error: 'no path' };
+  return readLutFile(file);
+});
+
 ipcMain.handle('media:pickFolder', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Import folder', properties: ['openDirectory'] });
   return r.canceled ? [] : r.filePaths;

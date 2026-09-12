@@ -605,6 +605,10 @@ select, input[type=number], input[type=text] {
    afterwards - but it must not draw nothing in silence, which is exactly what the two
    pointer effects did before they said so. */
 .fx-warn { color: var(--warn, #e0b341); padding: 4px 6px 0; }
+/* The match-tone block inside a grade row: its own group, because it writes the three
+   sliders above it rather than being another one of them. */
+.fx-match { margin: 6px 0 2px; padding: 6px 6px 4px; border: 1px solid var(--line); border-radius: 4px; }
+.fx-match .tc-hint { line-height: 1.35; }
 
 /* The viewer while a mouse take is being performed: it is an input surface, not a
    framing control, and the cursor shape is the only thing that says so before the first

@@ -56,6 +56,13 @@ const state = {
    *  Tighten's and Captions': changing one snapshots no undo entry, it only changes what
    *  the next Sonify would place. Saved in the .scut, so a project keeps its sound. */
   sfx: SFX.defaultOpts(),
+  /** The project master finish - an FX stack run ONCE over the finished composite, after
+   *  every clip's own stack. Empty by default, so a project renders exactly as it did
+   *  before the finishing pass existed until somebody adds something to it. Unlike the
+   *  settings above this one IS state: it changes the picture, so editing it snapshots
+   *  undo and dirties the project. Keys on it are TIMELINE seconds - it has no in-point
+   *  to be timed from. See FX.renderMaster(). */
+  master: [],
 };
 
 let undoStack = [];
@@ -1900,6 +1907,7 @@ function renderInspector() {
   renderTransitionPanel();
   renderCaptionsPanel();
   renderSfxPanel();
+  renderMasterPanel();
 
   // A selected text card opens the editor drawer on the far right. The left column keeps
   // showing the normal clip inspector, so the preview area is never resized by it.
@@ -2657,6 +2665,16 @@ function clipFxPanel(clip) {
       }
       body.appendChild(prow);
     }
+
+    // A .cube LUT. A PATH, for exactly the reason the PNG pointer above is a path: the
+    // stack is plain JSON in every undo snapshot and in the .scut, and a 33-cube is
+    // 36,000 triplets. The row is the shared one - the master finish panel shows the
+    // same one, and two copies of it would drift within a week.
+    if (fx.type === 'lut') body.appendChild(lutPickRow(fx, edit));
+
+    // Matching this clip to another. It belongs on the GRADE row rather than in a panel
+    // of its own, because what it does is write this effect’s three numbers.
+    if (fx.type === 'grade') body.appendChild(matchToneRow(clip));
 
     // The shutter, per effect. `TextUI.set()` needs the object to exist before a control
     // can write into it, so it is created here the way `keyStrip()` creates empty tracks -
@@ -4218,6 +4236,10 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
     painted = true;
   }
   cctx.restore();
+  // The project master finish, over everything the stack just built. Here rather than in
+  // the two callers because this IS the composite: the viewer and the baker both come
+  // through this function, so a LUT or a grain that is in the file was in the viewer.
+  if (painted) FX.renderMaster(cctx, W, H, state.master, time, fxSurface, frameDur);
   return painted;
 }
 
@@ -4596,6 +4618,11 @@ function drawTransitionFrame(r, P) {
   cctx.fillRect(0, 0, P.w, P.h);
   Trans.draw(cctx, P.w, P.h, r.tr, p, aImg, bImg, 1 / state.out.fps,
     transitionBoxes(r, state.playhead, P.w, P.h));
+  // The master finish applies inside a transition window too - it is the project's look,
+  // not a clip's effect. The BAKER does the same thing at the same point (see
+  // bakeTransitions), which is what keeps the two agreeing; anything drawn afterwards -
+  // a caption over the cut - is outside it in the viewer and in the file alike.
+  FX.renderMaster(cctx, P.w, P.h, state.master, state.playhead, fxSurface, 1 / state.out.fps);
   ctx.drawImage(cache, 0, 0);
   frameCacheValid = true;
   return true;
@@ -4988,26 +5015,47 @@ $('#btnFrameAll').addEventListener('click', () => {
 
 // ============================== 7. editing operations
 
+/**
+ * An undo entry is the track list, the selection - and the project master finish.
+ *
+ * The master stack joined it when the finishing pass arrived, and it had to: it is the
+ * one piece of project state outside the tracks that decides PIXELS. Everything else at
+ * that level - Tighten's threshold, the caption style, the SFX levels - only changes what
+ * the next pass would produce, which is why none of them are in here. A snapshot is still
+ * nothing but JSON.stringify of plain data, which is the rule that keeps undo cheap and
+ * keeps anything non-serialisable off a clip.
+ */
+function snapshot() {
+  return JSON.stringify({
+    tracks: state.tracks,
+    selection: [...state.selection],
+    master: state.master,
+  });
+}
 function pushUndo() {
-  undoStack.push(JSON.stringify({ tracks: state.tracks, selection: [...state.selection] }));
+  undoStack.push(snapshot());
   if (undoStack.length > 100) undoStack.shift();
   redoStack = [];
 }
-function restore(snapshot) {
-  const s = JSON.parse(snapshot);
+function restore(snap) {
+  const s = JSON.parse(snap);
   state.tracks = s.tracks;
   state.selection = new Set(s.selection);
+  // Absent in an entry pushed before this existed - a snapshot taken by an older build
+  // and reloaded is not a thing, but an entry pushed earlier in THIS session by code that
+  // did not know about it would be, so it reads as an empty stack rather than undefined.
+  state.master = FX.normalizeStack(s.master);
   renderAll();
 }
 function undo() {
   if (!undoStack.length) return;
-  redoStack.push(JSON.stringify({ tracks: state.tracks, selection: [...state.selection] }));
+  redoStack.push(snapshot());
   restore(undoStack.pop());
   markDirty();
 }
 function redo() {
   if (!redoStack.length) return;
-  undoStack.push(JSON.stringify({ tracks: state.tracks, selection: [...state.selection] }));
+  undoStack.push(snapshot());
   restore(redoStack.pop());
   markDirty();
 }
@@ -6000,6 +6048,7 @@ function newProject() {
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
   state.captions = Object.assign({}, Captions.DEFAULTS);
   state.sfx = SFX.defaultOpts();
+  state.master = [];
   transcriptCache.clear();
   syncLoudnessControl();
   undoStack = []; redoStack = [];
@@ -6569,6 +6618,302 @@ function toggleSfx(show) {
 // startup rather than making the first press of Sonify wait for a disk write.
 refreshSfxLibrary().then(() => renderSfxPanel()).catch(() => {});
 
+// ======================================== 7d. the finishing pass
+//
+// Two things live here: the LUT row shared by every panel that can carry a `lut` effect,
+// and the PROJECT MASTER FINISH - an FX stack that is not on a clip.
+//
+// The master stack is ordinary `FX` entries and it is drawn by `FX.renderMaster()`, which
+// is `FX.render()` over a copy of the finished frame. So there is no second LUT, no
+// second grain and no ffmpeg half of either: a cube applied to one clip and the same cube
+// applied to the whole project are the same function, and they cannot drift.
+//
+// What it costs is stated in the panel, because it is not small: a master finish takes
+// every covered span off the fast path (see `needsCompositeAt()`), so a project that used
+// to hand three plain cuts to ffmpeg now bakes them.
+
+/**
+ * The "choose a .cube" row for a `lut` effect, wherever one is being edited.
+ *
+ * A PATH lands on the entry, never the table - the same rule the imported PNG pointer
+ * keeps, and for the same reason: `clip.fx` is plain JSON that goes into every undo
+ * snapshot and into the .scut, and a 33-cube inlined there is 36,000 triplets.
+ *
+ * The row is also the only place that can say what went wrong with a file, so it says it:
+ * loading, loaded and how big the cube is, an identity cube that will do nothing, or the
+ * parse error. A LUT that silently does not apply is indistinguishable from a LUT that
+ * applies subtly, which is the worst kind of quiet failure this panel could have.
+ */
+function lutPickRow(entry, edit) {
+  const el = TextUI.el;
+  const row = el('div', 'tc-row');
+  row.appendChild(el('label', 'tc-label', 'Cube'));
+  const st = FX.lutState(entry.params.lut);
+  const nm = el('span', 'tc-hint',
+    entry.params.lut ? String(entry.params.lut).split(/[\\/]/).pop() : 'none loaded');
+  nm.title = entry.params.lut || 'A .cube file. 3D only - a 1D LUT is three curves, which the Grade effect already is.';
+  row.appendChild(nm);
+  const pick = el('button', 'mini', 'Load .cube...');
+  pick.draggable = false;
+  pick.addEventListener('click', async () => {
+    const r = await window.api.pickLut();
+    if (!r || !r.ok) {
+      if (r && r.error) { log(r.error); alert(r.error); }
+      return;
+    }
+    // Parsed and cached BEFORE the undo snapshot, so a file that turns out not to be a
+    // cube leaves the project exactly as it was - no entry pointing at nothing.
+    const p = FX.putLut(r.path, r.text, { size: r.size, mtime: r.mtime, name: r.name });
+    if (!p.ok) { log(p.error); alert(p.error); return; }
+    edit(() => { entry.params.lut = r.path; });
+  });
+  row.appendChild(pick);
+  if (entry.params.lut) {
+    const clr = el('button', 'mini', 'Clear');
+    clr.draggable = false;
+    clr.addEventListener('click', () => edit(() => { entry.params.lut = ''; }));
+    row.appendChild(clr);
+  }
+  const box = el('div');
+  box.appendChild(row);
+  if (st.ok) {
+    box.appendChild(el('div', 'tc-hint',
+      st.n + '³ cube' + (st.title ? ' · “' + st.title + '”' : '') +
+      (st.identity ? ' · identity: this cube maps every colour to itself, so it draws nothing.' : '')));
+  } else if (st.pending) {
+    box.appendChild(el('div', 'tc-hint', 'Reading that .cube...'));
+  } else if (st.error) {
+    box.appendChild(el('div', 'tc-hint fx-warn', st.error));
+  }
+  return box;
+}
+
+/**
+ * Match one clip's tone to another's.
+ *
+ * Three points - black, mid-grey, white - carried onto the reference's three, solved by
+ * `FX.matchGrade()` in the same order `gradeLUT()` applies them. It writes an ordinary
+ * `grade` effect the author can then adjust, which is the same design call auto-zoom made
+ * about keyframes: a generator, not an opaque effect.
+ *
+ * Two deliberate choices in what gets measured:
+ *
+ *  - the CENTRE HALF of the frame, not all of it. Letterbox bars on a `contain` clip,
+ *    and the dark corners of a vignette, are exactly the pixels that would define a black
+ *    point, and neither is the footage.
+ *  - the reference AS IT LOOKS - through its own effect stack - and the target as it
+ *    looks WITHOUT the grade about to be replaced. Measuring the target's existing grade
+ *    and then writing a new one on top of it would compound every time the button was
+ *    pressed, and pressing Match twice must be the same as pressing it once.
+ */
+async function clipToneStats(clip, skipEntry) {
+  const P = previewSize();
+  const t = clip.start + clipLen(clip) / 2;
+  const el = mediaFor(clip);
+  if (el && el.tagName !== 'IMG' && !isCanvasClip(clip)) {
+    el.muted = true;
+    try {
+      await seekMedia(el, clamp(srcAt(clip, t - clip.start), 0, Math.max(0, clip.mediaDuration - 0.03)));
+    } catch (e) { /* a stubborn seek costs a measurement, never the session */ }
+  }
+  const plate = transPlate(clip, t, 'tone_' + clip.id, P.w, P.h, state.out.fps);
+  if (!plate) return null;
+  const cv = document.createElement('canvas');
+  cv.width = P.w; cv.height = P.h;
+  const c2 = cv.getContext('2d');
+  const stack = (clip.fx || []).filter((f) => f !== skipEntry);
+  FX.render(c2, P.w, P.h, { id: clip.id, fx: stack, mouse: clip.mouse, masks: clip.masks, tracks: clip.tracks },
+    t - clip.start, fxSurface, (tc) => tc.drawImage(plate, 0, 0), 1 / state.out.fps);
+  const x = Math.round(P.w / 4), y = Math.round(P.h / 4);
+  const d = c2.getImageData(x, y, Math.max(1, Math.round(P.w / 2)), Math.max(1, Math.round(P.h / 2))).data;
+  return FX.lumaStats(d);
+}
+
+async function matchClipTone(clip, refClip) {
+  const existing = (clip.fx || []).filter((f) => f.type === 'grade').pop() || null;
+  const ref = await clipToneStats(refClip, null);
+  const src = await clipToneStats(clip, existing);
+  if (!ref || !src) {
+    log('Match needs a decoded frame from both clips - park the playhead over them and try again.');
+    return;
+  }
+  const g = FX.matchGrade(src, ref);
+  pushUndo();
+  const target = existing || FX.create('grade');
+  target.params.lift = g.lift;
+  target.params.gamma = g.gamma;
+  target.params.gain = g.gain;
+  // Saturation, contrast and temperature are NOT touched: the match is a tone match, and
+  // whatever the author dialled into those stays dialled in.
+  if (!existing) {
+    if (!Array.isArray(clip.fx)) clip.fx = [];
+    clip.fx.push(target);
+  }
+  FX.normalizeClip(clip);
+  markDirty();
+  renderAll();
+  log('Matched tone to ' + clipLabel(refClip) + ': gain ' + g.gain + ', lift ' + g.lift +
+    ', gamma ' + g.gamma + ' (black ' + src.black.toFixed(3) + '→' + ref.black.toFixed(3) +
+    ', mid ' + src.mid.toFixed(3) + '→' + ref.mid.toFixed(3) +
+    ', white ' + src.white.toFixed(3) + '→' + ref.white.toFixed(3) + ')');
+}
+
+/** A clip's name for a menu - the file, or what the card or graphic calls itself. */
+function clipLabel(c) {
+  if (!c) return '?';
+  const P = CANVAS_PAINTERS[c.kind];
+  const name = P ? P.name(c) : String(c.src || c.kind).split(/[\\/]/).pop();
+  return name + ' @ ' + fmtTc(c.start);
+}
+
+/** The "Match tone to..." row in a clip's effect panel. */
+function matchToneRow(clip) {
+  const el = TextUI.el;
+  const others = allClips().map((x) => x.clip)
+    .filter((c) => c !== clip && isPictureClip(c));
+  const box = el('div', 'fx-match');
+  box.appendChild(el('div', 'tc-hint',
+    'Shifts this clip’s black point, white point and mid-grey towards another clip’s, ' +
+    'so mixed footage sits together. It writes an ordinary Grade effect you can then ' +
+    'adjust - pressing it twice is the same as pressing it once.'));
+  if (!others.length) {
+    box.appendChild(el('div', 'tc-hint', 'Nothing to match to: this is the only picture clip on the timeline.'));
+    return box;
+  }
+  const row = el('div', 'tc-row');
+  row.appendChild(el('label', 'tc-label', 'Match tone to'));
+  const sel = el('select');
+  for (const c of others) {
+    const o = el('option');
+    o.value = c.id;
+    o.textContent = clipLabel(c);
+    sel.appendChild(o);
+  }
+  row.appendChild(sel);
+  const go = el('button', 'mini', 'Match');
+  go.draggable = false;
+  go.addEventListener('click', async () => {
+    const refClip = others.find((c) => c.id === sel.value);
+    if (!refClip) return;
+    go.disabled = true;
+    try { await matchClipTone(clip, refClip); } finally { go.disabled = false; }
+  });
+  row.appendChild(go);
+  box.appendChild(row);
+  return box;
+}
+
+// ---------------------------------------------------------------- the master panel
+
+function renderMasterPanel() {
+  const host = $('#masterPanel');
+  if (!host) return;
+  host.innerHTML = '';
+  const stack = masterStack();
+  const meta = $('#masterMeta');
+  // The count is on the HEAD, so a collapsed panel still says the project is being graded.
+  if (meta) {
+    const on = stack.filter((f) => f.enabled !== false).length;
+    meta.textContent = !stack.length ? '' : on + ' on' + (on < stack.length ? ' of ' + stack.length : '');
+  }
+  if (host.hidden) return;
+
+  const el = TextUI.el;
+  const edit = (fn) => {
+    pushUndo();
+    fn();
+    state.master = FX.normalizeStack(state.master);
+    markDirty();
+    renderAll();
+  };
+  const rowHooks = {
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
+    onChanged: () => { markDirty(); drawPreview(); },
+    rebuild: renderMasterPanel,
+  };
+
+  const box = el('div', 'fx-box');
+  box.appendChild(el('div', 'tc-hint fx-note',
+    'Drawn once over the finished composite, after every clip’s own stack - the ' +
+    'preview and the export run the same code. A master finish takes every span it ' +
+    'covers off the fast path, so the project renders slower than it did without one. ' +
+    'Keys here are TIMELINE seconds, not clip seconds: the project has no in-point.'));
+
+  stack.forEach((fx, i) => {
+    const d = FX.DEFS[fx.type];
+    const row = el('div', 'fx-fx' + (fx.enabled === false ? ' off' : ''));
+    const bar = el('div', 'fx-fx-head');
+    const on = el('input');
+    on.type = 'checkbox';
+    on.checked = fx.enabled !== false;
+    on.title = 'Bypass this effect';
+    on.addEventListener('change', () => edit(() => { fx.enabled = on.checked; }));
+    bar.appendChild(on);
+    bar.appendChild(el('b', 'fx-title', (i + 1) + '. ' + d.label));
+    const btns = el('div', 'fx-fx-btns');
+    const mk = (label, title, fn, disabled) => {
+      const b = el('button', 'mini', label);
+      b.title = title; b.disabled = !!disabled; b.draggable = false;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+    };
+    mk('▲', 'Draw this earlier in the master stack', () => edit(() => {
+      stack.splice(i - 1, 0, stack.splice(i, 1)[0]);
+    }), i === 0);
+    mk('▼', 'Draw this later in the master stack', () => edit(() => {
+      stack.splice(i + 1, 0, stack.splice(i, 1)[0]);
+    }), i === stack.length - 1);
+    mk('✕', 'Remove this effect', () => edit(() => { stack.splice(i, 1); }));
+    bar.appendChild(btns);
+    row.appendChild(bar);
+
+    const body = el('div', 'fx-fx-body');
+    for (const spec of d.schema) body.appendChild(TextUI.control(spec, fx, { params: d.params }, rowHooks));
+    if (fx.type === 'lut') body.appendChild(lutPickRow(fx, edit));
+    row.appendChild(body);
+    box.appendChild(row);
+  });
+
+  const addRow = el('div', 'tc-row');
+  const add = el('select');
+  const a0 = el('option');
+  a0.value = '';
+  a0.textContent = 'Add to the master finish...';
+  add.appendChild(a0);
+  // Only the types that mean anything without a clip. `cursor`, `ripple` and `matte` read
+  // something recorded alongside one, and there is no clip here - see FX.MASTER_TYPES.
+  for (const type of FX.MASTER_TYPES) {
+    const o = el('option');
+    o.value = type;
+    o.textContent = FX.DEFS[type].label;
+    add.appendChild(o);
+  }
+  add.addEventListener('change', () => {
+    if (!add.value) return;
+    const type = add.value;
+    edit(() => { state.master = masterStack().concat([FX.create(type)]); });
+  });
+  addRow.appendChild(add);
+  box.appendChild(addRow);
+
+  if (stack.length) {
+    const clr = el('button', 'mini', 'Clear the master finish');
+    clr.title = 'Remove every effect from the master stack. One undo brings it back.';
+    clr.addEventListener('click', () => edit(() => { state.master = []; }));
+    box.appendChild(clr);
+  }
+  host.appendChild(box);
+}
+
+/** Show / hide the Master finish panel. Collapsed it builds no rows. */
+function toggleMaster(show) {
+  const hide = show == null ? !$('#masterPanel').hidden : !show;
+  $('#masterPanel').hidden = hide;
+  $('#btnMasterCollapse').textContent = hide ? '+' : '−';
+  renderMasterPanel();
+}
+
 // ================================== 8. project save/open
 
 function serialize() {
@@ -6583,6 +6928,8 @@ function serialize() {
     tighten: state.tighten,
     captions: state.captions,
     sfx: state.sfx,
+    // The master finish is part of the project, not a setting: it decides pixels.
+    master: masterStack(),
     tracks: state.tracks,
   };
 }
@@ -6638,6 +6985,9 @@ async function openProject(filePath) {
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
   state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
   state.sfx = SFX.normalizeOpts(d.sfx);
+  // Fill in a master stack saved by an older build, and drop a type this one does not
+  // know - the job Trans.normalize() and FX.normalizeClip() do for everything else.
+  state.master = FX.normalizeStack(d.master);
   transcriptCache.clear();
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
@@ -6751,6 +7101,11 @@ function buildJob(outPath, range) {
         // it is the prompts that matter, and `MagicMask.digest()` carries no timeline
         // position, which is what lets a masked clip keep its cached render when it moves.
         masks: maskDigests(c),
+        // And the last of the same family: a `lut` effect draws the grade a FILE holds,
+        // so swapping the cube at that path is a different picture the key could not
+        // otherwise see. The path is already in `fx`; this is what the table at that path
+        // currently is. `FX.lutDigest()` carries no timeline position either.
+        luts: lutDigests(c.fx),
         visible: (isPictureClip(c) || isCanvasClip(c)) && t.type === 'video' && !t.hidden,
         audible: t.type === 'audio' && !t.muted && c.volume > 0,
       };
@@ -6793,6 +7148,13 @@ function buildJob(outPath, range) {
     width: state.out.w, height: state.out.h, fps: state.out.fps,
     quality: state.out.quality, outPath, clips,
     loudness: Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness),
+    // The project master finish, and what its LUTs currently hold. Carried for the same
+    // ONE reason the per-clip stack is: `jobCacheKey()` hashes the job, and every
+    // composited frame in it went through this pass. ffmpeg never sees either - the baker
+    // has already drawn them by the time main runs. Absent when the stack is empty, so a
+    // project with no master finish hashes exactly as it did before this existed.
+    master: FX.masterActive(state.master) ? JSON.parse(JSON.stringify(masterStack())) : undefined,
+    masterLuts: FX.masterActive(state.master) ? lutDigests(masterStack()) : undefined,
     duration: Math.max(0, r.to - r.from),
     rangeFrom: r.from, rangeTo: r.to,
   };
@@ -6900,6 +7262,23 @@ function maskDigests(c) {
   return out.length ? out : undefined;
 }
 
+/**
+ * What every `lut` effect in a stack currently holds, in stack order.
+ *
+ * The same shape and the same reasoning as `maskDigests()`: the path is on the clip
+ * already, and this is the only thing that can say the file AT that path has changed.
+ * `null` for a cube that has not loaded yet - which is honest, because a frame baked
+ * then would carry no LUT either, and `FX.preloadLuts()` is what stops that happening.
+ */
+function lutDigests(stack) {
+  const out = [];
+  for (const f of (stack || [])) {
+    if (!(f && f.enabled !== false && f.type === 'lut' && f.params && f.params.lut)) continue;
+    out.push(FX.lutDigest(f.params.lut));
+  }
+  return out.length ? out : undefined;
+}
+
 function jobCacheKey(job) {
   const copy = Object.assign({}, job);
   delete copy.outPath;
@@ -6909,6 +7288,10 @@ function jobCacheKey(job) {
   // give the same frames two different keys - the cache bar would never match a preview
   // render, and exporting a span you had already previewed would encode it a second time.
   delete copy.preview;
+  // The master stack's `id`s are identities `FX.create()` hands out so the panel can
+  // address a row, and they are different every time one is made - exactly as a clip's
+  // are below. Leaving them in would mean the same master grade never hit its own cache.
+  if (copy.master) copy.master = copy.master.map((f) => { const g = Object.assign({}, f); delete g.id; return g; });
   copy.clips = (job.clips || []).map((c) => {
     const e = Object.assign({}, c);
     // Identity, not pixels: two identical cuts of the same source must key the same.
@@ -7053,6 +7436,10 @@ async function bakeTransitions(job) {
         const p = (e.tStart + i / job.fps) / Math.max(0.001, r.dur);
         Trans.draw(fctx, job.width, job.height, r.tr, p, aImg, bImg, 1 / job.fps,
           transitionBoxes(r, t, job.width, job.height));
+        // The master finish, at the same point the viewer applies it - see
+        // drawTransitionFrame(). `t` is timeline time on both sides, which is the axis
+        // the master stack's keys live on.
+        FX.renderMaster(fctx, job.width, job.height, state.master, t, fxSurface, 1 / job.fps);
 
         batch.set(fctx.getImageData(0, 0, job.width, job.height).data, inBatch * frameBytes);
         inBatch++;
@@ -7157,7 +7544,24 @@ function transitionWindows(job) {
 /** Would the frame at `t` have to be composited, rather than overlaid by ffmpeg? */
 function needsCompositeAt(t, windows) {
   for (const w of windows) if (t >= w.from - 1e-6 && t < w.to + 1e-6) return false;
+  // A PROJECT MASTER FINISH TAKES EVERY SPAN OFF THE FAST PATH, and it has to.
+  //
+  // The fast path hands a plain clip to ffmpeg's own trim/crop/scale chain, and there is
+  // no ffmpeg half of a LUT or of grain to hand it - that is the whole point of step 6.
+  // So a span that ffmpeg built would come out of the export ungraded while the viewer
+  // showed it graded, which is the exact drift this architecture exists to end. A master
+  // grade therefore costs a full bake of everything it covers, and the panel says so.
+  //
+  // The transition-window test above still wins, because a transition's baked layer must
+  // stay its own layer - `bakeTransitions()` applies the master finish itself instead.
   const layers = layersAt(t);
+  // An EMPTY span is exempt: there is no picture there to finish, and baking one would
+  // write a full-frame raw sequence of black. Grain and bloom over black are black
+  // anyway; a LUT that lifts its black point would tint a GAP, and that is the one thing
+  // this exemption knowingly gives up rather than pay a bake for every hole in the edit.
+  // The viewer agrees, for the same reason - `drawPreview()` fills a real gap with black
+  // and returns before it ever reaches `compositeLayers()`.
+  if (layers.length && FX.masterActive(state.master)) return true;
   let pictures = 0;
   for (const c of layers) {
     if (isPictureClip(c)) pictures++;
@@ -7305,6 +7709,10 @@ async function bakeOverlays(job) {
   // 16 ms later; the export cannot, so it waits here. Nothing else in the bake is allowed
   // to depend on a decode landing in time either - this is the one door.
   await FX.preloadImages(allClips().map((x) => x.clip));
+  // And every .cube the edit names, for exactly the same reason: a `lut` whose table has
+  // not arrived draws nothing, and the frame it drew nothing on is in the file forever.
+  // One door, before anything is baked - see FX.preloadLuts().
+  await FX.preloadLuts(allClips().map((x) => x.clip), state.master);
   // The composite goes first: it decides which cards and clips are left to bake at all.
   const c = await bakeComposite(job);
   const a = await bakeTextClips(job);
@@ -7973,6 +8381,20 @@ function bindOwner(clip, bind) {
  * Everything degrades: a binding to a clip that has been deleted, or to a track that has,
  * answers null and the effect draws its own parameters instead.
  */
+/**
+ * The cube reader, injected for the same reason the binder and the matte provider are:
+ * `fx.js` has no `fs`, and a path only becomes a table after an IPC round trip. It hands
+ * back `{ok, text, size, mtime}` and `FX.parseCube()` does the rest - there is one cube
+ * parser in the app, in the file that draws with it.
+ */
+FX.setLutReader((p) => window.api.readLut(p));
+
+/** The project master finish, filled in and with unknown types dropped. */
+function masterStack() {
+  state.master = FX.normalizeStack(state.master);
+  return state.master;
+}
+
 FX.setBinder((clip, bind, tLocal, W, H) => {
   const owner = bindOwner(clip, bind);
   if (!owner) return null;
@@ -9875,6 +10297,7 @@ $('#btnBinCollapse').addEventListener('click', () => toggleBin());
 
 $('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
 $('#btnSfxCollapse').addEventListener('click', () => toggleSfx());
+$('#btnMasterCollapse').addEventListener('click', () => toggleMaster());
 
 /** Show / hide the Captions panel. Collapsed it costs nothing: it builds no rows. */
 function toggleCaptions(show) {

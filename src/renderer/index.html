@@ -242,6 +242,17 @@
            whole edit rather than a per-clip control. -->
       <div id="sfxPanel" hidden></div>
 
+      <div class="panel-head" id="masterPanelHead">
+        <span class="title">Master finish</span>
+        <span id="masterMeta" class="tc-meta"></span>
+        <button id="btnMasterCollapse" class="mini" title="Show / hide the project master finish">+</button>
+      </div>
+      <!-- Collapsed by default, like the captions and sound panels: grading the whole
+           project is a finishing pass rather than a per-clip control - and a master
+           finish takes every span it covers off the render fast path, so it is not
+           something to open by accident. -->
+      <div id="masterPanel" hidden></div>
+
       <div class="panel-head" id="transPanelHead" hidden>
         <span class="title">Transition</span>
         <span id="transMeta" class="tc-meta"></span>

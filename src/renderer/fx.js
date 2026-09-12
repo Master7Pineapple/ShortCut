@@ -1467,6 +1467,182 @@
         reset(L.c);
       },
     },
+
+    // ------------------------------------------------------- the finishing pass
+    //
+    // Four of the six things step 16 asked for are here; the other two are elsewhere on
+    // purpose. The SOFT VIGNETTE is `round` in its inner mode - it was built as this
+    // file's second effect and darkens the frame's edges exactly as a vignette does, so a
+    // second type would have been the same draw under a different label. The MASTER GRADE
+    // is not a type at all: it is this same stack run once over the finished composite,
+    // through `renderMaster()` below.
+    //
+    // All four are cheap enough to run at preview resolution, which is a requirement
+    // rather than a hope: the viewer repaints them on every frame of playback. `lut` and
+    // `grain` are the two that touch every pixel, and both say below what they do about it.
+
+    lut: {
+      label: 'LUT (.cube)',
+      // A PATH, never the table. A 33-cube is 36k triplets: putting one on a clip would
+      // put it into every undo snapshot and into the .scut file, which is the rule this
+      // whole architecture is built on. The table is held by path in `lutTables` and read
+      // through an injected reader, exactly as an imported PNG pointer is.
+      params: { lut: '', amount: 1 },
+      schema: [
+        { path: 'params.amount', label: 'Amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      /**
+       * Trilinear, per pixel, against the cube as loaded - NOT against a coarser table
+       * baked from it.
+       *
+       * A 64-step dense table with a nearest lookup would be four times faster and was
+       * the first build, and it is wrong for one reason that matters here: an identity
+       * cube has to be a PIXEL-EXACT no-op, and a quantised table answers the value at
+       * the nearest grid centre instead of the value asked for, so a neutral LUT moved
+       * every channel by up to two levels. Trilinear interpolation of an identity map is
+       * exact by construction - the interpolant of a linear function is that function -
+       * so the no-op falls out of the maths rather than out of a special case.
+       */
+      draw(L, p) {
+        const lut = lutFor(p.lut);
+        if (!lut) return;                      // nothing loaded yet: the clip is untouched
+        const amount = clamp(p.amount, 0, 1);
+        if (amount <= 0.0005) return;
+        const W = L.W, H = L.H;
+        const img = L.c.getImageData(0, 0, W, H);
+        applyLUT(img.data, lut, amount);
+        L.c.putImageData(img, 0, 0);
+      },
+    },
+
+    bloom: {
+      label: 'Bloom',
+      params: { threshold: 0.72, intensity: 0.6, radius: 0.03 },
+      schema: [
+        { path: 'params.threshold', label: 'Threshold', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.intensity', label: 'Intensity', type: 'range', min: 0, max: 3, step: 0.01, digits: 2 },
+        { path: 'params.radius', label: 'Radius', type: 'range', min: 0.002, max: 0.2, step: 0.002, digits: 3 },
+      ],
+      /**
+       * Highlights above `threshold`, blurred and added back.
+       *
+       * The extraction and the blur happen on a plate of a FIXED SIZE - 256 px on the
+       * long side - and the result is scaled back up. That is not only a saving: it is
+       * what makes the bloom the same shape in the 540x960 viewer and the 1080x1920 file.
+       * A plate sized as a fraction of the frame would blur a different number of pixels
+       * at the two resolutions, and `padBlur()`'s own comment explains what that costs.
+       *
+       * The plate is masked to the layer's own alpha before it is added, for the reason
+       * at the top of this file: `lighter` over transparency would let a logo's glow
+       * spill onto the layers underneath it, and the effect would then behave one way
+       * over video and another over nothing.
+       */
+      draw(L, p) {
+        const intensity = clamp(p.intensity, 0, 3);
+        if (intensity <= 0.002) return;
+        const W = L.W, H = L.H;
+        const src = take(L, 'fxA');
+        L.c.drawImage(src, 0, 0);
+
+        const PL = 256;
+        const PW = W >= H ? PL : Math.max(8, Math.round(PL * W / H));
+        const PH = W >= H ? Math.max(8, Math.round(PL * H / W)) : PL;
+        const small = clean(L.surface, 'fxBloomS', PW, PH);
+        small.c.drawImage(src, 0, 0, PW, PH);
+        const img = small.c.getImageData(0, 0, PW, PH);
+        const d = img.data;
+        const thr = clamp(p.threshold, 0, 0.999);
+        const span = 1 - thr;
+        for (let i = 0; i < d.length; i += 4) {
+          if (!d[i + 3]) continue;
+          // Rec.709 luma, the same weights the grade calls brightness.
+          const y = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+          const v = y <= thr ? 0 : (span <= 0 ? 1 : (y - thr) / span);
+          // The colour is kept and the ALPHA carries how much of it blooms, so a warm
+          // highlight blooms warm rather than white.
+          d[i + 3] = Math.round(d[i + 3] * (v > 1 ? 1 : v));
+        }
+        small.c.putImageData(img, 0, 0);
+
+        const r = pxMin(clamp(p.radius, 0, 0.5), PW, PH);
+        const soft = padBlur(small.cv, r, PW, PH, L.surface, 'fxBloomB', false);
+        const glow = clean(L.surface, 'fxBloomG', W, H);
+        glow.c.drawImage(soft.cv, soft.pad, soft.pad, PW, PH, 0, 0, W, H);
+        glow.c.globalCompositeOperation = 'destination-in';
+        glow.c.drawImage(src, 0, 0);
+        reset(glow.c);
+
+        // An intensity above 1 is more passes of the same glow rather than a clamp, so
+        // the slider keeps meaning something past the point where one pass saturates.
+        L.c.globalCompositeOperation = 'lighter';
+        for (let n = intensity; n > 0; n -= 1) {
+          L.c.globalAlpha = Math.min(1, n);
+          L.c.drawImage(glow.cv, 0, 0);
+        }
+        reset(L.c);
+      },
+    },
+
+    grain: {
+      label: 'Film grain',
+      params: { amount: 0.14, scale: 1, seed: 1 },
+      schema: [
+        { path: 'params.amount', label: 'Amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.scale', label: 'Speck size', type: 'range', min: 0.125, max: 1, step: 0.125, digits: 3 },
+        { path: 'params.seed', label: 'Seed', type: 'range', min: 1, max: 999, step: 1 },
+      ],
+      /**
+       * SEEDED, and built at a fixed small size then scaled - the rule the film burn's
+       * streaks already live by, for the same reason.
+       *
+       * The preview and the baker build this texture independently, in two different
+       * canvases, at two different resolutions. `Math.random()` would therefore make them
+       * disagree on every single frame: the export would carry grain that was never
+       * previewed, and no amount of comparing would ever find it because it would be
+       * different again next time. `mulberry32(seed)` makes the map a pure function of
+       * the seed, and a 256 px map scaled to the frame makes it a pure function of the
+       * seed at every resolution - which is exactly what `smoke-finish.js` asserts.
+       *
+       * Grain that SCALES is the deliberate choice here. Real grain is a fixed physical
+       * size and would be finer in a larger frame, but this app's whole contract is that
+       * the viewer shows the file scaled down; grain built per output pixel would be
+       * invisible in the viewer and crawling in the export.
+       *
+       * `overlay` is the blend, so a mid-grey map leaves the picture alone and only the
+       * noise around it lifts and darkens. The map is masked to the layer's alpha first:
+       * `overlay` onto transparency shows the grey plate itself, which would fill the
+       * frame around a logo with flat grey.
+       */
+      draw(L, p) {
+        const amount = clamp(p.amount, 0, 1);
+        if (amount <= 0.002) return;
+        const W = L.W, H = L.H;
+        const src = take(L, 'fxA');
+        L.c.drawImage(src, 0, 0);
+
+        const map = grainMap(Math.round(Number(p.seed) || 1));
+        if (!map) return;
+        const plate = clean(L.surface, 'fxGrainP', W, H);
+        // Tiles, so a smaller speck is the same map laid down more times rather than a
+        // different map. `n` is an integer for the same reason the map is seeded: a
+        // fractional tiling would land the seams at different sub-pixel phases in the
+        // viewer and in the file.
+        const n = Math.max(1, Math.min(8, Math.round(1 / clamp(p.scale, 0.125, 1))));
+        for (let i = 0; i < n; i++) {
+          for (let j = 0; j < n; j++) {
+            plate.c.drawImage(map, i * W / n, j * H / n, W / n, H / n);
+          }
+        }
+        plate.c.globalCompositeOperation = 'destination-in';
+        plate.c.drawImage(src, 0, 0);
+        reset(plate.c);
+
+        L.c.globalCompositeOperation = 'overlay';
+        L.c.globalAlpha = amount;
+        L.c.drawImage(plate.cv, 0, 0);
+        reset(L.c);
+      },
+    },
   };
 
   /**
@@ -1674,6 +1850,471 @@
     return out;
   }
 
+
+  // ---------------------------------------------------------------- the LUT loader
+
+  /**
+   * A .cube file, parsed.
+   *
+   *   { n, data: Float32Array(n*n*n*3), min: [r,g,b], max: [r,g,b], title }
+   *
+   * `data` is indexed the way the format is written: RED FASTEST, then green, then blue.
+   * Getting that backwards is the classic .cube bug and it does not look like an error -
+   * it looks like a grade with the red and blue channels swapped, which is easy to
+   * mistake for the LUT being "a cool one".
+   *
+   * 1D cubes (`LUT_1D_SIZE`) are refused rather than half-supported: a 1D LUT is three
+   * curves, which is what the `grade` effect already is, and silently treating one as a
+   * cube would make a mess of it.
+   */
+  function parseCube(text) {
+    const src = String(text || '');
+    let n = 0, title = '';
+    const min = [0, 0, 0], max = [1, 1, 1];
+    const rows = [];
+    let oneD = false;
+    for (const raw of src.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line[0] === '#') continue;
+      const up = line.toUpperCase();
+      if (up.startsWith('TITLE')) { title = line.slice(5).trim().replace(/^"|"$/g, ''); continue; }
+      if (up.startsWith('LUT_3D_SIZE')) { n = parseInt(line.split(/\s+/)[1], 10) || 0; continue; }
+      if (up.startsWith('LUT_1D_SIZE')) { oneD = true; continue; }
+      if (up.startsWith('DOMAIN_MIN')) {
+        const v = line.split(/\s+/).slice(1).map(Number);
+        for (let i = 0; i < 3; i++) if (isFinite(v[i])) min[i] = v[i];
+        continue;
+      }
+      if (up.startsWith('DOMAIN_MAX')) {
+        const v = line.split(/\s+/).slice(1).map(Number);
+        for (let i = 0; i < 3; i++) if (isFinite(v[i])) max[i] = v[i];
+        continue;
+      }
+      if (/^[-+.\d]/.test(line)) {
+        const v = line.split(/\s+/).map(Number);
+        if (v.length >= 3 && isFinite(v[0]) && isFinite(v[1]) && isFinite(v[2])) rows.push(v);
+      }
+    }
+    if (oneD && !n) return { ok: false, error: 'That is a 1D LUT. Use the Grade effect instead - it is the same three curves.' };
+    if (!n || n < 2 || n > 128) return { ok: false, error: 'No usable LUT_3D_SIZE in that .cube file.' };
+    const need = n * n * n;
+    if (rows.length < need) {
+      return { ok: false, error: 'That .cube says LUT_3D_SIZE ' + n + ' - ' + need +
+        ' rows - but carries ' + rows.length + '.' };
+    }
+    const data = new Float32Array(need * 3);
+    for (let i = 0; i < need; i++) {
+      data[i * 3] = rows[i][0];
+      data[i * 3 + 1] = rows[i][1];
+      data[i * 3 + 2] = rows[i][2];
+    }
+    return { ok: true, lut: { n, data, min, max, title } };
+  }
+
+  /** One cube entry, by grid index. Red is the fastest axis - see `parseCube()`. */
+  function cubeAt(lut, i, j, k, out) {
+    const n = lut.n;
+    const o = ((k * n + j) * n + i) * 3;
+    out[0] = lut.data[o]; out[1] = lut.data[o + 1]; out[2] = lut.data[o + 2];
+    return out;
+  }
+
+  const lutC0 = new Float32Array(3), lutC1 = new Float32Array(3);
+
+  /**
+   * Trilinear sample. `r`,`g`,`b` are 0..1 in the LUT's own domain; the answer is 0..1.
+   *
+   * Written out rather than looped because it is the inner loop of a full-frame pixel
+   * pass: eight corners, three lerps along red, two along green, one along blue.
+   */
+  function sampleLUT(lut, r, g, b) {
+    const n = lut.n, m = n - 1;
+    const dom = (v, i) => {
+      const lo = lut.min[i], hi = lut.max[i];
+      const span = hi - lo;
+      const u = span > 1e-9 ? (v - lo) / span : 0;
+      return u < 0 ? 0 : u > 1 ? 1 : u;
+    };
+    const x = dom(r, 0) * m, y = dom(g, 1) * m, z = dom(b, 2) * m;
+    const i0 = Math.min(m, Math.floor(x)), j0 = Math.min(m, Math.floor(y)), k0 = Math.min(m, Math.floor(z));
+    const i1 = Math.min(m, i0 + 1), j1 = Math.min(m, j0 + 1), k1 = Math.min(m, k0 + 1);
+    const fx = x - i0, fy = y - j0, fz = z - k0;
+    const out = [0, 0, 0];
+    for (let ch = 0; ch < 3; ch++) {
+      const c000 = cubeAt(lut, i0, j0, k0, lutC0)[ch], c100 = cubeAt(lut, i1, j0, k0, lutC1)[ch];
+      const c00 = c000 + (c100 - c000) * fx;
+      const c010 = cubeAt(lut, i0, j1, k0, lutC0)[ch], c110 = cubeAt(lut, i1, j1, k0, lutC1)[ch];
+      const c01 = c010 + (c110 - c010) * fx;
+      const c001 = cubeAt(lut, i0, j0, k1, lutC0)[ch], c101 = cubeAt(lut, i1, j0, k1, lutC1)[ch];
+      const c10 = c001 + (c101 - c001) * fx;
+      const c011 = cubeAt(lut, i0, j1, k1, lutC0)[ch], c111 = cubeAt(lut, i1, j1, k1, lutC1)[ch];
+      const c11 = c011 + (c111 - c011) * fx;
+      const c0 = c00 + (c01 - c00) * fy;
+      const c1 = c10 + (c11 - c10) * fy;
+      out[ch] = c0 + (c1 - c0) * fz;
+    }
+    return out;
+  }
+
+  /**
+   * Apply a cube to an RGBA byte array in place, mixed `amount` of the way.
+   *
+   * Alpha is untouched, and a fully transparent pixel is skipped - the same two rules the
+   * `grade` pass keeps. `ImageData` is unpremultiplied, so the colour of a half-
+   * transparent pixel is meaningful and needs no undoing of a premultiply.
+   */
+  function applyLUT(d, lut, amount) {
+    const a = amount == null ? 1 : clamp(amount, 0, 1);
+    for (let i = 0; i < d.length; i += 4) {
+      if (!d[i + 3]) continue;
+      const o = sampleLUT(lut, d[i] / 255, d[i + 1] / 255, d[i + 2] / 255);
+      let r = o[0] * 255, g = o[1] * 255, b = o[2] * 255;
+      if (a !== 1) {
+        r = d[i] + (r - d[i]) * a;
+        g = d[i + 1] + (g - d[i + 1]) * a;
+        b = d[i + 2] + (b - d[i + 2]) * a;
+      }
+      r = Math.round(r); g = Math.round(g); b = Math.round(b);
+      d[i] = r < 0 ? 0 : r > 255 ? 255 : r;
+      d[i + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+      d[i + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    return d;
+  }
+
+  /** True when a cube maps every grid point to itself, so it cannot change a pixel. */
+  function isIdentityLUT(lut) {
+    if (!lut) return false;
+    const n = lut.n, m = n - 1;
+    for (let i = 0; i < 3; i++) if (Math.abs(lut.min[i]) > 1e-6 || Math.abs(lut.max[i] - 1) > 1e-6) return false;
+    const c = new Float32Array(3);
+    for (let k = 0; k < n; k++) {
+      for (let j = 0; j < n; j++) {
+        for (let i = 0; i < n; i++) {
+          cubeAt(lut, i, j, k, c);
+          if (Math.abs(c[0] - i / m) > 1e-5) return false;
+          if (Math.abs(c[1] - j / m) > 1e-5) return false;
+          if (Math.abs(c[2] - k / m) > 1e-5) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * LUTs held by path, exactly as imported pointers are - and for exactly the same
+   * reasons. `draw()` is synchronous and must never stall, so this hands back `null`
+   * while a file is still being read and the effect draws the clip untouched. That is
+   * right for the viewer, where the next frame is 16 ms away, and WRONG for the baker,
+   * where a missed frame is in the file forever: `preloadLuts()` is the one door the
+   * baker goes through first, the way `preloadImages()` already is.
+   *
+   * The READER is injected, because reading a file is not this file's business: the
+   * renderer has no `fs`, the path comes back through IPC, and a suite running fx.js on
+   * its own can hand it a reader over a string. With none installed nothing loads and
+   * every `lut` effect is a no-op, which is the honest answer rather than a broken one.
+   */
+  const lutTables = new Map();
+  let LUT_READER = null;
+  function setLutReader(fn) { LUT_READER = typeof fn === 'function' ? fn : null; }
+
+  /** Put a parsed cube in the cache directly - what a smoke suite and a preset use. */
+  function putLut(path, text, info) {
+    const key = String(path || '');
+    if (!key) return { ok: false, error: 'no path' };
+    const r = parseCube(text);
+    lutTables.set(key, r.ok
+      ? { lut: r.lut, info: Object.assign({ n: r.lut.n }, info || {}), pending: false }
+      : { lut: null, error: r.error, info: null, pending: false });
+    return r;
+  }
+
+  function lutFor(path) {
+    const key = String(path || '');
+    if (!key) return null;
+    const rec = lutTables.get(key);
+    if (rec) return rec.lut;
+    if (!LUT_READER) return null;
+    // Started once, never re-tried on every frame: a dead path must cost one read.
+    lutTables.set(key, { lut: null, pending: true, info: null });
+    Promise.resolve()
+      .then(() => LUT_READER(key))
+      .then((r) => {
+        if (!r || !r.ok) {
+          lutTables.set(key, { lut: null, pending: false, info: null, error: (r && r.error) || 'unreadable' });
+          return;
+        }
+        putLut(key, r.text, { size: r.size, mtime: r.mtime, name: r.name });
+      })
+      .catch((e) => lutTables.set(key, { lut: null, pending: false, info: null, error: String(e && e.message || e) }));
+    return null;
+  }
+
+  /** What the panel needs to say about a path: loaded, still reading, or why not. */
+  function lutState(path) {
+    const rec = lutTables.get(String(path || ''));
+    if (!rec) return String(path || '') ? { pending: true } : { empty: true };
+    if (rec.lut) return { ok: true, n: rec.lut.n, title: rec.lut.title, identity: isIdentityLUT(rec.lut) };
+    return rec.pending ? { pending: true } : { error: rec.error || 'unreadable' };
+  }
+
+  /**
+   * A digest of what a path's table actually IS, for the render key.
+   *
+   * A path alone would not do: swapping the file at that path for a different grade is a
+   * different picture, and the cached render of the old one would come straight back.
+   * Size and mtime come from the reader; `n` and a cheap sum over the table are computed
+   * here so a hand-installed cube (a preset, a suite) keys honestly too.
+   */
+  function lutDigest(path) {
+    const rec = lutTables.get(String(path || ''));
+    if (!rec || !rec.lut) return null;
+    const d = rec.lut.data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 7) sum = (sum + d[i] * 1e6) % 4294967296;
+    const info = rec.info || {};
+    return rec.lut.n + ':' + Math.round(sum) + ':' + (info.size || 0) + ':' + (info.mtime || 0);
+  }
+
+  /** Every LUT path a set of stacks names - clips, and the project's master stack. */
+  function lutPaths(clips, master) {
+    const paths = new Set();
+    const scan = (stack) => {
+      for (const f of (stack || [])) {
+        if (f && f.type === 'lut' && f.params && f.params.lut) paths.add(String(f.params.lut));
+      }
+    };
+    for (const c of (clips || [])) scan(c && c.fx);
+    scan(master);
+    return [...paths];
+  }
+
+  /**
+   * Read every cube a render needs before a single frame is baked.
+   *
+   * A path that will not read resolves anyway: a missing file must not hang a render, and
+   * an unapplied LUT is a defensible fallback - the same contract `preloadImages()` keeps
+   * for a pointer that will not decode.
+   */
+  function preloadLuts(clips, master) {
+    return Promise.all(lutPaths(clips, master).map((path) => {
+      if (lutFor(path)) return Promise.resolve();
+      if (!LUT_READER) return Promise.resolve();
+      return new Promise((done) => {
+        const t0 = Date.now();
+        const tick = () => {
+          const rec = lutTables.get(path);
+          if (!rec || !rec.pending || Date.now() - t0 > 3000) return done();
+          setTimeout(tick, 16);
+        };
+        tick();
+      });
+    }));
+  }
+
+  // ------------------------------------------------------------------- the grain map
+
+  /**
+   * Seeded randomness, the same generator `transitions.js` uses for its burn and luma
+   * maps - and here for the same reason, stated at length on the `grain` type: the
+   * preview and the baker build the texture independently, so an unseeded one would put
+   * grain in the file that was never on screen.
+   */
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * A 256x256 monochrome noise plate, mid-grey based so `overlay` leaves the picture
+   * alone where the noise is neutral. Held by seed: built once per seed per session, and
+   * a FIXED SIZE at every output resolution, which is the whole point of it.
+   */
+  const GRAIN_SIZE = 256;
+  const grainMaps = new Map();
+  function grainMap(seed) {
+    const key = String(seed);
+    const hit = grainMaps.get(key);
+    if (hit) return hit;
+    if (typeof document === 'undefined') return null;
+    const cv = document.createElement('canvas');
+    cv.width = GRAIN_SIZE; cv.height = GRAIN_SIZE;
+    const c = cv.getContext('2d');
+    const img = c.createImageData(GRAIN_SIZE, GRAIN_SIZE);
+    const d = img.data;
+    const rnd = mulberry32((seed || 1) * 2654435761 + 11);
+    for (let i = 0; i < d.length; i += 4) {
+      // Two samples averaged: a flat uniform plate reads as static, and the triangular
+      // distribution this gives clusters around neutral the way real grain does.
+      const v = Math.round(((rnd() + rnd()) / 2) * 255);
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = 255;
+    }
+    c.putImageData(img, 0, 0);
+    grainMaps.set(key, cv);
+    return cv;
+  }
+
+  // ------------------------------------------------------------------ matching two clips
+
+  /**
+   * The black point, mid-grey and white point of a frame, as 0..1 luma.
+   *
+   * PERCENTILES, not the extremes: one blown speculum or one crushed shadow pixel would
+   * otherwise define the whole range, and a single hot pixel would then rewrite the
+   * grade. Transparent pixels are ignored, so measuring a logo measures the logo.
+   */
+  function lumaStats(data, lo, hi) {
+    const pLo = lo == null ? 0.01 : lo, pHi = hi == null ? 0.99 : hi;
+    const hist = new Float64Array(256);
+    let n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] < 8) continue;
+      const y = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+      hist[Math.max(0, Math.min(255, Math.round(y)))]++;
+      n++;
+    }
+    if (!n) return null;
+    const at = (p) => {
+      let want = p * n, acc = 0;
+      for (let v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (acc >= want) return v / 255;
+      }
+      return 1;
+    };
+    return { black: at(pLo), mid: at(0.5), white: at(pHi), n };
+  }
+
+  /**
+   * Gain, lift and gamma that carry `src`'s three points onto `ref`'s.
+   *
+   * SOLVED ALL THREE AT ONCE, and that is the whole subtlety of this function.
+   *
+   * `gradeLUT()` applies gain, then lift, then gamma, so the curve is
+   *
+   *   f(v) = (v * gain + lift) ^ (1 / gamma)
+   *
+   * and the obvious build - fit gain and lift to the two end points, then spend gamma on
+   * mid-grey - is WRONG, because gamma is not a mid-tone control. A power moves every
+   * value but 0 and 1, so the gamma that lands the mid-grey walks the black point back
+   * off the reference: fitting the ends first and the middle second measured the black
+   * point landing at 0.046 against a reference of 0.02, and `smoke-finish.js` caught it.
+   *
+   * Inverting the equations instead makes all three exact. Writing g = gain and l = lift:
+   *
+   *   b * g + l = ref.black ^ gamma
+   *   w * g + l = ref.white ^ gamma
+   *   m * g + l = ref.mid   ^ gamma
+   *
+   * The first two give g and l for any gamma; substituting into the third leaves one
+   * equation in gamma alone, which is solved by bisection - monotone in practice, and
+   * bounded to the same 0.2..3 the slider is, so a hopeless fit answers "as close as the
+   * range allows" rather than an absurdity.
+   *
+   * A degenerate input - a flat frame, a black frame - answers the neutral grade rather
+   * than an infinity. Nothing here touches saturation or temperature: matching the TONE
+   * is what makes mixed footage sit together, and a hue match on two different subjects
+   * is as likely to be wrong as right.
+   */
+  function matchGrade(src, ref) {
+    const out = Object.assign({}, GRADE_NEUTRAL);
+    if (!src || !ref) return out;
+    const b = src.black, w = src.white, m = src.mid;
+    const sSpan = w - b, rSpan = ref.white - ref.black;
+    if (!(sSpan > 0.004) || !(rSpan > 0.004)) return out;
+
+    // Where mid-grey sits between the two end points. It is the same fraction on both
+    // sides of the fit, which is what the residual below measures.
+    const k = clamp((m - b) / sSpan, 0, 1);
+    const pw = (v, g) => Math.pow(Math.max(0, Math.min(1, v)), g);
+    const resid = (g) => k * (pw(ref.white, g) - pw(ref.black, g)) + pw(ref.black, g) - pw(ref.mid, g);
+
+    let gamma = 1;
+    let lo = 0.2, hi = 3;
+    const fLo = resid(lo), fHi = resid(hi);
+    if (isFinite(fLo) && isFinite(fHi) && fLo * fHi < 0) {
+      for (let i = 0; i < 40; i++) {
+        const midG = (lo + hi) / 2;
+        if (resid(lo) * resid(midG) <= 0) hi = midG; else lo = midG;
+      }
+      gamma = (lo + hi) / 2;
+    } else if (Math.abs(fLo) < Math.abs(fHi)) {
+      gamma = lo;
+    } else if (isFinite(fHi) && Math.abs(fHi) < Math.abs(fLo)) {
+      gamma = hi;
+    }
+    gamma = clamp(gamma, 0.2, 3);
+
+    const gain = clamp((pw(ref.white, gamma) - pw(ref.black, gamma)) / sSpan, 0.05, 8);
+    const lift = clamp(pw(ref.black, gamma) - b * gain, -0.5, 0.5);
+    out.gain = Math.round(gain * 1000) / 1000;
+    out.lift = Math.round(lift * 1000) / 1000;
+    out.gamma = Math.round(gamma * 1000) / 1000;
+    return out;
+  }
+
+  // ------------------------------------------------------------- the project master pass
+
+  /**
+   * The project's own stack, run ONCE over a finished frame.
+   *
+   * This is the whole of the master grade: there is no second implementation of a LUT or
+   * of grain for it, and no ffmpeg half. The frame that has just been composited is
+   * copied, handed back to `render()` as the "paint" of a clip with no clip, and the
+   * finished layer is drawn over the top. A LUT applied per clip and the same LUT applied
+   * here therefore cannot drift, because they are the same function.
+   *
+   * WHICH TYPES ARE ALLOWED, and why it is a short list. `cursor`, `ripple` and `matte`
+   * read something recorded alongside a CLIP, and there is no clip here - they would draw
+   * nothing, or worse, read the first clip they were handed. `MASTER_TYPES` is what the
+   * panel offers and `normalizeStack()` is what enforces it, so a hand-edited project
+   * cannot get a `matte` into the master pass.
+   *
+   * `t` is TIMELINE time, not clip-local: the master stack belongs to the project and has
+   * no in-point to be timed from. Keys on it are therefore timeline seconds, which is the
+   * one place in the app where that is true, and the panel says so.
+   */
+  const MASTER_TYPES = ['grade', 'lut', 'bloom', 'grain', 'blur', 'round'];
+
+  function normalizeStack(stack) {
+    if (!Array.isArray(stack)) return [];
+    return stack
+      .filter((f) => f && DEFS[f.type] && MASTER_TYPES.indexOf(f.type) >= 0)
+      .map(normalize)
+      .filter(Boolean);
+  }
+
+  /**
+   * Does the master stack have anything that will actually draw?
+   *
+   * A FILTER, never `normalizeStack()`, even though that would answer the same question:
+   * `normalize()` writes defaults into the entry it is given, and this is asked on every
+   * frame by `needsCompositeAt()`. Filling in a project's state from inside a paint check
+   * is a mutation outside `pushUndo()`, which is the one thing the editing rules forbid.
+   */
+  function masterActive(stack) {
+    return (stack || []).some(
+      (f) => f && DEFS[f.type] && MASTER_TYPES.indexOf(f.type) >= 0 && f.enabled !== false);
+  }
+
+  function renderMaster(target, W, H, stack, t, surface, frameDur) {
+    const entries = (stack || []).filter(
+      (f) => f && DEFS[f.type] && MASTER_TYPES.indexOf(f.type) >= 0 && f.enabled !== false);
+    if (!entries.length) return false;
+    const snap = clean(surface, 'fxMasterSrc', W, H);
+    snap.c.drawImage(target.canvas, 0, 0);
+    // A clip with an id and nothing else: `paramsAt()` wants somewhere to look for a
+    // binding and finds none, which is the right answer - a master pass follows nothing.
+    render(target, W, H, { id: 'master', fx: entries }, t, surface,
+      (tc, w, h) => tc.drawImage(snap.cv, 0, 0, w, h), frameDur);
+    return true;
+  }
   // ------------------------------------------------------------ per-effect shutter
 
   const MBLUR = { on: false, strength: 0.5, samples: 8 };
@@ -2033,6 +2674,14 @@
     pointerImage, preloadImages,
     MBLUR, mblurOf, timeVarying, shadowProblem,
     gradeLUT, isNeutralGrade, GRADE_NEUTRAL,
+    // The finishing pass. The cube parser and the sampler are exported because they are
+    // the part worth asserting on their own - `smoke-finish.js` checks trilinear
+    // interpolation against hand-computed values without painting a pixel.
+    parseCube, sampleLUT, applyLUT, isIdentityLUT, cubeAt,
+    setLutReader, putLut, lutFor, lutState, lutDigest, lutPaths, preloadLuts,
+    mulberry32, grainMap, GRAIN_SIZE,
+    lumaStats, matchGrade,
+    MASTER_TYPES, normalizeStack, masterActive, renderMaster,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
     CHROME, chromeGeom, spotRect, cutoutRect, fitDraw,
   };

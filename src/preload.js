@@ -14,6 +14,12 @@ contextBridge.exposeInMainWorld('api', {
   // rather than a path to a file that can move. See Graphics.svgPaths().
   pickSvg: () => ipcRenderer.invoke('svg:pick'),
 
+  // A .cube LUT for the finishing pass. The TEXT comes back with the size and mtime -
+  // FX.parseCube() is the only cube parser in the app, and the render key needs to know
+  // when the file at a path has changed.
+  pickLut: () => ipcRenderer.invoke('lut:pick'),
+  readLut: (p) => ipcRenderer.invoke('lut:read', p),
+
   // QuickBin: a media library kept in userData, so it is there in every project.
   binRead: () => ipcRenderer.invoke('bin:read'),
   binWrite: (data) => ipcRenderer.invoke('bin:write', data),

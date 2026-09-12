@@ -45,7 +45,7 @@ Three environment variables hook into the main process (all in `createWindow()`)
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
 
-There are twenty-eight suites:
+There are twenty-nine suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -107,6 +107,18 @@ There are twenty-eight suites:
   assertion an opaque black-and-white mask fails), the cutout's source-to-destination
   mapping, and that `chrome` then `background` and `background` then `chrome` give
   different pictures — so "the stack order is the feature" stays true.
+- `tools/smoke-finish.js` — the finishing pass: the `.cube` parser (title, `DOMAIN_MAX`,
+  a refused 1D LUT, a refused short file, and that **red is the fastest axis**), trilinear
+  interpolation against values computed by hand, that an identity LUT with no grain is a
+  **pixel-exact** no-op over a 256-band ramp, that grain is byte-identical across two runs
+  and the *same texture* at 256×448 and 768×1344 — with a different-seed control, so the
+  assertion is measuring the texture rather than measuring nothing — bloom's reach,
+  threshold and scale invariance, that neither bloom nor grain spills onto the
+  transparency around a clip, that the three-point tone match lands all three points,
+  that the same stack agrees as a clip effect and as the master finish, that the master
+  finish takes every covered span off the fast path and lands in the render key (a
+  different cube at the *same path* included) without carrying a timeline position, and
+  that one undo restores it exactly.
 - `tools/smoke-mask.js` — Magic Mask: prompt encoding (a scribble resampled along its own
   length with both ends kept and the count capped, and the **sign** carried through as a
   label), that a negative stroke genuinely cuts a same-coloured neighbour back out, the
@@ -430,6 +442,8 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
   captions: { ... },                         // caption settings - see "Captions" below
   sfx: { level, minGap, maxTicks,            // sound design settings - see "Sound design"
          duck: {...}, triggers: {...} },
+  master: [ FX, ... ],   // the project master finish - an effect stack over the whole
+                         //   composite. Empty by default. See "The finishing pass"
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
 }
 ```
@@ -613,7 +627,10 @@ on the fast path when **both** of these hold:
 
 1. at most **one** picture clip (`kind:'video'` or `kind:'image'`) is visible across it;
 2. **no** clip contributing to it carries a live effect (`FX.active(clip)` is empty);
-3. **no** clip contributing to it carries a speed change (`Speed.has(clip)` is false).
+3. **no** clip contributing to it carries a speed change (`Speed.has(clip)` is false);
+4. the project **master finish** is empty or entirely bypassed (`FX.masterActive()` is
+   false) — a master pass has no ffmpeg half either, so it disqualifies every span it
+   covers at once. See "The project master finish".
 
 Anything else bakes. In practice that means real alpha compositing — two or more pictures
 stacked — any effect at all, or any rate other than 1x. Speed is on that list for the
@@ -701,7 +718,7 @@ Plain JSON, ordered, and **absent by default** — `FX.normalizeClip()` deletes 
 again once the last effect goes, so a project that uses no effects serialises exactly as
 it did before this existed.
 
-Thirteen types ship so far, and each one is **one function**:
+Sixteen types ship so far, and each one is **one function**:
 
 | Type | What it draws |
 | --- | --- |
@@ -718,6 +735,9 @@ Thirteen types ship so far, and each one is **one function**:
 | `spotlight` | darken and blur everything outside a rounded rect or an ellipse |
 | `cutout` | a region lifted out, scaled up and floated with its own shadow |
 | `matte` | the clip cut to a painted Magic Mask, with feather, grow/choke and invert |
+| `lut` | a .cube LUT, trilinear, at any amount |
+| `bloom` | highlights above a threshold, blurred and added back |
+| `grain` | seeded film grain, built small and scaled |
 
 Adding a type is one entry in `FX.DEFS` — its label, its default parameters, its
 inspector schema and its `draw()`. The panel, the keyframe strips, the serialisation, the
@@ -960,6 +980,149 @@ bake spans outright — see the fast path), and neither path is effect-aware. Th
 agree with each other, which is the invariant that matters, but the effect is simply not
 there for the length of the window. The panel says so on screen.
 
+The project **master finish** is the exception, and deliberately so: it is the project's
+look rather than a clip's effect, so both transition paths apply it to the finished
+transition frame. See "The project master finish".
+
+#### The finishing pass
+
+Three new `DEFS` entries — `lut`, `bloom`, `grain` — plus a **project master finish**,
+which is not a type at all. The soft vignette is not a new type either: it is `round` in
+its inner mode, which darkens the frame's edges and has done since step 7, and a second
+entry would have been the same draw under a different label.
+
+**A LUT is a path, never a table.** `clip.fx` is plain JSON that goes into every undo
+snapshot and into the `.scut`; a 33-point cube is 36,000 triplets. So the entry carries
+`params.lut` — a file path — and the parsed cube is held by path in `fx.js`, exactly as an
+imported PNG pointer is. The reader is **injected** (`FX.setLutReader()`) for the same
+reason the binder and the matte provider are: the renderer has no `fs`, and a path becomes
+a table only after an IPC round trip. `main.js` reads the text and hands back its size and
+mtime; `FX.parseCube()` is the only cube parser in the app, and it lives in the file that
+draws with it.
+
+Reading is asynchronous and `draw()` is not, so a cube that has not arrived yet draws
+**nothing** and the clip comes through untouched. That is right for the viewer, where the
+next frame is 16 ms away, and wrong for the baker, where a missed frame is in the file
+forever — so `bakeOverlays()` awaits `FX.preloadLuts()` before a single frame is baked,
+the same one door `FX.preloadImages()` already stands in.
+
+Two details of the format worth knowing, because getting either wrong looks like a grade
+rather than a bug:
+
+- **red is the fastest axis.** The second data row of a `.cube` is *r = 1, g = 0, b = 0*.
+  Indexing it the other way produces a picture with red and blue transposed, which reads
+  as "a cool LUT" rather than as an error. `smoke-finish.js` asserts the axis order.
+- **`DOMAIN_MIN` / `DOMAIN_MAX`** rescale the *input*, so a half-domain cube treats 0.5 as
+  its top and everything above clamps.
+
+**Sampling is trilinear, per pixel, against the cube as loaded.** A 64-step dense table
+with a nearest lookup was the first build and is four times faster; it is wrong for one
+reason that matters here. An identity cube has to be a *pixel-exact* no-op, and a
+quantised table answers the value at the nearest grid centre rather than the value asked
+for, so a neutral LUT moved every channel by up to two levels. Trilinear interpolation of
+a linear map *is* that map, so the no-op falls out of the arithmetic instead of out of a
+special case — and the suite asserts it over a 256-band ramp, every byte, not a sample.
+
+**Grain is seeded, and the seed map is built small and scaled.** This is the trap the
+film burn's streaks already learned, and it is worth restating because the symptom is
+invisible: the preview and the baker build the texture independently, in two different
+canvases, at two different resolutions, so `Math.random()` would put grain in the export
+that was never on screen and a different one again next time. `FX.grainMap(seed)` is a
+256×256 plate from `mulberry32(seed)`, held by seed, drawn scaled and tiled an *integer*
+number of times — a fractional tiling would land the seams at different sub-pixel phases
+in the viewer and in the file. Grain that *scales* is the deliberate choice: real grain is
+a fixed physical size and would be finer in a larger frame, but this app's contract is
+that the viewer shows the file scaled down, so grain built per output pixel would be
+invisible in the viewer and crawling in the export.
+
+**Bloom extracts and blurs on a fixed 256 px plate** and scales the glow back up. Not
+only a saving: a plate sized as a *fraction* of the frame would blur a different number of
+pixels at 540×960 and at 1080×1920, and `padBlur()`'s comment explains at length what that
+costs. Both `bloom` and `grain` mask their plate to the layer's own alpha before
+compositing, which is the layer rule at the top of `fx.js` — `lighter` or `overlay` onto
+transparency would spill a logo's glow onto the layers underneath it and fill the space
+around a cutout with flat grey.
+
+#### The project master finish
+
+`state.master` is an ordinary FX stack that belongs to the project rather than to a clip,
+drawn once over the finished composite by `FX.renderMaster()` — which is `FX.render()`
+over a copy of the frame that was just composited. **There is no second LUT and no second
+grain for it**: a cube applied to one clip and the same cube applied to the whole project
+are the same function, so they cannot drift. `smoke-finish.js` asserts that the same stack
+gives the same pixels both ways.
+
+Where it is applied, and why in exactly those two places:
+
+| Path | Master finish applied |
+| --- | --- |
+| `compositeLayers()` — the viewer *and* the composite baker | yes, at the end |
+| a transition window — `drawTransitionFrame()` and `bakeTransitions()` | yes, on the finished transition frame |
+| a caption or graphic ffmpeg overlays on top of a transition | no, in the viewer or in the file |
+| a real gap with nothing on it | no — see below |
+
+The middle row is the point: the viewer draws the transition, applies the master finish,
+then paints the cards over it; the baker bakes the transition with the master finish in it
+and ffmpeg overlays the same cards afterwards. The two agree because they stop at the same
+place, and the odd-looking one out — an ungraded caption over a graded cut — is the same
+in the preview and in the export.
+
+`FX.MASTER_TYPES` is the short list the panel offers: `grade`, `lut`, `bloom`, `grain`,
+`blur` and `round` (the vignette). `cursor`, `ripple` and `matte` are excluded because
+each reads something recorded alongside a *clip*, and there is no clip here;
+`FX.normalizeStack()` enforces that, so a hand-edited project cannot get a `matte` into
+the master pass. Keys on a master entry are **timeline** seconds rather than clip seconds
+— the project has no in-point to be timed from — which is the only place in the app where
+that is true, and the panel says so.
+
+**A master finish is undoable state.** It decides pixels, so it joined the undo snapshot
+alongside the track list and the selection (`snapshot()` in `app.js`). Everything else at
+project level — Tighten's threshold, the caption style, the SFX levels — only changes what
+the *next* pass would produce, which is why none of those are in there. A snapshot is
+still nothing but `JSON.stringify` of plain data.
+
+**And it takes every span it covers off the fast path.** There is no ffmpeg half of a LUT
+or of grain to fall back on, so a span ffmpeg built would export ungraded while the viewer
+showed it graded — the exact drift step 6 exists to end. `needsCompositeAt()` therefore
+answers *yes* for any span with something visible on it while the master stack is live,
+and the panel says out loud that the project renders slower with one. A **real gap** is
+the one exemption: there is no picture there to finish, and baking a full-frame raw
+sequence of black to carry a LUT that would tint a hole in the edit is not a trade worth
+making. The viewer agrees, because `drawPreview()` fills a gap with black and returns
+before it ever reaches `compositeLayers()`.
+
+#### Matching two clips
+
+`FX.matchGrade()` shifts one clip's black point, white point and mid-grey towards
+another's, and writes the result into an ordinary `grade` effect the author can then
+adjust — a generator, not an opaque effect, which is the same call auto-zoom made about
+its keyframes. The button sits on the grade row itself, because what it does is write that
+effect's three numbers.
+
+It solves **all three points at once**, and that is the whole subtlety. `gradeLUT()`
+applies gain, then lift, then gamma, so the curve is `f(v) = (v * gain + lift) ^ (1/gamma)`
+— and the obvious build, fitting gain and lift to the two end points and then spending
+gamma on the middle, is wrong: a power moves every value but 0 and 1, so the gamma that
+lands mid-grey walks the black point back off the reference. Measured, it landed at 0.046
+against a reference of 0.02, and the suite caught it. Inverting the three equations
+instead leaves one equation in gamma alone, solved by bisection inside the same 0.2–3 the
+slider offers, so all three points land and a hopeless fit answers "as close as the range
+allows".
+
+What is measured is chosen just as deliberately:
+
+- the **centre half** of the frame, not all of it. Letterbox bars on a `contain` clip and
+  the dark corners of a vignette are exactly the pixels that would otherwise define a
+  black point, and neither is the footage;
+- **percentiles**, not extremes — one blown highlight would otherwise rewrite the grade;
+- the reference **as it looks**, through its own effect stack, and the target as it looks
+  *without* the grade about to be replaced. Measuring the target's existing grade and
+  writing a new one on top of it would compound, and pressing Match twice must be the same
+  as pressing it once.
+
+Saturation, contrast and temperature are never touched: this is a tone match, and a hue
+match between two different subjects is as likely to be wrong as right.
+
 #### The render cache
 
 `jobCacheKey()` hashes the whole job, and `buildJob()` carries `clip.fx` onto the job entry
@@ -969,6 +1132,16 @@ picture. The key strips each effect's `id` on the way in, for the same reason it
 clip's — an id is identity handed out by `FX.create()`, not pixels, and leaving it in
 would mean two clips wearing the same grade never shared a cached render, and deleting an
 effect and adding an identical one back missed its own cache.
+
+Two more things joined it with the finishing pass, and both follow the same rule. A job
+carries the project **master** stack (absent when it is empty, so a project with no
+master finish hashes exactly as it did before this existed, ids stripped the same way),
+and it carries `luts` — a digest of what the cube AT each path currently holds, per clip
+and for the master. A path alone would not do: swapping the file at that path for a
+different grade is a different picture, and the cached render of the old one would come
+straight back. `FX.lutDigest()` is the size, the mtime and a cheap sum over the table,
+and like `Tracker.digest()` and `MagicMask.digest()` before it, it carries no timeline
+position — which is what lets a graded clip keep its cached render when it is dragged.
 
 ### The audio chain
 
@@ -4068,6 +4241,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
 | A transcript format | a parser in `src/captions.js` and a branch in `parseTranscript()` — everything downstream takes `[{w, start, end, conf}]` |
 | An audio effect type | one entry in `AudioFX.DEFS` (`src/audiofx.js`) — its `schema` builds the inspector rows and its `filter()` builds the ffmpeg string; nothing else to touch |
+| A **finishing** effect that applies to the whole project | one entry in `FX.DEFS` as usual, plus its name in `FX.MASTER_TYPES` — the master panel, the serialisation and the render key all build themselves from that. Only add a type whose `draw()` needs no clip |
 | A preset kind | one entry in `PRESET_KINDS` (`main.js`) + a preset bar built like `audioFxPresetBar()` |
 | A transition type | `TYPES` + `defaults()` + a `draw*()` in `transitions.js`, and its controls in `renderTransitionPanel()` (`app.js`) |
 | Anything that blurs by sampling across time | `Anim.temporalAverage()` — never a hand-rolled `lighter` at `1/samples` accumulator, see "The shutter" |
@@ -4077,7 +4251,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 
 Anything that mutates the timeline should call `pushUndo()` **before** mutating and
 `markDirty()` + `renderAll()` after. Undo snapshots are `JSON.stringify` of the whole
-track list — cheap and total; don't put non-serialisable values on clips or tracks.
+track list, the selection and the project master finish (`snapshot()` in `app.js`) — cheap
+and total; don't put non-serialisable values on clips, tracks or the master stack.
 
 ### Known limits
 
@@ -4115,6 +4290,19 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   both of them hit the same disk cache, so the second one is a file read.
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The
   numbers are in "The fast path, and exactly what leaves it".
+- A project **master finish** takes *every* span it covers off the fast path, so turning
+  one on makes the whole project render at bake speed. It is the most expensive switch in
+  the app, and the panel says so.
+- The master finish does not reach a real gap, or a caption or graphic that ffmpeg
+  overlays on top of a transition. Both are the same in the preview and in the export —
+  see "The project master finish" for the table of where it applies.
+- A LUT is loaded from a path, so moving or deleting the `.cube` leaves the effect drawing
+  nothing. The panel says which state a path is in; it is never silent about it.
+- Grain scales with the frame rather than being a fixed physical size, so it is the same
+  texture in the viewer and in the export rather than the same speck size in centimetres.
+- Match tone matches **tone** — black point, white point, mid-grey. It does not touch
+  saturation, contrast or temperature, so two clips under different lights still need a
+  hue trim by hand.
 - Sonify sounds five things - a graphic's entry, a transition, a mouse-down, a counting
   number's steps and a hard cut into a stat. It does not listen to the audio: there is no
   beat detection, so nothing is placed on the music. It also has no per-placement
