@@ -2335,6 +2335,79 @@ ipcMain.handle('render:pickOutput', async (_e, defaultName) => {
   return r.canceled ? null : r.filePath;
 });
 
+/* ------------------------------------------------------------------ delivery
+ *
+ * A delivery run writes several files at once - three formats times three hook variants
+ * is nine - so it asks for a FOLDER once and names the files itself. Walking a save
+ * dialog nine times is not a workflow.
+ */
+ipcMain.handle('deliver:pickDir', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Deliver into',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  return r.canceled || !r.filePaths.length ? null : r.filePaths[0];
+});
+
+/** One cover frame. The renderer composited it; this only decodes the data URL and writes. */
+ipcMain.handle('deliver:cover', async (_e, { dir, name, dataUrl }) => {
+  try {
+    if (typeof dir !== 'string' || typeof name !== 'string') throw new Error('bad path');
+    const m = /^data:image\/png;base64,(.+)$/.exec(String(dataUrl || ''));
+    if (!m) throw new Error('not a PNG data URL');
+    const file = path.join(dir, path.basename(name));
+    fs.writeFileSync(file, Buffer.from(m[1], 'base64'));
+    return { ok: true, path: file };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+/**
+ * Join a hook to its tail, without re-encoding either.
+ *
+ * Both parts came out of the same `buildArgs()` at the same size, fps and quality, so the
+ * streams are compatible and the concat demuxer can copy them: the join costs a file copy
+ * rather than a second encode, which is the whole reason the split into two ranges is
+ * worth making. Re-encoding here would give back everything the shared tail saved.
+ *
+ * The list file is written next to the output, with paths quoted the way the demuxer
+ * wants - a Windows path has backslashes in it, and `-safe 0` is what lets it be absolute.
+ */
+ipcMain.handle('deliver:concat', async (_e, { parts, outPath }) => {
+  try {
+    if (!Array.isArray(parts) || parts.length < 2) throw new Error('nothing to join');
+    for (const p of parts) if (!fs.existsSync(p)) throw new Error('missing part: ' + p);
+    const listFile = path.join(app.getPath('temp'),
+      'shortcut-concat-' + crypto.randomBytes(6).toString('hex') + '.txt');
+    fs.writeFileSync(listFile,
+      parts.map((p) => "file '" + String(p).replace(/'/g, "'\\''") + "'").join('\n'), 'utf8');
+    const args = ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c', 'copy',
+      '-movflags', '+faststart', outPath];
+    const res = await new Promise((resolve) => {
+      const p = ffmpegSpawn(args);
+      let log = '';
+      p.stderr.on('data', (d) => { log += d.toString(); if (log.length > 100000) log = log.slice(-50000); });
+      p.on('error', (err) => resolve({ ok: false, error: err.message }));
+      p.on('close', (code) => resolve(code === 0
+        ? { ok: true, outPath }
+        : { ok: false, error: log.split('\n').slice(-20).join('\n') || 'ffmpeg exited ' + code }));
+    });
+    try { fs.unlinkSync(listFile); } catch (e) { /* scratch */ }
+    return res;
+  } catch (err) {
+    return { ok: false, error: 'Could not join the parts: ' + err.message };
+  }
+});
+
+/** Delete one scratch part. Best-effort: a leftover costs disk, never the delivery. */
+ipcMain.handle('deliver:remove', (_e, file) => {
+  try {
+    if (typeof file === 'string' && /\.shortcut_(hook|tail)_/.test(file)) fs.unlinkSync(file);
+    return true;
+  } catch (err) { return false; }
+});
+
 ipcMain.handle('render:start', async (_e, job) => {
   if (activeRender) return { ok: false, error: 'A render is already running.' };
 

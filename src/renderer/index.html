@@ -16,6 +16,11 @@
 
       <div id="stage">
         <canvas id="preview" width="1080" height="1920"></canvas>
+        <!-- The safe-zone guide. A DOM overlay and never a draw into the canvas: the
+             canvas is the same surface the baker composites into, so a guide painted on
+             it could one day reach a baked frame. Positioned onto the canvas's own box
+             by renderSafeOverlay(), because the picture is letterboxed inside the stage. -->
+        <div id="safeOverlay" hidden><div class="safe-in"></div><div class="safe-lbl"></div></div>
         <div id="frameHint" class="hint">Drag on the preview to reposition the frame</div>
       </div>
 
@@ -191,6 +196,9 @@
       <div id="quickBin"></div>
 
       <div class="panel-head"><span class="title">Framing</span>
+        <!-- Which format these sliders are writing to. Hidden on the master, because
+             that is the answer every project has unless the format picker is open. -->
+        <span id="framingWhich" class="tc-meta" hidden></span>
         <button id="btnResetFrame" class="mini" title="Reset framing (Shift+R)">Reset</button>
       </div>
       <div id="framing" class="pad">
@@ -253,6 +261,16 @@
            something to open by accident. -->
       <div id="masterPanel" hidden></div>
 
+      <div class="panel-head" id="delPanelHead">
+        <span class="title">Delivery</span>
+        <span id="delMeta" class="tc-meta"></span>
+        <button id="btnDelCollapse" class="mini" title="Show / hide the delivery panel">+</button>
+      </div>
+      <!-- Collapsed by default, like the three panels above it: choosing formats, cutting
+           hook variants and reading the retention lint are things done at the end of an
+           edit rather than while making one. -->
+      <div id="delPanel" hidden></div>
+
       <div class="panel-head" id="transPanelHead" hidden>
         <span class="title">Transition</span>
         <span id="transMeta" class="tc-meta"></span>
@@ -301,6 +319,7 @@
   <script src="../screen.js"></script>
   <script src="../captions.js"></script>
   <script src="../sfx.js"></script>
+  <script src="../delivery.js"></script>
   <script src="meter.js"></script>
   <script src="anim.js"></script>
   <script src="speed.js"></script>

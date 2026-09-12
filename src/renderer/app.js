@@ -63,7 +63,66 @@ const state = {
    *  undo and dirties the project. Keys on it are TIMELINE seconds - it has no in-point
    *  to be timed from. See FX.renderMaster(). */
   master: [],
+  /** Hook variants - alternative openings that share one tail. See section 11. */
+  hooks: Delivery.defaultHooks(),
+  /** Delivery settings: which formats ship, the safe-zone guide, the lint's threshold.
+   *  Settings like Tighten's and Captions': changing one snapshots no undo entry and
+   *  dirties nothing on its own. Saved in the .scut so a project remembers what it
+   *  delivers. The hook VARIANTS above are not settings - they are timeline content. */
+  delivery: { formats: ['9x16'], safe: false, maxGap: Delivery.LINT_DEFAULTS.maxGap },
 };
+
+/**
+ * THE FORMAT THE VIEWER IS SHOWING, or null for the project's own.
+ *
+ * A project has ONE master format - `state.out` - and the other two are derived from it.
+ * Setting this is a VIEW mode, not an edit: it changes the shape the viewer composites at
+ * and which framing the Framing panel writes to, and it changes nothing that is saved.
+ * That is exactly why it is a module variable rather than state - switching to 1:1 to fix
+ * a crop and hitting Ctrl+S must not save a square project.
+ *
+ * Everything needing the output shape asks `outSize()`; everything needing to know WHICH
+ * framing to read asks `framingFormat()`, where null means the clip's own.
+ */
+let viewFormat = null;
+
+function outSize() {
+  const f = viewFormat && Delivery.formatById(viewFormat);
+  return f ? { w: f.w, h: f.h } : { w: state.out.w, h: state.out.h };
+}
+
+/** The format id on screen, master or override. Null for an output shape that is neither. */
+function activeFormatId() {
+  if (viewFormat) return viewFormat;
+  const f = Delivery.formatOf(state.out.w, state.out.h);
+  return f ? f.id : null;
+}
+
+/**
+ * Which per-format override the picture is framed by. Null means the clip's own values.
+ *
+ * Null whenever the viewer is on the master format, which is every moment of every
+ * project that never opens the format picker - so `Delivery.framingFor()` short-circuits
+ * to `panX`/`panY`/`zoom` and the framing path is arithmetically what it was before this
+ * step existed.
+ */
+function framingFormat() { return viewFormat; }
+
+/** The framing one clip is drawn with right now: its own, or this format's override. */
+function framingOf(c) { return Delivery.framingFor(c, framingFormat()); }
+
+/**
+ * The clip as the picture sees it: a shallow copy wearing this format's framing.
+ *
+ * Anything that maps SOURCE coordinates into the frame - the tracker's `frameMap`, and
+ * so every bound effect - has to use the same crop the draw does, or a callout bound to a
+ * button sits next to it the moment the viewer switches format. A copy, never the clip:
+ * a view mode must not write a single value back onto the timeline.
+ */
+function framedCopy(c) {
+  if (!c || !framingFormat() || !Delivery.hasOverride(c, framingFormat())) return c;
+  return Object.assign({}, c, framingOf(c));
+}
 
 let undoStack = [];
 let redoStack = [];
@@ -1113,6 +1172,11 @@ function renderAll() {
   renderPlayhead();
   renderInspector();
   drawPreview();
+  // The delivery meta and the safe guide follow every edit: the lint's answer changes
+  // with the timeline, and the guide has to track the canvas when the preset does.
+  updateDeliveryMeta();
+  renderSafeOverlay();
+  if (deliveryLintPaint && !$('#delPanel').hidden) deliveryLintPaint();
 }
 
 function renderHeads() {
@@ -2831,7 +2895,7 @@ function autoZoomSettings(clip) {
 function autoZoomPreview(clip) {
   if (!ScreenTel.hasTelemetry(clip)) return { segments: [], keys: { x: [], y: [], scale: [] } };
   return Cursor.autoZoom(clip.screen, clip,
-    Object.assign({}, autoZoomSettings(clip), { aspect: state.out.w / state.out.h }));
+    Object.assign({}, autoZoomSettings(clip), { aspect: outSize().w / outSize().h }));
 }
 
 /**
@@ -4067,8 +4131,9 @@ const ctx = canvas.getContext('2d');
  */
 function previewSize() {
   const s = state.previewScale || 1;
-  const w = Math.max(2, Math.round(state.out.w * s / 2) * 2);
-  const h = Math.max(2, Math.round(state.out.h * s / 2) * 2);
+  const o = outSize();
+  const w = Math.max(2, Math.round(o.w * s / 2) * 2);
+  const h = Math.max(2, Math.round(o.h * s / 2) * 2);
   return { w, h };
 }
 
@@ -4077,7 +4142,16 @@ function resizeCanvas() {
   canvas.width = p.w;
   canvas.height = p.h;
   frameCacheValid = false;
-  $('#aspectBadge').textContent = state.out.w > state.out.h ? '16:9' : '9:16';
+  const fmt = Delivery.formatById(activeFormatId());
+  const o = outSize();
+  $('#aspectBadge').textContent = fmt ? fmt.short : o.w + 'x' + o.h;
+  // The badge is also the "you are not looking at the master" light: nothing else on
+  // screen says the viewer is showing a shape the project does not render at.
+  $('#aspectBadge').classList.toggle('viewing', !!viewFormat);
+  $('#aspectBadge').title = viewFormat
+    ? 'Previewing ' + (fmt ? fmt.label : viewFormat) + '. The project still renders ' +
+      state.out.w + 'x' + state.out.h + '.'
+    : "The project's own output shape.";
 }
 
 /** A clip that puts pixels on the canvas through an element: footage or a still. */
@@ -4268,20 +4342,25 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
 function drawClipTo(c, el, target, W, H) {
   const sw = elW(el) || c.srcW, sh = elH(el) || c.srcH;
   if (!sw || !sh) return;
-  if (c.fit === 'contain') {
+  // The framing this format is drawn with - the clip's own unless the viewer is on
+  // another format and the clip carries an override for it. Identical to reading
+  // `c.panX`/`c.panY`/`c.zoom` in every project that never opens the format picker.
+  const f = framingOf(c);
+  if (f.fit === 'contain') {
     // Scaled to fit inside the frame, then multiplied by `zoom` - so zoom 1 is "as large
     // as it goes while whole", and the aspect ratio is the source's own at every size.
-    const s = Math.min(W / sw, H / sh) * Math.max(0.01, c.zoom || 1);
+    const s = Math.min(W / sw, H / sh) * Math.max(0.01, f.zoom || 1);
     const dw = sw * s, dh = sh * s;
     // pan 0.5 centres it; 0 and 1 put its edges against the frame's, so the whole range
     // is reachable at any size and the control means the same thing as it does in 'crop'.
-    target.drawImage(el, 0, 0, sw, sh, (W - dw) * c.panX, (H - dh) * c.panY, dw, dh);
+    target.drawImage(el, 0, 0, sw, sh, (W - dw) * f.panX, (H - dh) * f.panY, dw, dh);
     return;
   }
-  const outAspect = state.out.w / state.out.h;
-  const cw = Math.min(sw, sh * outAspect) / c.zoom;
-  const ch = Math.min(sh, sw / outAspect) / c.zoom;
-  target.drawImage(el, (sw - cw) * c.panX, (sh - ch) * c.panY, cw, ch, 0, 0, W, H);
+  const o = outSize();
+  const outAspect = o.w / o.h;
+  const cw = Math.min(sw, sh * outAspect) / f.zoom;
+  const ch = Math.min(sh, sw / outAspect) / f.zoom;
+  target.drawImage(el, (sw - cw) * f.panX, (sh - ch) * f.panY, cw, ch, 0, 0, W, H);
 }
 
 /**
@@ -4907,7 +4986,8 @@ canvas.addEventListener('mousedown', (e) => {
   const c = activeVideoClip();
   if (!c) return;
   canvas.classList.add('dragging');
-  framingDrag = { c, x: e.clientX, y: e.clientY, panX: c.panX, panY: c.panY };
+  const f0 = framingOf(c);
+  framingDrag = { c, x: e.clientX, y: e.clientY, panX: f0.panX, panY: f0.panY };
   pushUndo();
 });
 document.addEventListener('mousemove', (e) => {
@@ -4915,8 +4995,10 @@ document.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
   const c = framingDrag.c;
   // Full pan range across roughly one canvas width of mouse travel.
-  c.panX = clamp(framingDrag.panX - (e.clientX - framingDrag.x) / rect.width, 0, 1);
-  c.panY = clamp(framingDrag.panY - (e.clientY - framingDrag.y) / rect.height, 0, 1);
+  // Written through `writeFraming()`, so a drag on the viewer while looking at 1:1
+  // writes the 1:1 override rather than moving the master's crop under it.
+  writeFraming(c, 'panX', clamp(framingDrag.panX - (e.clientX - framingDrag.x) / rect.width, 0, 1));
+  writeFraming(c, 'panY', clamp(framingDrag.panY - (e.clientY - framingDrag.y) / rect.height, 0, 1));
   syncFramingControls();
 });
 document.addEventListener('mouseup', () => {
@@ -4933,9 +5015,32 @@ function framingTarget() {
 
 const FRAMING_DEFAULTS = { panX: 0.5, panY: 0.5, zoom: 1 };
 
+/**
+ * Write one framing value to the right place: the clip, or this format's override.
+ *
+ * THE one door. Every path that changes framing - the sliders, the number boxes, the
+ * wheel, the reset buttons, the L/C/R buttons and the drag on the viewer - goes through
+ * it, which is what makes "the Framing panel edits whichever format you are looking at"
+ * one rule rather than seven.
+ */
+function writeFraming(c, prop, value) {
+  const fmt = framingFormat();
+  if (fmt) Delivery.setOverride(c, fmt, { [prop]: value });
+  else c[prop] = value;
+}
+
 function syncFramingControls() {
   const t = framingTarget()[0];
   const on = !!t;
+  // The panel says which framing it is editing, because the sliders look identical
+  // either way and writing a square crop while believing you are fixing the master is
+  // the one mistake this feature makes possible.
+  const fmt = Delivery.formatById(framingFormat());
+  const head = $('#framingWhich');
+  if (head) {
+    head.textContent = fmt ? 'editing the ' + fmt.short + ' override' : '';
+    head.hidden = !fmt;
+  }
   ['panX', 'panY', 'zoom'].forEach((k) => {
     $('#' + k).disabled = !on;
     $('#' + k + 'v').disabled = !on;
@@ -4944,16 +5049,17 @@ function syncFramingControls() {
   // Don't fight the user while they are mid-edit in a number box.
   const skip = document.activeElement && document.activeElement.classList.contains('tc-num')
     ? document.activeElement.id : null;
+  const f = framingOf(t);
   for (const k of ['panX', 'panY', 'zoom']) {
-    $('#' + k).value = t[k];
-    if (skip !== k + 'v') $('#' + k + 'v').value = Number(t[k]).toFixed(3);
+    $('#' + k).value = f[k];
+    if (skip !== k + 'v') $('#' + k + 'v').value = Number(f[k]).toFixed(3);
   }
 }
 
 function setFraming(prop, value) {
   const targets = framingTarget();
   if (!targets.length) return;
-  for (const c of targets) c[prop] = value;
+  for (const c of targets) writeFraming(c, prop, value);
   markDirty();
   syncFramingControls();
 }
@@ -4978,7 +5084,7 @@ function setFraming(prop, value) {
     max: k === 'zoom' ? 8 : 1,
     get: () => {
       const t = framingTarget()[0];
-      return t ? t[k] : 0;
+      return t ? framingOf(t)[k] : 0;
     },
     set: (v) => setFraming(k, v),
   };
@@ -4998,19 +5104,29 @@ $('#btnFrameCenter').addEventListener('click', () => { pushUndo(); setFraming('p
 $('#btnFrameRight').addEventListener('click', () => { pushUndo(); setFraming('panX', 1); });
 $('#btnResetFrame').addEventListener('click', () => {
   pushUndo();
-  for (const c of framingTarget()) { c.panX = 0.5; c.panY = 0.5; c.zoom = 1; }
-  markDirty(); syncFramingControls();
+  const fmt = framingFormat();
+  for (const c of framingTarget()) {
+    // Resetting an OVERRIDE drops it rather than pinning it at centre: "no override" and
+    // "an override that happens to say 0.5" are different things, and only the first one
+    // follows the master when the master is re-framed.
+    if (fmt) Delivery.clearOverride(c, fmt);
+    else { c.panX = 0.5; c.panY = 0.5; c.zoom = 1; }
+  }
+  markDirty(); syncFramingControls(); renderAll();
 });
 $('#btnFrameAll').addEventListener('click', () => {
   const src = framingTarget()[0];
   if (!src) return;
   pushUndo();
+  const sf = framingOf(src);
   for (const { clip } of allClips()) {
     if (clip.kind !== 'video') continue;
-    clip.panX = src.panX; clip.panY = src.panY; clip.zoom = src.zoom;
+    for (const k of ['panX', 'panY', 'zoom']) writeFraming(clip, k, sf[k]);
   }
   markDirty();
-  log('Framing applied to all video clips.');
+  renderAll();
+  const fmt = Delivery.formatById(framingFormat());
+  log('Framing applied to all video clips' + (fmt ? ' for ' + fmt.short : '') + '.');
 });
 
 // ============================== 7. editing operations
@@ -6049,6 +6165,9 @@ function newProject() {
   state.captions = Object.assign({}, Captions.DEFAULTS);
   state.sfx = SFX.defaultOpts();
   state.master = [];
+  state.delivery = normalizeDelivery(null);
+  state.hooks = Delivery.defaultHooks();
+  viewFormat = null;
   transcriptCache.clear();
   syncLoudnessControl();
   undoStack = []; redoStack = [];
@@ -6930,6 +7049,11 @@ function serialize() {
     sfx: state.sfx,
     // The master finish is part of the project, not a setting: it decides pixels.
     master: masterStack(),
+    // Delivery: the settings, and the hook variants. The variants carry real clips - a
+    // variant IS timeline content that happens not to be on the timeline right now - so
+    // the active one is written back before this is taken. See `syncActiveVariant()`.
+    delivery: state.delivery,
+    hooks: syncActiveVariant(),
     tracks: state.tracks,
   };
 }
@@ -6988,6 +7112,9 @@ async function openProject(filePath) {
   // Fill in a master stack saved by an older build, and drop a type this one does not
   // know - the job Trans.normalize() and FX.normalizeClip() do for everything else.
   state.master = FX.normalizeStack(d.master);
+  state.delivery = normalizeDelivery(d.delivery);
+  state.hooks = Delivery.normalizeHooks(d.hooks);
+  viewFormat = null;
   transcriptCache.clear();
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
@@ -7008,6 +7135,9 @@ async function openProject(filePath) {
       // newer file would fall through every branch of drawClipTo() as 'crop' anyway, so
       // it is normalised away rather than carried around meaning nothing.
       if (c.fit !== 'contain') delete c.fit;
+      // Drop a per-format override for a format this build does not know, and prune the
+      // container when it holds nothing - the job every normalizer above does.
+      Delivery.normalizeClip(c);
     }
   }
   preloadTransitionImages();
@@ -7051,6 +7181,7 @@ function buildJob(outPath, range) {
       const headCut = Math.max(0, r.from - c.start);
       const tailCut = Math.max(0, cEnd - r.to);
 
+      const fr = framingOf(c);
       const entry = {
         id: c.id,
         src: c.src,
@@ -7071,7 +7202,12 @@ function buildJob(outPath, range) {
         speed: Speed.digest(c),
         speedAudio: Speed.has(c) ? Speed.audioMode(c) : undefined,
         rate: Speed.has(c) ? Speed.constantRate(c) : undefined,
-        panX: c.panX, panY: c.panY, zoom: c.zoom,
+        // The framing THIS FORMAT is drawn with. Identical to `c.panX`/`c.panY`/`c.zoom`
+        // on the master format and on every clip with no override, which is what keeps a
+        // project that never opens the format picker emitting byte-identical arguments.
+        // A per-format override therefore lands in the render key for free: it is the
+        // same three fields, holding different numbers.
+        panX: fr.panX, panY: fr.panY, zoom: fr.zoom,
         volume: c.volume,
         // The audio chain and the track it sits on. `trackId` is what a ducking effect
         // names as its voice source, so buildArgs() needs it to find the sidechain feed.
@@ -7145,7 +7281,7 @@ function buildJob(outPath, range) {
     }
   }
   return {
-    width: state.out.w, height: state.out.h, fps: state.out.fps,
+    width: outSize().w, height: outSize().h, fps: state.out.fps,
     quality: state.out.quality, outPath, clips,
     loudness: Object.assign({}, AudioFX.LOUD_DEFAULTS, state.out.loudness),
     // The project master finish, and what its LUTs currently hold. Carried for the same
@@ -7316,8 +7452,11 @@ function jobCacheKey(job) {
     if (e.fx) e.fx = e.fx.map((f) => { const g = Object.assign({}, f); delete g.id; return g; });
     if (c.transRef) {
       // Everything a transition's pixels depend on: its settings and both clips' framing.
-      const framing = (x) => ({ src: x.src, in: x.in, start: x.start, out: x.out,
-        panX: x.panX, panY: x.panY, zoom: x.zoom, speed: Speed.digest(x) });
+      // Through `framingOf()` for the same reason the clip entries above are: a
+      // transition's two halves are drawn by `drawClipTo()`, so a per-format override
+      // changes its pixels and has to change its key.
+      const framing = (x) => Object.assign({ src: x.src, in: x.in, start: x.start, out: x.out,
+        speed: Speed.digest(x) }, framingOf(x));
       e.trans = c.transRef.tr;
       e.transA = framing(c.transRef.a);
       e.transB = framing(c.transRef.b);
@@ -7530,7 +7669,9 @@ function clipNeedsBake(c) {
   // A 'contain' still is transparent around its edges, which ffmpeg's crop-and-fill chain
   // cannot express - it would scale the picture up to fill the frame and crop it, which
   // is the opposite of what the mode says. So it composites, exactly as an effect does.
-  if (c.fit === 'contain') return true;
+  // Read through the format, so a still set to 'contain' for 1:1 only is composited
+  // when 1:1 is the shape being rendered and handed to the fast path when it is not.
+  if (framingOf(c).fit === 'contain') return true;
   return FX.active(c).length > 0;
 }
 
@@ -8041,6 +8182,752 @@ window.api.onRenderProgress((d) => {
   setStatus('Rendering... ' + fmtTc(d.time) + ' / ' + fmtTc(d.total));
 });
 
+// ================================= 9b. delivery: formats, hooks, covers, lint
+//
+// The last layer, and the one a client actually receives. Four things, and they only look
+// like four features - three of them are re-readings of work that already exists.
+//
+//   FORMATS      one project, three shapes. The picture is already built at whatever size
+//                it is asked for (step 6 made the bake the single draw path, and every
+//                painter scales off the frame), so a second format costs a render rather
+//                than a second implementation. What it DOES cost is judgement: a crop that
+//                is right for 9:16 is wrong for 1:1, and no arithmetic fixes that. Hence
+//                per-format framing overrides, and a viewer that can show another shape.
+//
+//   HOOKS        2-3 openings, one tail. The whole feature rests on a property of the
+//                render cache rather than on new machinery: the tail is the SAME timeline
+//                range under every variant, so `buildJob()` builds the same job and
+//                `jobCacheKey()` hashes the same string, and main hands back the file the
+//                first variant encoded. A variant is REAL CLIPS, swapped on and off the
+//                timeline - never a parallel edit model.
+//
+//   COVERS       one composited frame at each format's size. `compositeLayers()` already
+//                paints exactly that; a cover is that canvas as a PNG.
+//
+//   LINT         the only check in the app that measures the EDIT rather than the picture.
+//                Nothing changing for three seconds is the failure mode of the format, and
+//                it is invisible from inside the edit - so making it visible is worth more
+//                than another effect, and it is thirty lines.
+//
+// `Delivery` (src/delivery.js) holds every decision as a pure function. Everything here is
+// the half that needs a timeline, a canvas or a render.
+
+function normalizeDelivery(d) {
+  const o = Object.assign(
+    { formats: ['9x16'], safe: false, maxGap: Delivery.LINT_DEFAULTS.maxGap }, d || {});
+  o.formats = (Array.isArray(o.formats) ? o.formats : []).filter((id) => Delivery.formatById(id));
+  if (!o.formats.length) {
+    // Default to whatever the project actually renders at, so the box already ticked is
+    // the one `Export...` has always used.
+    const f = Delivery.formatOf(state.out.w, state.out.h);
+    o.formats = [f ? f.id : '9x16'];
+  }
+  o.safe = !!o.safe;
+  o.maxGap = clamp(o.maxGap, 0.5, 15);
+  return o;
+}
+
+// ---------------------------------------------------------- the safe-zone overlay
+//
+// A DOM overlay laid over the canvas, NOT something drawn into it. The viewer's canvas is
+// the same surface the baker composites into, and a guide that could ever reach a baked
+// frame is a guide that will eventually ship inside somebody's video. Keeping it in the
+// DOM makes that impossible by construction rather than by care.
+
+function renderSafeOverlay() {
+  const box = $('#safeOverlay');
+  if (!box) return;
+  const fmt = Delivery.formatById(activeFormatId());
+  if (!state.delivery.safe || !fmt) { box.hidden = true; return; }
+  box.hidden = false;
+  // Track the canvas's own laid-out box: it is letterboxed inside the stage, and the guide
+  // has to sit on the picture rather than on the panel around it.
+  box.style.left = canvas.offsetLeft + 'px';
+  box.style.top = canvas.offsetTop + 'px';
+  box.style.width = canvas.offsetWidth + 'px';
+  box.style.height = canvas.offsetHeight + 'px';
+  const s = fmt.safe;
+  const inner = box.querySelector('.safe-in');
+  inner.style.left = (s.left * 100) + '%';
+  inner.style.right = (s.right * 100) + '%';
+  inner.style.top = (s.top * 100) + '%';
+  inner.style.bottom = (s.bottom * 100) + '%';
+  box.querySelector('.safe-lbl').textContent = fmt.short + ' safe';
+}
+
+// ------------------------------------------------------------- looking at a format
+
+const masterFormatId = () => (Delivery.formatOf(state.out.w, state.out.h) || {}).id || null;
+
+/**
+ * Show the viewer another format, or `null` for the project's own.
+ *
+ * Where the format picker's real work happens, and it is deliberately tiny: the shape
+ * comes from `outSize()` and the framing from `framingOf()`, and everything in the app
+ * already reads both. Nothing is saved, nothing is dirtied and no undo entry is taken -
+ * looking at a project is not editing it.
+ */
+function setViewFormat(id) {
+  const next = id && Delivery.formatById(id) && id !== masterFormatId() ? id : null;
+  if (next === viewFormat) return;
+  viewFormat = next;
+  // The framing changed shape, so every held layer surface and the frame cache are the
+  // wrong crop. resizeCanvas() drops the cache; the layer surfaces resize and clear.
+  frameCacheValid = false;
+  resizeCanvas();
+  renderAll();
+  renderDeliveryPanel();
+}
+
+/**
+ * Run `fn` with the viewer on `id`, and put it back however `fn` ends.
+ *
+ * The restore is in a `finally` for the same reason `loop()` re-arms in one: a render that
+ * throws half way through the 1:1 pass must not leave the editor showing 1:1 with the
+ * Framing panel quietly writing square overrides.
+ */
+async function withFormat(id, fn) {
+  const prev = viewFormat;
+  try {
+    viewFormat = id && id !== masterFormatId() ? id : null;
+    frameCacheValid = false;
+    resizeCanvas();
+    return await fn();
+  } finally {
+    viewFormat = prev;
+    frameCacheValid = false;
+    resizeCanvas();
+  }
+}
+
+// ---------------------------------------------------------------- the hook variants
+//
+// A variant is the first N seconds of the timeline, lifted off it and held in the project.
+// It is ORDINARY CLIPS - the same objects, with the same shape, that were on the tracks a
+// moment ago - so everything about them (undo, saving, media elements, effects, keys)
+// works because nothing about them is special. Switching variant is a swap: what is on the
+// timeline goes back into the variant it came from, and the other one comes out.
+//
+// The alternative - a parallel timeline per variant - would have meant every feature in
+// the app learning what a hook is. This way none of them do.
+
+/** Does a clip belong to the hook? It STARTS inside it; see `Delivery.crossers()`. */
+function inHook(c, len) { return c.start < len - 1e-6; }
+
+/** Lift the hook region off the tracks and hand it back as a variant body. */
+function captureHook(len) {
+  const body = {};
+  for (const t of state.tracks) {
+    const mine = t.clips.filter((c) => inHook(c, len));
+    const trs = (t.transitions || []).filter((tr) => {
+      const r = resolveTransition(tr, t);
+      return r && r.from < len - 1e-6;
+    });
+    if (!mine.length && !trs.length) continue;
+    body[t.id] = {
+      clips: JSON.parse(JSON.stringify(mine)),
+      transitions: JSON.parse(JSON.stringify(trs)),
+    };
+  }
+  return body;
+}
+
+/** Take the hook region off the tracks, leaving everything after it exactly as it is. */
+function stripHook(len) {
+  for (const t of state.tracks) {
+    for (const c of t.clips) if (inHook(c, len)) dropMedia(c.id);
+    t.clips = t.clips.filter((c) => !inHook(c, len));
+    t.transitions = (t.transitions || []).filter((tr) => {
+      const r = resolveTransition(tr, t);
+      return r && r.from >= len - 1e-6;
+    });
+  }
+}
+
+/** Put a variant body back on the tracks. A track it names that is gone is dropped. */
+function placeHook(body) {
+  for (const id of Object.keys(body || {})) {
+    const t = state.tracks.find((x) => x.id === id);
+    if (!t) continue;
+    t.clips = t.clips.concat(JSON.parse(JSON.stringify(body[id].clips || [])));
+    t.clips.sort((a, b) => a.start - b.start);
+    t.transitions = (t.transitions || [])
+      .concat(JSON.parse(JSON.stringify(body[id].transitions || [])));
+  }
+}
+
+/**
+ * Write whatever is on the timeline now back into the active variant, and hand back
+ * `state.hooks`.
+ *
+ * Called before saving and before every swap, because the TIMELINE is the truth while a
+ * variant is live: a variant's stored body is a snapshot from the moment it was last put
+ * away, and the author has been editing the real clips ever since.
+ */
+function syncActiveVariant() {
+  const h = state.hooks;
+  if (h.enabled && h.variants.length) {
+    const v = h.variants[h.active];
+    if (v) v.tracks = captureHook(h.len);
+  }
+  return h;
+}
+
+function activateVariant(i) {
+  const h = state.hooks;
+  if (!h.variants.length || i === h.active || !h.variants[i]) return;
+  pushUndo();
+  syncActiveVariant();
+  stripHook(h.len);
+  h.active = i;
+  placeHook(h.variants[i].tracks);
+  markDirty();
+  renderAll();
+  renderDeliveryPanel();
+  log('Hook variant: ' + h.variants[i].name);
+}
+
+/**
+ * Turn hook variants on, taking what is on the timeline now as the first variant.
+ *
+ * The first variant is never empty: whatever opening the author already cut IS the first
+ * thing worth testing against, and starting from a blank hook would throw it away.
+ */
+function enableHooks() {
+  const h = state.hooks;
+  pushUndo();
+  h.enabled = true;
+  if (!h.variants.length) {
+    h.variants = [{ id: nextId(), name: Delivery.variantName(0), tracks: captureHook(h.len) }];
+    h.active = 0;
+  }
+  markDirty();
+  renderAll();
+  renderDeliveryPanel();
+}
+
+/** A new variant, copied from the active one - editing a copy beats cutting from nothing. */
+function addVariant(blank) {
+  const h = state.hooks;
+  if (h.variants.length >= Delivery.MAX_VARIANTS) return;
+  pushUndo();
+  syncActiveVariant();
+  stripHook(h.len);
+  const i = h.variants.length;
+  const body = blank ? {} : JSON.parse(JSON.stringify(h.variants[h.active].tracks || {}));
+  // Fresh ids. Two variants holding one clip id would share a media element, a selection
+  // and an undo identity the moment both were ever on the timeline in the same session.
+  for (const tid of Object.keys(body)) {
+    const remap = new Map();
+    for (const c of (body[tid].clips || [])) { const was = c.id; c.id = nextId(); remap.set(was, c.id); }
+    for (const tr of (body[tid].transitions || [])) {
+      tr.id = nextId();
+      tr.aId = remap.get(tr.aId) || tr.aId;
+      tr.bId = remap.get(tr.bId) || tr.bId;
+    }
+  }
+  h.variants.push({ id: nextId(), name: Delivery.variantName(i), tracks: body });
+  h.active = i;
+  placeHook(body);
+  markDirty();
+  renderAll();
+  renderDeliveryPanel();
+}
+
+function removeVariant(i) {
+  const h = state.hooks;
+  if (h.variants.length <= 1 || !h.variants[i]) return;
+  pushUndo();
+  if (i === h.active) {
+    stripHook(h.len);
+    h.variants.splice(i, 1);
+    h.active = Math.max(0, i - 1);
+    placeHook(h.variants[h.active].tracks);
+  } else {
+    syncActiveVariant();
+    h.variants.splice(i, 1);
+    if (h.active > i) h.active--;
+  }
+  markDirty();
+  renderAll();
+  renderDeliveryPanel();
+}
+
+/** The timeline as `Delivery.crossers()` reads it: every clip's id, name and extent. */
+function hookScene() {
+  return allClips().map(({ clip }) => ({
+    id: clip.id, name: clipLabel(clip), start: clip.start, end: clipEnd(clip),
+  }));
+}
+
+// ---------------------------------------------------------------------- the lint
+//
+// One pass over the timeline collecting the moments where SOMETHING HAPPENS, handed to
+// `Delivery.lint()`, which finds the holes between them. The same split the captions and
+// Sonify passes keep: only this side knows how a clip maps into timeline time, and only
+// the pure side needs testing.
+
+function lintEvents() {
+  const ev = [];
+  const put = (t, kind) => { if (Number.isFinite(t)) ev.push({ t, kind }); };
+  for (const t of state.tracks) {
+    for (const c of t.clips) {
+      if (t.type === 'audio') {
+        // A placed sound is a pattern interrupt the ear hears even when the picture is
+        // still, so a sonified stretch is not a flat one.
+        if (c.sfx) put(c.start, 'sfx');
+        continue;
+      }
+      if (c.kind === 'text') put(c.start, 'caption');
+      else if (c.kind === 'graphic') put(c.start, 'graphic');
+      else { put(c.start, 'cut'); put(clipEnd(c), 'cut'); }
+      // Every keyframe on the clip - the zooms, the moves, the graded ramps. Auto-zoom
+      // writes ordinary keys (step 9's whole design point), so this counts an auto-zoom
+      // without knowing that auto-zoom exists.
+      for (const prop of Object.keys(c.keys || {})) {
+        for (const k of (c.keys[prop] || [])) put(c.start + k.t, 'zoom');
+      }
+      for (const f of (c.fx || [])) {
+        if (!f || f.enabled === false) continue;
+        for (const prop of Object.keys(f.keys || {})) {
+          for (const k of (f.keys[prop] || [])) put(c.start + k.t, 'zoom');
+        }
+      }
+    }
+    for (const tr of (t.transitions || [])) {
+      const r = resolveTransition(tr, t);
+      if (r) put(r.from, 'transition');
+    }
+  }
+  return ev;
+}
+
+function runLint() {
+  return Delivery.lint(lintEvents(), {
+    maxGap: state.delivery.maxGap, from: 0, to: projectDuration(),
+  });
+}
+
+// ---------------------------------------------------------------------- the cover
+//
+// One composited frame, at a format's own size. Nothing new is drawn: `compositeLayers()`
+// is the single draw path, so a cover is what the export shows at that timecode, cards
+// and graphics included. Which is the point - a cover frame that does not match the video
+// is a cover frame that lies about the video.
+
+async function composeCover(time, W, H) {
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const c2 = cv.getContext('2d');
+  const clips = allClips().map((x) => x.clip);
+  // The same one door the baker uses: a pointer or a LUT that has not arrived would be
+  // painted wrong, and unlike a viewer frame this one is written to a file.
+  await FX.preloadImages(clips);
+  await FX.preloadLuts(clips, state.master);
+  const layers = layersAt(time);
+  await Promise.all(layers.filter(isPictureClip).map((c) => {
+    const el = mediaFor(c);
+    if (el.tagName === 'IMG') return Promise.resolve();
+    el.muted = true;
+    return seekMedia(el, clamp(srcAt(c, time - c.start), 0, Math.max(0, c.mediaDuration - 0.03)));
+  }));
+  compositeLayers(c2, W, H, layers, time,
+    (c) => { const el = mediaFor(c); return frameReady(el) ? el : null; }, 1 / state.out.fps);
+  return cv;
+}
+
+async function exportCovers() {
+  if (rendering) { setStatus('A render is already running.', 'err'); return; }
+  const fmts = state.delivery.formats.map(Delivery.formatById).filter(Boolean);
+  if (!fmts.length) { setStatus('Tick a format first.', 'err'); return; }
+  const base = state.filePath
+    ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'cover';
+  const dir = await window.api.pickDeliveryDir();
+  if (!dir) return;
+  pause();
+  const t = state.playhead;
+  const written = [];
+  for (const f of fmts) {
+    // Through withFormat, so the frame is composed with THIS format's framing overrides.
+    // A cover is a frame of that format's video, not a rescale of another one's.
+    const png = await withFormat(f.id, async () => {
+      const cv = await composeCover(t, f.w, f.h);
+      return cv.toDataURL('image/png');
+    });
+    const r = await window.api.writeCover(dir, Delivery.outputName(base + '_cover', f, 'png'), png);
+    if (r && r.ok) written.push(r.path);
+    else log('Cover failed for ' + f.label + ': ' + ((r && r.error) || 'unknown'));
+  }
+  frameCacheValid = false;
+  renderAll();
+  if (written.length) {
+    setStatus('Wrote ' + written.length + ' cover frame(s) at ' + fmtTc(t) + '.', 'ok');
+    log('Cover frames at ' + fmtTc(t) + ': ' + written.join(', '));
+    window.api.showItem(written[0]);
+  } else setStatus('No cover frame was written.', 'err');
+}
+
+// --------------------------------------------------------------------- the export
+//
+// The delivery run: every ticked format, and inside each, every hook variant.
+
+/** Render one timeline range to one path, through the bake and the render cache. */
+async function renderSpanTo(outPath, range) {
+  const job = buildJob(outPath, range);
+  // Taken BEFORE baking, while the job still carries the cards - the same rule
+  // `doRender()` keeps, and the reason the tail's key is comparable across variants.
+  job.cacheKey = jobCacheKey(job);
+  job.useCache = true;
+  let dirs = [];
+  try {
+    dirs = await bakeOverlays(job);
+    return await window.api.startRender(job);
+  } finally {
+    for (const d of dirs) window.api.endTextSeq(d);
+  }
+}
+
+async function doDeliver() {
+  if (rendering) { setStatus('A render is already running.', 'err'); return; }
+  const dur = projectDuration();
+  if (dur <= 0) { setStatus('Nothing to render - the timeline is empty.', 'err'); return; }
+  const fmts = state.delivery.formats.map(Delivery.formatById).filter(Boolean);
+  if (!fmts.length) { setStatus('Tick at least one format.', 'err'); return; }
+
+  const h = state.hooks;
+  const variants = h.enabled && h.variants.length ? h.variants : [null];
+  const base = state.filePath
+    ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'output';
+  const dir = await window.api.pickDeliveryDir();
+  if (!dir) return;
+
+  pause();
+  rendering = true;
+  setDeliveryBusy(true);
+
+  // A variant swap is a timeline edit, and a render is not allowed to be one. The whole
+  // run happens between a snapshot and its restore - the same trick `withFormat()` plays
+  // on the viewer, one level up. No `pushUndo()`, because when this ends there is nothing
+  // to undo: the timeline is byte-identical to what it was when the button was pressed.
+  syncActiveVariant();
+  const snapshot = JSON.stringify(state.tracks);
+  const wasActive = h.active;
+  const t0 = Date.now();
+  const written = [];
+  const tmp = [];
+  let failed = null;
+  let reusedTails = 0;
+
+  try {
+    for (const f of fmts) {
+      if (failed) break;
+      await withFormat(f.id, async () => {
+        for (let vi = 0; vi < variants.length; vi++) {
+          if (failed) return;
+          const v = variants[vi];
+          if (v) {
+            stripHook(h.len);
+            h.active = vi;
+            placeHook(v.tracks);
+          }
+          const name = Delivery.outputName(base, f, 'mp4', v ? v.name : '');
+          const outPath = dir + '\\' + name;
+          setStatus('Delivering ' + name + '...');
+
+          if (!v || !(h.len > 0 && h.len < dur)) {
+            const res = await renderSpanTo(outPath, { from: 0, to: dur });
+            if (!res.ok) { failed = res; return; }
+            written.push(outPath);
+            continue;
+          }
+
+          // THE SPLIT THAT MAKES VARIANTS CHEAP.
+          //
+          // The hook is rendered per variant; the tail is rendered as its own range, and
+          // that range's job is IDENTICAL under every variant - same clips, same framing,
+          // same effects, same everything - so `jobCacheKey()` hashes the same string and
+          // main copies back the file the first variant encoded. The second and third
+          // variants therefore cost one short hook encode each, plus a stream copy.
+          //
+          // `res.cached` is how that is CHECKED rather than assumed: it comes back true
+          // only when main found the key already on disk, and the log says so per file.
+          const hookPath = dir + '\\.shortcut_hook_' + f.id + '_' + vi + '.mp4';
+          const tailPath = dir + '\\.shortcut_tail_' + f.id + '.mp4';
+          tmp.push(hookPath, tailPath);
+          const hr = await renderSpanTo(hookPath, Delivery.hookRange(h));
+          if (!hr.ok) { failed = hr; return; }
+          const tr = await renderSpanTo(tailPath, Delivery.tailRange(h, dur));
+          if (!tr.ok) { failed = tr; return; }
+          if (tr.cached) reusedTails++;
+          const cc = await window.api.concatParts([hookPath, tailPath], outPath);
+          if (!cc.ok) { failed = cc; return; }
+          written.push(outPath);
+          log('Delivered ' + name + ' - hook encoded, tail ' +
+            (tr.cached ? 'REUSED from the render cache' : 'encoded') + '.');
+        }
+      });
+    }
+  } catch (err) {
+    failed = { error: 'Delivery failed: ' + (err && err.message ? err.message : err) };
+  } finally {
+    // However it ended, the timeline comes back exactly as it was.
+    state.tracks = JSON.parse(snapshot);
+    h.active = wasActive;
+    state.selection.clear();
+    for (const p of tmp) window.api.removeFile(p);
+    rendering = false;
+    setDeliveryBusy(false);
+    renderAll();
+  }
+
+  if (failed) {
+    setStatus(failed.error || 'Delivery failed.', failed.cancelled ? '' : 'err');
+    log('Delivery failed: ' + String(failed.error).split('\n').slice(-3).join(' '));
+    return;
+  }
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  setStatus('Delivered ' + written.length + ' file(s) in ' + secs + 's' +
+    (reusedTails ? ' - ' + reusedTails + ' tail(s) reused from the cache' : '') + '.', 'ok');
+  log('Delivered: ' + written.join(', '));
+  refreshCacheInfo();
+  refreshCacheBands(true);
+  if (written.length) window.api.showItem(written[0]);
+}
+
+function setDeliveryBusy(busy) {
+  for (const id of ['#btnRender', '#btnRenderPreview', '#btnRenderFull']) $(id).disabled = busy;
+  $('#btnCancelRender').disabled = !busy;
+  const go = $('#btnDeliver');
+  if (go) go.disabled = busy;
+}
+
+// ----------------------------------------------------------------------- the panel
+
+function renderDeliveryPanel() {
+  updateDeliveryMeta();
+  const box = $('#delPanel');
+  if (!box || box.hidden) return;
+  const el = TextUI.el;
+  box.textContent = '';
+
+  // ---- formats
+  const fBox = el('div', 'afx-box');
+  fBox.appendChild(el('div', 'afx-head', 'Formats'));
+  fBox.appendChild(el('div', 'tc-hint',
+    'What ships. The project itself renders ' + state.out.w + 'x' + state.out.h +
+    '; the others are the same edit at another shape, each with its own framing.'));
+  for (const f of Delivery.FORMATS) {
+    const isMaster = f.id === masterFormatId();
+    const row = el('div', 'del-fmt' + (viewFormat === f.id ? ' viewing' : ''));
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = state.delivery.formats.includes(f.id);
+    cb.title = 'Include ' + f.label + ' in a delivery run';
+    cb.addEventListener('change', () => {
+      state.delivery.formats = cb.checked
+        ? state.delivery.formats.concat([f.id])
+        : state.delivery.formats.filter((x) => x !== f.id);
+      markDirty();
+      renderDeliveryPanel();
+    });
+    row.appendChild(cb);
+    row.appendChild(el('b', null, f.label));
+    row.appendChild(el('span', 'tc-meta', f.w + 'x' + f.h));
+    const look = el('button', 'mini');
+    look.textContent = viewFormat === f.id ? 'Stop' : isMaster ? 'Master' : 'View';
+    look.disabled = isMaster && !viewFormat;
+    look.title = isMaster
+      ? 'The project\'s own shape - the viewer shows it whenever nothing else is being viewed.'
+      : 'Show the viewer this shape. The Framing panel then edits this format\'s override.';
+    look.addEventListener('click', () => setViewFormat(viewFormat === f.id ? null : f.id));
+    row.appendChild(look);
+    fBox.appendChild(row);
+    fBox.appendChild(el('div', 'tc-hint del-note', f.note));
+  }
+  const safe = el('label', 'del-check');
+  const sc = el('input');
+  sc.type = 'checkbox';
+  sc.checked = !!state.delivery.safe;
+  sc.addEventListener('change', () => {
+    state.delivery.safe = sc.checked;
+    markDirty();
+    renderSafeOverlay();
+  });
+  safe.appendChild(sc);
+  safe.appendChild(el('span', null, 'Show the safe zone over the viewer'));
+  fBox.appendChild(safe);
+  box.appendChild(fBox);
+
+  // ---- the hook
+  const h = state.hooks;
+  const hBox = el('div', 'afx-box');
+  hBox.appendChild(el('div', 'afx-head', 'Hook variants'));
+  if (!h.enabled) {
+    hBox.appendChild(el('div', 'tc-hint',
+      'Hold two or three openings and export one file per variant. Everything after the ' +
+      'hook is shared, so the tail is encoded once however many variants ship.'));
+    const on = el('button', 'mini');
+    on.textContent = 'Use hook variants';
+    on.title = 'Take what is on the timeline now as the first variant';
+    on.addEventListener('click', enableHooks);
+    hBox.appendChild(on);
+  } else {
+    hBox.appendChild(TextUI.control({
+      path: 'len', label: 'Hook length', type: 'range',
+      min: 0.5, max: Math.max(2, Math.min(30, projectDuration() || 30)), step: 0.1,
+      unit: 's', digits: 1,
+    }, h, Delivery.HOOK_DEFAULTS, {
+      onEdit: () => pushUndo(),
+      // Rebuilt on RELEASE, never on change: `renderDeliveryPanel()` replaces this very
+      // slider, so rebuilding per frame would tear the drag out from under the pointer.
+      onEditEnd: () => renderDeliveryPanel(),
+      onChanged: () => { markDirty(); renderAll(); },
+    }));
+
+    for (let i = 0; i < h.variants.length; i++) {
+      const v = h.variants[i];
+      const row = el('div', 'del-var' + (i === h.active ? ' on' : ''));
+      const pick = el('button', 'mini');
+      pick.textContent = i === h.active ? '●' : '○';
+      pick.title = 'Put this variant on the timeline';
+      pick.addEventListener('click', () => activateVariant(i));
+      row.appendChild(pick);
+      const nm = el('input');
+      nm.type = 'text';
+      nm.value = v.name;
+      nm.title = 'The suffix this variant\'s file gets';
+      nm.addEventListener('keydown', (e) => e.stopPropagation());
+      nm.addEventListener('change', () => {
+        pushUndo();
+        v.name = nm.value.trim() || Delivery.variantName(i);
+        nm.value = v.name;
+        markDirty();
+      });
+      row.appendChild(nm);
+      const del = el('button', 'mini');
+      del.textContent = '×';
+      del.disabled = h.variants.length <= 1;
+      del.title = 'Delete this variant';
+      del.addEventListener('click', () => removeVariant(i));
+      row.appendChild(del);
+      hBox.appendChild(row);
+    }
+
+    const addRow = el('div', 'row btns');
+    const addCopy = el('button', 'mini');
+    addCopy.textContent = '+ Copy';
+    addCopy.disabled = h.variants.length >= Delivery.MAX_VARIANTS;
+    addCopy.title = 'A new variant, copied from this one';
+    addCopy.addEventListener('click', () => addVariant(false));
+    const addBlank = el('button', 'mini');
+    addBlank.textContent = '+ Empty';
+    addBlank.disabled = h.variants.length >= Delivery.MAX_VARIANTS;
+    addBlank.title = 'A new variant with an empty hook';
+    addBlank.addEventListener('click', () => addVariant(true));
+    const off = el('button', 'mini');
+    off.textContent = 'Stop using variants';
+    off.title = 'Keep what is on the timeline and forget the others';
+    off.addEventListener('click', () => {
+      pushUndo();
+      syncActiveVariant();
+      h.enabled = false;
+      h.variants = [];
+      h.active = 0;
+      markDirty();
+      renderDeliveryPanel();
+    });
+    addRow.appendChild(addCopy);
+    addRow.appendChild(addBlank);
+    addRow.appendChild(off);
+    hBox.appendChild(addRow);
+
+    const cross = Delivery.crossers(hookScene(), h.len);
+    if (cross.length) {
+      hBox.appendChild(el('div', 'del-warn',
+        cross.length + ' clip(s) cross the hook boundary (' +
+        cross.slice(0, 3).map((c) => c.name).join(', ') +
+        '), so the tail is not identical between variants and will be encoded once per ' +
+        'variant. Split them at ' + fmtTc(h.len) + ' to get the shared encode back.'));
+    }
+  }
+  box.appendChild(hBox);
+
+  // ---- the run, and the covers
+  const rBox = el('div', 'afx-box');
+  rBox.appendChild(el('div', 'afx-head', 'Deliver'));
+  const rRow = el('div', 'row btns');
+  const go = el('button', 'primary');
+  go.id = 'btnDeliver';
+  go.textContent = 'Deliver all';
+  go.title = 'Render every ticked format, and every hook variant inside it';
+  go.disabled = rendering;
+  go.addEventListener('click', doDeliver);
+  const cov = el('button', 'mini');
+  cov.textContent = 'Cover frames';
+  cov.title = 'Write the frame under the playhead as a PNG at each ticked format\'s size';
+  cov.addEventListener('click', exportCovers);
+  rRow.appendChild(go);
+  rRow.appendChild(cov);
+  rBox.appendChild(rRow);
+  box.appendChild(rBox);
+
+  // ---- the lint
+  const lBox = el('div', 'afx-box');
+  lBox.appendChild(el('div', 'afx-head', 'Retention'));
+  lBox.appendChild(el('div', 'tc-hint',
+    'Where nothing changes - no cut, zoom, graphic, caption or sound. That is the pattern ' +
+    'interrupt the whole format runs on, so a long flat stretch is the one edit note worth ' +
+    'having on screen.'));
+  const status = el('div', 'tc-hint');
+  const list = el('div', 'del-lint');
+  const paint = () => {
+    const flat = runLint();
+    status.textContent = Delivery.lintSummary(flat, projectDuration());
+    list.textContent = '';
+    for (const f of flat) {
+      const row = el('button', 'del-lint-row');
+      row.textContent = fmtTc(f.from) + '  →  ' + fmtTc(f.to) + '     ' +
+        f.gap.toFixed(1) + 's flat after ' + f.after;
+      row.title = 'Jump to ' + fmtTc(f.from);
+      row.addEventListener('click', () => { seek(f.from); });
+      list.appendChild(row);
+    }
+    updateDeliveryMeta();
+  };
+  lBox.appendChild(TextUI.control({
+    path: 'maxGap', label: 'Warn after', type: 'range',
+    min: 1, max: 10, step: 0.5, unit: 's', digits: 1,
+  }, state.delivery, { maxGap: Delivery.LINT_DEFAULTS.maxGap }, {
+    onEdit: () => {}, onEditEnd: () => {}, onChanged: () => { markDirty(); paint(); },
+  }));
+  lBox.appendChild(status);
+  lBox.appendChild(list);
+  deliveryLintPaint = paint;
+  paint();
+  box.appendChild(lBox);
+}
+
+/**
+ * The lint's list, repainted after an edit.
+ *
+ * Deliberately not a whole `renderDeliveryPanel()`: rebuilding the panel on every edit
+ * would throw away the variant name being typed into and the slider being dragged, and
+ * the only thing an edit can change here is which stretches are flat.
+ */
+let deliveryLintPaint = null;
+
+/** The one-line summary on the collapsed panel's head. */
+function updateDeliveryMeta() {
+  const m = $('#delMeta');
+  if (!m) return;
+  const n = state.delivery.formats.length;
+  const h = state.hooks;
+  const flat = runLint();
+  m.textContent = n + ' format' + (n === 1 ? '' : 's') +
+    (h.enabled && h.variants.length > 1 ? ' x ' + h.variants.length + ' hooks' : '') +
+    (flat.length ? ' · ' + flat.length + ' flat' : '');
+}
+
 // ============================ 10. wiring + shortcuts
 
 $('#btnImport').addEventListener('click', async () => importPaths(await window.api.pickMedia()));
@@ -8264,7 +9151,11 @@ function trkAnalysisSize(clip, res) {
 
 /** Frame fractions to SOURCE fractions - the inverse of the map a binding reads forwards. */
 function trkSourcePoint(clip, fx, fy) {
-  const crop = Tracker.frameMap(clip, state.out.w / state.out.h).crop;
+  // Mapped through the framing the picture is actually DRAWN with, which is the clip's
+  // own on the master format and its override on any other. A copy rather than the clip
+  // itself: `frameMap` reads pan/zoom off whatever it is handed, and nothing here is
+  // allowed to write a view mode's framing back onto the timeline.
+  const crop = Tracker.frameMap(framedCopy(clip), outSize().w / outSize().h).crop;
   return {
     x: clamp(crop.x + fx * crop.w, 0, 1),
     y: clamp(crop.y + fy * crop.h, 0, 1),
@@ -8412,7 +9303,7 @@ function trackMarkers() {
   for (const c of sel) {
     const tLocal = state.playhead - c.start;
     if (tLocal < -1e-6 || tLocal > clipLen(c) + 1e-6) continue;
-    const m = Tracker.frameMap(c, state.out.w / state.out.h);
+    const m = Tracker.frameMap(framedCopy(c), outSize().w / outSize().h);
     for (const tk of c.tracks) {
       const s = Tracker.sampleAt(tk, srcAt(c, tLocal));
       if (!s) continue;
@@ -10298,6 +11189,19 @@ $('#btnBinCollapse').addEventListener('click', () => toggleBin());
 $('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
 $('#btnSfxCollapse').addEventListener('click', () => toggleSfx());
 $('#btnMasterCollapse').addEventListener('click', () => toggleMaster());
+$('#btnDelCollapse').addEventListener('click', () => toggleDelivery());
+
+/** Show / hide the Delivery panel. Collapsed it builds no rows, like the three above it. */
+function toggleDelivery(show) {
+  const hide = show == null ? !$('#delPanel').hidden : !show;
+  $('#delPanel').hidden = hide;
+  $('#btnDelCollapse').textContent = hide ? '+' : '−';
+  renderDeliveryPanel();
+}
+
+// The guide is positioned onto the canvas's own laid-out box, so it has to be replaced
+// whenever that box moves - which a window resize and an inspector drag both do.
+window.addEventListener('resize', () => renderSafeOverlay());
 
 /** Show / hide the Captions panel. Collapsed it costs nothing: it builds no rows. */
 function toggleCaptions(show) {
@@ -10414,7 +11318,11 @@ refreshCacheInfo();
 $('#preset').addEventListener('change', (e) => {
   const parts = e.target.value.split('x').map(Number);
   state.out.w = parts[0]; state.out.h = parts[1];
-  resizeCanvas(); markDirty(); drawPreview();
+  // The master format moved. Anything being viewed that IS the new master is no longer
+  // an override to look at - it is simply what the project renders now.
+  if (viewFormat === masterFormatId()) viewFormat = null;
+  frameCacheValid = false;
+  resizeCanvas(); markDirty(); renderAll(); renderDeliveryPanel();
 });
 $('#quality').addEventListener('change', (e) => { state.out.quality = e.target.value; markDirty(); });
 // Loudness is one project-level target for the finished mix, not a per-clip effect: it

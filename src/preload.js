@@ -85,6 +85,15 @@ contextBridge.exposeInMainWorld('api', {
   onOpenOnLaunch: (cb) => ipcRenderer.on('project:openOnLaunch', (_e, p) => cb(p)),
 
   pickOutput: (name) => ipcRenderer.invoke('render:pickOutput', name),
+
+  // Delivery. A run writes several files at once - three formats times three hook
+  // variants is nine - so it asks for a FOLDER and names the files itself, rather than
+  // walking the user through nine save dialogs. `concatParts` joins a per-variant hook to
+  // the shared tail with a stream copy; `removeFile` clears the two scratch parts after.
+  pickDeliveryDir: () => ipcRenderer.invoke('deliver:pickDir'),
+  writeCover: (dir, name, dataUrl) => ipcRenderer.invoke('deliver:cover', { dir, name, dataUrl }),
+  concatParts: (parts, outPath) => ipcRenderer.invoke('deliver:concat', { parts, outPath }),
+  removeFile: (file) => ipcRenderer.invoke('deliver:remove', file),
   startRender: (job) => ipcRenderer.invoke('render:start', job),
   cancelRender: () => ipcRenderer.invoke('render:cancel'),
   onRenderProgress: (cb) => ipcRenderer.on('render:progress', (_e, d) => cb(d)),

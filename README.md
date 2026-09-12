@@ -422,7 +422,7 @@ Three columns, set by the `#app` grid in `styles.css`:
 | --- | --- |
 | `#left` — the left third | **The short itself and nothing else**: the preview canvas plus the transport strip. No settings panel may be added here; anything that would squeeze the viewer belongs in the inspector. |
 | `#right` — the middle | Toolbar, ruler, timeline tracks, and the render/log footer. Gives up width when the inspector is widened. |
-| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector (which grows the graphic editor and the effect stack as the selection calls for them), the Captions and Sound design panels (both collapsed by default, because each is a pass over the whole edit rather than a per-clip control), and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
+| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector (which grows the graphic editor and the effect stack as the selection calls for them), the Captions, Sound design, Master finish and Delivery panels (all four collapsed by default, because each is a pass over the whole edit rather than a per-clip control), and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
 
 The left column's width is `minmax(320px, 33.333%)` and never changes with panel state.
 
@@ -444,6 +444,9 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
          duck: {...}, triggers: {...} },
   master: [ FX, ... ],   // the project master finish - an effect stack over the whole
                          //   composite. Empty by default. See "The finishing pass"
+  delivery: { formats, safe, maxGap },       // delivery settings - see "Delivery"
+  hooks: { enabled, len, active,             // hook variants; `variants` holds REAL clips
+           variants: [{ id, name, tracks }] },//  lifted off the timeline. See "Delivery"
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
 }
 ```
@@ -488,6 +491,10 @@ Clip = {
   fit,                   // OPTIONAL - 'contain' draws the WHOLE picture inside the frame
                          //   and leaves the rest transparent; absent means the default,
                          //   which fills the frame and crops. See "Framing"
+  frames,                // OPTIONAL - per-format framing overrides, keyed by format id:
+                         //   { '1x1': { panX, panY, zoom, fit } }. Absent means "framed
+                         //   the same in every format", which is almost every clip.
+                         //   See "Delivery"
   screen,                // OPTIONAL - screen-recording telemetry, { events, displayW,
                          //   displayH, clicks }. Absent for anything not recorded here;
                          //   see "The screen recorder" for the degradation contract
@@ -526,8 +533,13 @@ Invariants worth preserving when you change things:
 
 ### Framing (16:9 → 9:16)
 
-The crop is defined by `panX`/`panY`/`zoom` and computed **twice**, in two languages that
-must stay in agreement:
+The crop is defined by `panX`/`panY`/`zoom` — or, when the viewer is showing another
+delivery format, by that format's override on the clip; `framingOf()` in `app.js` is the
+one function that decides which, and it answers "the clip's own" for every project that
+never opens the format picker. See "Delivery". Everything below is written in terms of
+`panX`/`panY`/`zoom` because that is what the answer *is* in the ordinary case.
+
+The crop is computed **twice**, in two languages that must stay in agreement:
 
 - Preview: `drawClip()` in `app.js`, which now **delegates to `drawClipTo()`** at preview
   size rather than keeping a second copy of the crop — takes the largest source rect
@@ -4215,6 +4227,169 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
   **capture-phase** listener in `app.js`, or it would stay up over an import the
   bubble-phase handler never sees.
 
+### Delivery: formats, hook variants, covers and the lint
+
+The last layer, and the one a client actually receives. Four things live in the
+**Delivery** panel in the inspector (collapsed by default, like Captions, Sound design and
+Master finish), and three of them are re-readings of work that already exists rather than
+new machinery.
+
+`src/delivery.js` is loaded twice — a plain `<script>` global `Delivery` in `index.html`
+and a CommonJS module elsewhere — exactly as `AudioFX`, `Captions` and `SFX` are. Every
+decision in it is a **pure function over plain data**: the formats and their safe zones,
+the framing-override rules, the hook boundary, and the lint. The half that needs a
+timeline, a canvas or a render lives in section 9b of `app.js`. That is the same split the
+captions and Sonify passes keep, and it is the reason the lint is testable with no
+fixture, no decode and no window.
+
+#### The three formats
+
+| id | label | size | safe zone (inset fractions) |
+| --- | --- | --- | --- |
+| `9x16` | Vertical | 1080 × 1920 | top .10, bottom .20, sides .06 |
+| `1x1` | Square | 1080 × 1080 | .06 all round |
+| `16x9` | Landscape | 1920 × 1080 | .05 all round |
+
+A project has **one master format** — whatever `state.out` says — and the other two are
+derived from it. `Delivery.formatOf(w, h)` matches on **aspect**, not on exact pixels, so
+a project rendering 720 × 1280 is still a 9:16 project and still gets the 9:16 safe zone.
+
+The 9:16 safe zone describes **platform furniture**, not a broadcast title-safe
+convention: the bottom fifth is the caption, handle, description and button rail, and the
+top tenth is the status bar and the follow button. Square and landscape carry the ordinary
+action-safe margin, because nothing is drawn over them.
+
+The guide is a **DOM overlay** (`#safeOverlay`), positioned onto the canvas's own
+laid-out box by `renderSafeOverlay()`. It is deliberately not drawn into the canvas: the
+viewer's canvas is the same surface the baker composites into, so a guide painted on it
+could one day reach a baked frame. Keeping it in the DOM makes that impossible by
+construction rather than by care.
+
+#### Per-format framing
+
+A 16:9 source framed for a 9:16 short is framed *wrongly* for a 1:1 one, and no arithmetic
+fixes that — it is a judgement about what matters in the picture. So a clip may carry
+`clip.frames[fmt]`, an override of `panX`/`panY`/`zoom`/`fit` for that format alone.
+
+**Absent means "framed the same everywhere"**, which is almost every clip in almost every
+project, and it is what keeps a project that never opens the format picker emitting
+byte-identical ffmpeg arguments and hashing to the render key it did before this existed.
+`Delivery.normalizeClip()` prunes an empty override away on load, the same rule
+`Speed.prune()` keeps and for the same reason.
+
+Press **View** next to a format and the viewer shows that shape. That is a *view mode*,
+not an edit: `viewFormat` is a module variable, never state, so switching to 1:1 to fix a
+crop and pressing Ctrl+S does not save a square project. Three small accessors carry it:
+
+- `outSize()` — the shape everything composites at. `previewSize()`, `drawClipTo()`,
+  `buildJob()` and the tracker's frame map all ask it.
+- `framingFormat()` — which override to read, `null` for the clip's own.
+- `framingOf(clip)` / `framedCopy(clip)` — the framing the picture is actually drawn with,
+  and a shallow copy of the clip wearing it. Anything mapping **source** coordinates into
+  the frame (`Tracker.frameMap()`, and so every bound effect) uses the copy, or a callout
+  bound to a button would sit next to it the moment the viewer switched format. A copy,
+  never the clip: a view mode must not write one value back onto the timeline.
+
+While a format is being viewed, the **Framing** panel writes that format's override
+instead of the clip — sliders, number boxes, the wheel, the L/C/R buttons, Reset, Apply to
+all, and a drag on the viewer, all through the one door `writeFraming()`. The panel head
+says which (`editing the 1:1 override`), because the sliders look identical either way and
+writing a square crop while believing you are fixing the master is the one mistake the
+feature makes possible. **Reset** on an override *drops* it rather than pinning it at
+centre: "no override" and "an override that happens to say 0.5" are different things, and
+only the first follows the master when the master is re-framed.
+
+A format's framing lands in the render key for free — it is the same three fields on the
+job entry, holding different numbers — and the job already carries `width`/`height`, so
+two formats never share a cached render.
+
+#### Hook variants
+
+Mark the first N seconds as the hook, hold two or three versions of it, and export one
+file per variant. Everything after the hook is shared.
+
+A variant is **ordinary clips** — the same objects, with the same shape, that were on the
+tracks a moment ago — lifted off the timeline and held in `state.hooks.variants[i].tracks`
+as `{ [trackId]: { clips, transitions } }`. Switching variant is a swap: `captureHook()`
+writes what is on the timeline back into the variant it came from, `stripHook()` takes the
+region off, `placeHook()` puts the other one on. Everything about those clips — undo,
+saving, media elements, effects, keys — works because **nothing about them is special**.
+The alternative, a parallel timeline model per variant, would have meant every feature in
+the app learning what a hook is.
+
+A clip belongs to the hook if it **starts** inside it. `syncActiveVariant()` runs before
+every save and every swap, because the timeline is the truth while a variant is live: the
+stored body is a snapshot from the moment it was last put away, and the author has been
+editing the real clips ever since.
+
+**Why the tail is cheap, and how that is checked.** The tail is the timeline range
+`[len, duration]`, and that range's job is *identical* under every variant — same clips,
+same framing, same effects, same everything — so `buildJob()` builds the same job,
+`jobCacheKey()` hashes the same string, and main hands back the file the first variant
+encoded. The second and third variants cost one short hook encode each plus a stream copy.
+That is a promise about the **cache**, not about the picture, so nothing on screen would
+ever show it being broken: `renderSpanTo()` reads `res.cached` back from main and the log
+says, per file, whether the tail was encoded or `REUSED from the render cache`.
+
+The join is `deliver:concat` in `main.js` — ffmpeg's concat demuxer with `-c copy`. Both
+parts came out of the same `buildArgs()` at the same size, fps and quality, so the streams
+are compatible and the join costs a file copy. Re-encoding here would give back everything
+the shared tail saved.
+
+A clip that **crosses** the boundary breaks the promise: it belongs to both halves, so the
+tail is no longer the same job under every variant. `Delivery.crossers()` finds them and
+the panel warns, naming them and offering the fix (split at the boundary). It is a warning
+rather than a refusal — the render is still correct, the tail job crops the clip at the
+boundary like any ranged render — only the saving is lost.
+
+#### The delivery run
+
+**Deliver all** asks for a folder once and names the files itself: three formats times
+three variants is nine files, and walking a save dialog nine times is not a workflow.
+Names come from `Delivery.outputName()` — `project_HookA_1080x1920.mp4`.
+
+A variant swap is a timeline edit, and a render is not allowed to be one. The whole run
+happens between a `JSON.stringify(state.tracks)` snapshot and its restore in a `finally` —
+the same trick `withFormat()` plays on the viewer, one level up. **No `pushUndo()`**,
+because when the run ends there is nothing to undo: the timeline is byte-identical to what
+it was when the button was pressed.
+
+#### Cover frames
+
+**Cover frames** writes the frame under the playhead as a PNG at each ticked format's
+size. Nothing new is drawn: `compositeLayers()` is the single draw path, so a cover is
+what the export shows at that timecode, cards and graphics included — a cover frame that
+does not match the video is a cover frame that lies about the video. It goes through
+`withFormat()`, so each PNG is a frame of *that format's* video rather than a rescale of
+another one's, and through the same `FX.preloadImages()`/`preloadLuts()` door the baker
+uses, because unlike a viewer frame this one is written to a file.
+
+#### The retention lint
+
+Walk the timeline and warn wherever nothing changes for more than ~3 seconds: no cut,
+transition, keyframe, graphic entry, caption or placed sound. That is the pattern-interrupt
+rule the whole format runs on, so making it visible is worth more than another effect — and
+it is the only check in the app that measures the **edit** rather than the picture.
+
+`lintEvents()` in `app.js` collects the moments (only it knows how a clip maps into
+timeline time); `Delivery.lint()` finds the holes between them. Every keyframe counts,
+which is how an auto-zoom registers without the lint knowing that auto-zoom exists — step
+9 writes ordinary `Anim` keys, and that is the payoff.
+
+Two details carry it:
+
+- **Both ends are sentinels.** A gap is measured between consecutive events, so a short
+  that opens with eight silent seconds before its first cut has no interval to measure
+  unless the range's start counts as an event, and one that ends flat has none unless its
+  end does. Both are the commonest real cases — the top of a short is where retention is
+  lost, and the tail is where an edit runs out of energy.
+- **Events at the same instant collapse.** A cut, a whoosh and a caption on one timecode
+  is one thing happening, not three.
+
+Each row is a button: it says the timecodes and what the last thing to happen was, and
+clicking it seeks there. The panel head carries the count, so a collapsed panel still says
+`2 formats · 3 flat`.
+
 ### Adding a feature — the usual places
 
 | Want to add | Touch |
@@ -4247,6 +4422,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | Anything that blurs by sampling across time | `Anim.temporalAverage()` — never a hand-rolled `lighter` at `1/samples` accumulator, see "The shutter" |
 | An effect that should offer motion blur | nothing — every effect does. Flag the type `timeVarying: true` only if its `draw()` reads the clock without needing keyframes |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
+| A **delivery format** | one entry in `Delivery.FORMATS` (`src/delivery.js`) — its id, size and safe zone. The format list, the safe guide, the per-format framing overrides, the file names and the delivery run all build themselves from it. Ids are stable strings, never indices: reordering the table must not re-point every override in every saved project |
+| Something the **retention lint** should count as a change | one `put(t, 'kind')` in `lintEvents()` (`app.js` §9b) + a label in `Delivery.EVENT_KINDS` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
 
 Anything that mutates the timeline should call `pushUndo()` **before** mutating and
@@ -4335,6 +4512,28 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
   change onto the rest — see "Editing several cards at once".
 - Audio clips draw a waveform; video clips have no thumbnails.
 - Preview is nearest-frame accurate, not frame-exact; the render is the source of truth.
+- Delivery ships **three** formats — 9:16, 1:1 and 16:9 — and a project has one master
+  format with the others derived from it. A format is a shape, not a re-edit: nothing
+  re-times, re-lays-out or re-crops itself per format except what a `clip.frames` override
+  says. Text cards, captions and graphics are positioned as fractions of the frame, so
+  they move with the shape but do not re-flow for it; a caption sitting in the 9:16 safe
+  zone is not automatically in the 1:1 one, which is what the safe guide is for.
+- A per-format framing override covers `panX`/`panY`/`zoom`/`fit` and nothing else. There
+  is no per-format effect stack, no per-format keyframe and no per-format cut.
+- Hook variants are capped at **three**, and a variant owns the clips that **start**
+  inside the hook. A clip crossing the boundary still renders correctly but costs the
+  shared tail encode; the panel warns and names it — see "Delivery".
+- The shared-tail saving is a render-cache hit, so clearing the cache between variants
+  loses it, and it needs the two halves to be encoded at the same size, fps and quality
+  — which they are, because they come from the same job builder.
+- Cover frames are written at the playhead, one PNG per ticked format. There is no
+  separate cover composition: what is on the timeline at that timecode is the cover, so a
+  cover-only title card is an ordinary text card the author puts there.
+- The retention lint counts cuts, transitions, keyframes, graphic and caption entries and
+  placed sounds. It does not watch the **pixels**: a long static hold inside one clip with
+  no keys on it reads as flat (which is usually right), and a busy piece of footage with
+  no edits on it reads as flat too (which is sometimes wrong). It is an edit note, not a
+  measurement of motion.
 - Video-track compositing is bottom-up alpha blending, in the preview and in the render
   alike — and since step 6 it is blended **once**, in the renderer, and handed to ffmpeg
   as finished pixels. The two now agree to within a couple of 8-bit levels rather than the
