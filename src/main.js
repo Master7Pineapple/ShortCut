@@ -857,23 +857,18 @@ ipcMain.handle('bin:listDir', (_e, dir) => {
 // ------------------------------------------------------------- the SFX library
 
 /**
- * The sound library: the bundled sounds, plus whatever the user imported.
+ * The sound library: whatever the user imported, and nothing else.
  *
- * The bundled ones are SYNTHESISED by src/sfx.js and written into `userData/sfx` the
- * first time anything asks for them - a few hundred lines of arithmetic in the repo
- * instead of a few megabytes of audio, royalty-free because nobody else wrote them, and
- * byte-identical on every run because every generator is seeded. A file is rewritten
- * only when it is missing or the wrong size, so the second launch costs a `statSync`.
+ * It ships EMPTY. Nothing is bundled, so there is no download, no first-run write and no
+ * "app sounds" to grow out of - the sounds a channel uses are its own. They arrive one
+ * file at a time, a folder at a time, or straight out of the QuickBin, and all three
+ * doors lead to `addSfx()`.
  *
- * The user's own sounds are NOT copied - an entry in `sfx.json` is a path and a name,
- * exactly as a QuickBin item is, and a file that has moved comes back `missing` so the
- * row can be greyed out instead of failing when somebody sonifies with it.
+ * Nothing is copied: an entry in `sfx.json` is a path, a name and a duration, exactly as
+ * a QuickBin item is. That keeps the library tiny and leaves the files where the user put
+ * them, at the cost of an entry going stale if one moves - which is reported as `missing`
+ * so the row can be greyed out instead of failing when somebody sonifies with it.
  */
-const sfxDir = () => {
-  const dir = path.join(app.getPath('userData'), 'sfx');
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-};
 const sfxListFile = () => path.join(app.getPath('userData'), 'sfx.json');
 
 function readSfxList() {
@@ -888,61 +883,63 @@ function writeSfxList(items) {
   fs.writeFileSync(f, JSON.stringify({ version: 1, items }, null, 2), 'utf8');
 }
 
-/** Write any bundled sound that is not already on disk. Returns the catalogue. */
-function materialiseSfx() {
-  const dir = sfxDir();
-  const out = [];
-  for (const entry of SFX.catalogue()) {
-    const file = path.join(dir, entry.id + '.wav');
-    const bytes = SFX.wavFor(entry.id);
-    const want = bytes ? bytes.length : 0;
-    let have = -1;
-    try { have = fs.statSync(file).size; } catch (e) { /* not written yet */ }
-    if (have !== want && bytes) {
-      try { fs.writeFileSync(file, Buffer.from(bytes)); } catch (e) { continue; }
-    }
-    out.push(Object.assign({}, entry, { path: file }));
+/**
+ * Add paths to the library. Folders are walked, non-audio is ignored, duplicates are
+ * skipped. The path IS the id: a sound is named by a trigger and by every clip placed
+ * from it, and a path is the one name that means the same thing in both.
+ */
+async function addSfx(paths) {
+  const files = expandPaths(paths || [], false).filter(
+    (f) => AUDIO_EXT.has(path.extname(f).toLowerCase()));
+  const items = readSfxList();
+  let added = 0;
+  for (const f of files) {
+    if (items.some((it) => it.path === f)) continue;
+    const m = await probe(f);
+    if (!m || !(m.duration > 0)) continue;
+    items.push({
+      id: f, path: f, name: path.basename(f),
+      cat: path.basename(path.dirname(f)) || 'Imported',
+      duration: m.duration,
+    });
+    added++;
   }
-  return out;
+  if (added) writeSfxList(items);
+  return { added, seen: files.length };
 }
 
-ipcMain.handle('sfx:library', async () => {
-  let builtin = [];
-  try { builtin = materialiseSfx(); } catch (e) { builtin = []; }
-  const mine = readSfxList().map((it) => Object.assign({}, it, {
-    builtin: false,
+ipcMain.handle('sfx:library', () => ({
+  items: readSfxList().map((it) => Object.assign({}, it, {
+    // `missing` is a live check, not state - never persisted, the same rule bin:read keeps.
     missing: !(it.path && fs.existsSync(it.path)),
-  }));
-  return { items: builtin.concat(mine), dir: sfxDir() };
-});
+  })),
+}));
 
-ipcMain.handle('sfx:import', async () => {
+ipcMain.handle('sfx:pick', async () => {
   const r = await dialog.showOpenDialog(win, {
     title: 'Import sound effects',
     properties: ['openFile', 'multiSelections'],
     filters: [{ name: 'Audio', extensions: [...AUDIO_EXT].map((e) => e.slice(1)) }],
   });
-  if (r.canceled || !r.filePaths.length) return { added: 0 };
-  const items = readSfxList();
-  let added = 0;
-  for (const f of r.filePaths) {
-    if (items.some((it) => it.path === f)) continue;
-    const m = await probe(f);
-    if (!m || !(m.duration > 0)) continue;
-    // The path is the id. An imported sound is referenced by a trigger and by a placed
-    // clip, and a path is the one name for it that means the same thing in both.
-    items.push({ id: f, path: f, name: path.basename(f), cat: 'Imported', duration: m.duration });
-    added++;
-  }
-  if (added) writeSfxList(items);
-  return { added };
+  return r.canceled ? [] : r.filePaths;
 });
 
-ipcMain.handle('sfx:remove', (_e, id) => {
+ipcMain.handle('sfx:pickFolder', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import a folder of sound effects',
+    properties: ['openDirectory', 'multiSelections'],
+  });
+  return r.canceled ? [] : r.filePaths;
+});
+
+ipcMain.handle('sfx:add', async (_e, paths) => addSfx(paths));
+
+ipcMain.handle('sfx:remove', (_e, ids) => {
+  const want = new Set(Array.isArray(ids) ? ids : [ids]);
   const items = readSfxList();
-  const keep = items.filter((it) => it.id !== id);
-  // Only the user's own entries are removable, and removing one deletes nothing from
-  // disk - the QuickBin's contract, for the same reason.
+  const keep = items.filter((it) => !want.has(it.id));
+  // Removing an entry deletes nothing from disk - the QuickBin's contract, for the same
+  // reason: the app never owned the file.
   if (keep.length !== items.length) writeSfxList(keep);
   return items.length - keep.length;
 });

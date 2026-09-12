@@ -380,7 +380,7 @@ src/recorder-preload.js   contextBridge for the recorder window - video bytes an
 src/renderer/recorder.html + recorder.js   the hidden capture window (MediaRecorder)
 src/captions.js           transcripts and captions: parsing, phrasing, placement, fillers
                           (loaded twice, like audiofx.js - see "Transcription and captions")
-src/sfx.js                sound design: the synthesised SFX library and the Sonify planner
+src/sfx.js                sound design: the triggers and the Sonify planner
                           (loaded twice, like audiofx.js - see "Sound design")
 ```
 
@@ -1191,33 +1191,34 @@ drift — a placed sound is mixed by `syncMedia()` in the viewer and by `buildAr
 ffmpeg, the same way a music bed is.
 
 `src/sfx.js` is loaded **twice**, like `audiofx.js` and `screen.js`: as a `<script>`
-global `SFX` in `index.html`, and as a CommonJS module by `main.js`. Main needs the
-synthesiser; the renderer needs the planner.
+global `SFX` in `index.html`, and as a CommonJS module by `main.js`, so the triggers and
+the planner have exactly one definition.
 
-#### The bundled sounds are synthesised, not shipped
+#### The library ships empty
 
-There are eight of them — `pop`, `click`, `tick`, `whoosh`, `swipe`, `riser`, `impact`,
-`sub` — and none of them is a file in this repository. Each is a few lines of arithmetic
-in `SOUNDS` (a chirp with an exponential decay; noise through a one-pole band whose
-centre sweeps; a sine sliding down into a floor), rendered by `samplesFor()` and wrapped
-as a 16-bit mono WAV by `wavFor()`. `materialiseSfx()` in main writes them into
-`userData/sfx` the first time anything asks, and rewrites one only when it is missing or
-the wrong size — so the second launch costs a `statSync` each.
+Nothing is bundled and nothing is synthesised. The sounds a channel uses are its own, so
+there is no download, no first-run write, and no house set to grow out of — which also
+means a fresh project is **silent until sounds are imported and each trigger is pointed
+at one**, and every part of the feature has to read well in that state rather than look
+broken. A trigger with no sound plans nothing; the panel says which triggers are still
+unset, and `SFX.armed()` is the one answer to "would this place anything".
 
-Three things fall out of that, and all three are the point:
+Sounds arrive through three doors, all of which land in `addSfx()` in main:
 
-- They are royalty-free because nobody else wrote them.
-- They work with no network and no download UI.
-- **Every generator is seeded** (`noise(seedOf(id))` — never `Math.random()`), so the
-  bytes are identical on every run and in every process. This is the same rule the film
-  burn's streaks and step 16's grain live by, and here it protects the render cache: a
-  sound file that changed between launches would silently invalidate every cached render
-  that used it.
+| Door | What it takes |
+| --- | --- |
+| **+ Files** | One or more audio files |
+| **+ Folder** | A folder, walked recursively; non-audio is ignored |
+| **From bin** | Whatever audio the QuickBin has selected — a selected bin folder means everything in it |
 
-The user's own sounds are **not copied**. `sfx.json` in userData holds a path and a name
-per import, exactly as the QuickBin does, and a file that has moved comes back `missing`
-so the row greys out instead of failing when somebody sonifies with it. "Forget imports"
-removes entries from that list and deletes nothing from disk.
+Nothing is copied. `sfx.json` in userData holds a path, a name, a duration and a category
+(the containing folder's name) per entry, exactly as a QuickBin item does. **The path is
+the id**: a sound is named by a trigger and by every clip placed from it, and a path is
+the one name that means the same thing in both. A file that has moved comes back
+`missing`, so the row greys out and the trigger still shows what it was pointed at —
+fixable, rather than silently swapped for something else. Removing an entry removes it
+from that list and **deletes nothing from disk**, which is the QuickBin's contract for the
+same reason: the app never owned the file.
 
 #### The five triggers
 
@@ -1225,13 +1226,13 @@ One entry each in `SFX.TRIGGERS`, and the panel and the planner both build thems
 from that table — adding a sixth is an entry there plus the few lines in `sonifyScene()`
 that find its moments.
 
-| Trigger | Moment | Default |
+| Trigger | Moment | Defaults (the sound is always yours to pick) |
 | --- | --- | --- |
-| `graphic` | A graphic clip's **entry** | `pop`, -2 dB |
-| `transition` | The start of a transition's window | `whoosh`, -3 dB, offset -0.06 s |
-| `click` | Each mouse-down in a recording's telemetry | `click`, -6 dB |
-| `counter` | Each step of a counting number, capped | `tick`, -12 dB |
-| `cut` | A **hard** cut into a data graphic | `impact`, -4 dB |
+| `graphic` | A graphic clip's **entry** | -2 dB — a short pop suits it |
+| `transition` | The start of a transition's window | -3 dB, offset **-0.06 s** so it leads the picture |
+| `click` | Each mouse-down in a recording's telemetry | -6 dB |
+| `counter` | Each step of a counting number, capped | -12 dB |
+| `cut` | A **hard** cut into a data graphic | -4 dB |
 
 Four details that are decisions rather than accidents:
 
@@ -1247,6 +1248,10 @@ Four details that are decisions rather than accidents:
   is actually moving in.
 - **An impact goes on a hard cut only.** A cut with a transition on it already has a
   whoosh, and stacking the two reads as a mistake rather than as emphasis.
+
+Every trigger's default `sound` is the empty string, and that is deliberate: with an
+empty library there is nothing honest to point at, and inventing a placement with no file
+behind it would fail at the moment of rendering rather than at the moment of asking.
 
 `SFX.plan(scene, opts)` is a **pure function** from a scene — five arrays of moments in
 timeline seconds — to a list of placements. It touches no clip and no DOM, which is what
@@ -3868,7 +3873,7 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A **generator** that writes keyframes | a pure function returning tracks of `{t, v, ease, gen:'<name>'}` + `Cursor.applyGenerated()` to merge them + one panel with its own Generate/Clear. Never an opaque effect — see "Screen-recording treatment" |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
 | A **sonify trigger** | one entry in `SFX.TRIGGERS` (`src/sfx.js`) - its default sound, offset and gain, and the panel block and the planner both build themselves from it - plus the few lines in `sonifyScene()` (`app.js` §7c) that find its moments |
-| A bundled sound effect | one entry in `SFX.SOUNDS` (`src/sfx.js`): a length and a generator. It must be SEEDED - `noise(seedOf(id))`, never `Math.random()` - or the file rewritten on the next launch would invalidate every cached render that used it |
+| A way to get sounds into the library | a picker in `main.js` that answers with paths, then `sfxAdd` - `addSfx()` already walks folders, filters to audio, skips duplicates and probes durations |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
 | A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
 | A transcript format | a parser in `src/captions.js` and a branch in `parseTranscript()` — everything downstream takes `[{w, start, end, conf}]` |
@@ -3926,8 +3931,8 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   variation - the same trigger uses the same file at the same gain every time, and the
   answer to "these all sound identical" is to move or swap the clips it placed, which is
   exactly what they are for.
-- The bundled sounds are synthesised, which makes them free, offline and reproducible, and
-  also makes them plain. A real library imports over them - see "Sound design".
+- The SFX library ships **empty** and nothing is bundled, so Sonify does nothing until
+  sounds are imported and each trigger is pointed at one - see "Sound design".
 - The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
   ducking, loudness) is applied on render. This is the one deliberate preview/render
   disagreement in the app, and the inspector says so on screen.

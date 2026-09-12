@@ -5474,7 +5474,7 @@ function newProject() {
 
 const SFX_DEFAULTS = SFX.defaultOpts();
 
-/** The library, fetched once: the bundled sounds plus the user's imports. */
+/** The library: the user's imported sounds. It ships empty - nothing is bundled. */
 let sfxLib = { items: [], dir: '' };
 let sfxPanelPaint = null;
 let sfxStatusMsg = '';
@@ -5490,7 +5490,7 @@ async function refreshSfxLibrary() {
   return sfxLib;
 }
 
-/** A sound by id - a bundled id, or the path of an imported file. */
+/** A sound by id - which is the path of the imported file. */
 function sfxSound(id) {
   return sfxLib.items.find((i) => i.id === id) || null;
 }
@@ -5648,7 +5648,9 @@ function sonify() {
   const placements = SFX.plan(sonifyScene(), o);
   const old = generatedSfxClips();
   if (!placements.length && !old.length) {
-    log('Sonify: nothing on the timeline to sound - add a graphic, a transition, or a recording with clicks.');
+    log(!SFX.armed(o).length
+      ? 'Sonify: no trigger has a sound yet - import sounds and pick one per trigger.'
+      : 'Sonify: nothing on the timeline to sound - add a graphic, a transition, or a recording with clicks.');
     return null;
   }
   const duck = SFX.duckFor(o);
@@ -5712,6 +5714,49 @@ function clearSonify() {
   return doomed.length;
 }
 
+/** Add paths (files or folders) to the library, then repaint. */
+async function addSfxPaths(paths) {
+  let r = null;
+  try { r = await window.api.sfxAdd(paths); } catch (e) { r = null; }
+  await refreshSfxLibrary();
+  renderSfxPanel();
+  const n = (r && r.added) || 0;
+  log('SFX library: added ' + n + ' sound(s)' +
+      (r && r.seen > n ? ' (' + (r.seen - n) + ' already there)' : '') + '.');
+  return n;
+}
+
+/** Forget library entries. Nothing is deleted from disk - the QuickBin's contract. */
+async function forgetSfx(ids) {
+  let n = 0;
+  try { n = await window.api.sfxRemove(ids); } catch (e) { n = 0; }
+  await refreshSfxLibrary();
+  renderSfxPanel();
+  log('SFX library: removed ' + n + ' entry(ies). Nothing was deleted from disk.');
+  return n;
+}
+
+/**
+ * The audio the QuickBin has selected, as paths - the bin's third door into the library.
+ *
+ * A selected folder means everything in it, which is what `itemsIn()` already answers for
+ * the bin's own "use the selection" button; only audio comes through, because a video's
+ * sound is not a sound effect.
+ */
+function quickBinAudioPaths() {
+  if (typeof QuickBin === 'undefined' || !QuickBin.ready) return [];
+  const items = [];
+  const byId = new Map(QuickBin.data.items.map((i) => [i.id, i]));
+  for (const id of QuickBin.selection) {
+    const it = byId.get(id);
+    if (it) { items.push(it); continue; }
+    for (const sub of QuickBin.itemsIn(id)) items.push(sub);
+  }
+  const paths = items.filter((i) => i.kind === 'audio' && !i.missing).map((i) => i.path);
+  if (!paths.length) log('Select some audio in the QuickBin first - only audio becomes a sound effect.');
+  return [...new Set(paths)];
+}
+
 /**
  * The Sound design panel.
  *
@@ -5746,11 +5791,16 @@ function sfxPanelBody() {
     const plan = sonifyPlan();
     count.textContent = plan.length ? plan.length + ' sound' + (plan.length === 1 ? '' : 's') : 'nothing to sound';
     const here = generatedSfxClips().length;
+    const ready = SFX.armed(state.sfx);
     status.textContent = sfxStatusMsg || (
       plan.length
         ? 'Would place ' + plan.length + ' sound(s)' + (here ? ', replacing the ' + here + ' already there' : '') + '.'
         : here ? here + ' generated sound(s) on the timeline; nothing new to place.'
-          : 'Nothing to sound yet.');
+          : !sfxLib.items.length
+            ? 'The library is empty - import some sounds below first.'
+            : !ready.length
+              ? 'No trigger has a sound yet - pick one for each trigger you want.'
+              : 'Nothing on the timeline for these triggers to sound.');
   };
   sfxPanelPaint = paint;
 
@@ -5791,6 +5841,12 @@ function sfxPanelBody() {
     const tbody = el('div', 'sfx-trig-body');
     tbody.appendChild(el('div', 'tc-hint', def.hint));
     const sel = el('select');
+    // The library ships empty, so "no sound" is a real and common state rather than an
+    // error - a trigger with nothing chosen simply places nothing.
+    const none = el('option');
+    none.value = '';
+    none.textContent = options.length ? 'No sound' : 'No sounds imported yet';
+    sel.appendChild(none);
     for (const opt of options) {
       const oEl = el('option');
       oEl.value = opt.value;
@@ -5799,10 +5855,10 @@ function sfxPanelBody() {
     }
     // A sound the library cannot find is shown as missing rather than silently swapped:
     // the trigger still says what it was pointed at, which is what makes it fixable.
-    if (!options.some((x) => x.value === t.sound)) {
+    if (t.sound && !options.some((x) => x.value === t.sound)) {
       const oEl = el('option');
       oEl.value = t.sound;
-      oEl.textContent = t.sound + ' (missing)';
+      oEl.textContent = String(t.sound).split(/[\/]/).pop() + ' (missing)';
       sel.appendChild(oEl);
     }
     sel.value = t.sound;
@@ -5878,9 +5934,9 @@ function sfxPanelBody() {
   lHead.appendChild(el('span', 'tc-hint', sfxLib.items.length + ' sound(s)'));
   lib.appendChild(lHead);
   lib.appendChild(el('div', 'tc-hint afx-note',
-    'The bundled sounds are synthesised into the app\'s own folder on first use, so they ' +
-    'work offline and never change. Imported ones are referenced where they are, like ' +
-    'the QuickBin - nothing is copied, and nothing is deleted from disk.'));
+    'Your own sounds: by file, by folder, or straight from the QuickBin. Nothing is ' +
+    'copied - an entry is a path, like a bin item - so removing one deletes nothing ' +
+    'from disk, and a file that has moved is shown as missing rather than failing later.'));
   const list = el('div', 'sfx-lib');
   let cat = null;
   for (const it of sfxLib.items) {
@@ -5888,7 +5944,7 @@ function sfxPanelBody() {
     const row = el('div', 'sfx-row' + (it.missing ? ' missing' : ''));
     row.dataset.id = it.id;
     const name = el('span', 'sfx-name', it.name);
-    name.title = (it.missing ? 'MISSING - ' : '') + (it.hint || it.path);
+    name.title = (it.missing ? 'MISSING - ' : '') + it.path;
     row.appendChild(name);
     row.appendChild(el('span', 'sfx-dur', (Number(it.duration) || 0).toFixed(2) + 's'));
     const playBtn = el('button', 'mini', '▶');
@@ -5899,35 +5955,36 @@ function sfxPanelBody() {
     placeBtn.title = 'Place it on the SFX track at the playhead';
     placeBtn.addEventListener('click', () => { insertSfx(it.id); renderSfxPanel(); });
     row.appendChild(placeBtn);
+    const dropBtn = el('button', 'mini', '✕');
+    dropBtn.title = 'Remove from the library. Nothing is deleted from disk.';
+    dropBtn.addEventListener('click', async () => { await forgetSfx([it.id]); });
+    row.appendChild(dropBtn);
     row.addEventListener('dblclick', () => auditionSfx(it));
     list.appendChild(row);
   }
-  if (!sfxLib.items.length) list.appendChild(el('div', 'tc-hint', 'The library is empty.'));
+  if (!sfxLib.items.length) {
+    list.appendChild(el('div', 'tc-hint',
+      'Empty. Import a file or a folder of sounds, or select audio in the QuickBin and ' +
+      'press "From bin" - then point each trigger above at one.'));
+  }
   lib.appendChild(list);
   const lBar = el('div', 'tc-btns');
-  const imp = el('button', 'mini', 'Import...');
-  imp.title = 'Add your own sound files to the library';
-  imp.addEventListener('click', async () => {
-    let r = null;
-    try { r = await window.api.sfxImport(); } catch (e) { r = null; }
-    await refreshSfxLibrary();
-    renderSfxPanel();
-    log('SFX library: added ' + ((r && r.added) || 0) + ' sound(s).');
-  });
-  lBar.appendChild(imp);
-  const rm = el('button', 'mini', 'Forget imports');
-  rm.title = 'Stop listing the sounds you imported. Nothing is deleted from disk.';
-  rm.addEventListener('click', async () => {
-    const mine = sfxLib.items.filter((i) => !i.builtin);
-    if (!mine.length) { log('Nothing imported to forget - the bundled sounds stay.'); return; }
-    for (const it of mine) { try { await window.api.sfxRemove(it.id); } catch (e) { /* ignore */ } }
-    await refreshSfxLibrary();
-    renderSfxPanel();
-    log('SFX library: forgot ' + mine.length + ' imported entry(ies). Nothing was deleted from disk.');
-  });
-  lBar.appendChild(rm);
-  box.appendChild(lib);
+  const mkImport = (label, title, get) => {
+    const b = el('button', 'mini', label);
+    b.title = title;
+    b.addEventListener('click', async () => {
+      let paths = [];
+      try { paths = (await get()) || []; } catch (e) { paths = []; }
+      if (!paths.length) return;
+      await addSfxPaths(paths);
+    });
+    lBar.appendChild(b);
+  };
+  mkImport('+ Files', 'Add sound files to the library', () => window.api.sfxPick());
+  mkImport('+ Folder', 'Add a folder of sounds - subfolders included', () => window.api.sfxPickFolder());
+  mkImport('From bin', 'Add the audio selected in the QuickBin', async () => quickBinAudioPaths());
   lib.appendChild(lBar);
+  box.appendChild(lib);
 
   paint();
   return box;

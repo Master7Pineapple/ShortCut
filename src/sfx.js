@@ -4,24 +4,25 @@
  *
  * Loaded twice, exactly as `AudioFX` and `Captions` are: as a plain <script> global
  * `SFX` in index.html, and as a CommonJS module by main.js. The tail of the file does
- * both. Main needs the synthesiser (it writes the library to disk); the renderer needs
- * the planner (it turns a timeline into placements).
+ * both.
  *
- * Three things live here:
+ * THE LIBRARY SHIPS EMPTY. Nothing is bundled and nothing is synthesised: the sounds are
+ * the user's own, brought in one file at a time, a folder at a time, or straight out of
+ * the QuickBin. An entry is a path and a name - nothing is copied, exactly as the
+ * QuickBin does it, so a file that has moved comes back `missing` and the row greys out
+ * instead of failing when somebody sonifies with it.
  *
- *   1. THE LIBRARY. The bundled sounds are SYNTHESISED, not shipped as files - a few
- *      hundred lines of arithmetic instead of a few megabytes of audio in git, and
- *      royalty-free because nobody else wrote them. `wavFor(id)` returns the bytes of a
- *      16-bit mono WAV; main.js materialises them into `userData/sfx` on first use.
- *      Every generator is SEEDED (see `noise()`), for the same reason the film burn's
- *      streaks are: two runs must produce the same file, or the render cache would see a
- *      new sound every launch.
+ * That is also why every trigger's default sound is EMPTY. A trigger with no sound
+ * chosen plans nothing at all - the panel says so, rather than the planner inventing a
+ * placement with no file behind it.
  *
- *   2. THE TRIGGERS. What sonifying looks for, and what each finds plays. One entry per
- *      trigger type, with a default sound, an offset and a gain - and a schema, so the
- *      panel builds itself out of `TextUI.control` like every other panel in the app.
+ * Two things live here:
  *
- *   3. THE PLANNER. `plan(scene, opts)` is a pure function from a description of the
+ *   1. THE TRIGGERS. What sonifying looks for, and what each finds plays. One entry per
+ *      trigger type, with an offset, a gain and a schema, so the panel builds itself out
+ *      of `TextUI.control` like every other panel in the app.
+ *
+ *   2. THE PLANNER. `plan(scene, opts)` is a pure function from a description of the
  *      timeline to a list of placements. It touches no clip and no DOM, which is what
  *      makes trigger timing testable without a fixture - the renderer's job is only to
  *      build the scene and to turn each placement into a real audio clip.
@@ -32,223 +33,8 @@
  * is a hidden effect.
  */
 (function () {
-  const SR = 48000;
   const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, Number(v) || 0));
   const r3 = (x) => Math.round((Number(x) || 0) * 1000) / 1000;
-
-  // ------------------------------------------------------------------ the synthesiser
-
-  /**
-   * A seeded noise source. `Math.random()` is banned here for the same reason it is
-   * banned in the film burn: the bytes must be identical on every run, or the file
-   * written into `userData/sfx` on Tuesday would not be the file the render cache was
-   * built against on Monday.
-   */
-  function noise(seed) {
-    let s = (seed >>> 0) || 1;
-    return () => {
-      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
-      return s / 2147483648 - 1;
-    };
-  }
-
-  /** A one-pole low-pass, as a closure over its own state. `f` is 0..1. */
-  function lp() {
-    let y = 0;
-    return (x, f) => { y += clamp(f, 0.0005, 1) * (x - y); return y; };
-  }
-  /** A one-pole high-pass built out of the same filter. */
-  function hp() {
-    const low = lp();
-    return (x, f) => x - low(x, f);
-  }
-
-  const exp = (x, k) => Math.exp(-k * x);
-  /** A raised-cosine bell over 0..1 - what a whoosh's amplitude does. */
-  const bell = (u) => 0.5 - 0.5 * Math.cos(2 * Math.PI * clamp(u, 0, 1));
-  /** A short attack and a long decay, both in seconds, normalised to peak 1. */
-  function ad(t, dur, attack, k) {
-    const a = attack > 0 ? Math.min(1, t / attack) : 1;
-    return a * exp(Math.max(0, t - attack), k);
-  }
-
-  /**
-   * Every bundled sound: a name, a category, a length and a generator.
-   *
-   * A generator fills `buf` at `SR` and may use `rnd` (seeded) and any number of
-   * filters. Peak normalisation happens afterwards, in `samplesFor()`, so a generator
-   * only has to get the shape right.
-   */
-  const SOUNDS = {
-    pop: {
-      name: 'Pop', cat: 'Pops', dur: 0.16,
-      hint: 'A soft blip. The default for something appearing on screen.',
-      make(buf, rnd) {
-        let ph = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const t = i / SR;
-          const f = 880 * exp(t, 14) + 220;          // a downward chirp
-          ph += 2 * Math.PI * f / SR;
-          buf[i] = Math.sin(ph) * ad(t, 0.16, 0.004, 34) +
-                   rnd() * 0.12 * ad(t, 0.16, 0.001, 220);
-        }
-      },
-    },
-    click: {
-      name: 'Click', cat: 'Clicks', dur: 0.06,
-      hint: 'A mouse click. Short enough that one per click never muddies the mix.',
-      make(buf, rnd) {
-        const high = hp();
-        let ph = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const t = i / SR;
-          ph += 2 * Math.PI * 2400 / SR;
-          const n = high(rnd(), 0.55);
-          buf[i] = (n * 0.8 + Math.sin(ph) * 0.35) * ad(t, 0.06, 0.0008, 150);
-        }
-      },
-    },
-    tick: {
-      name: 'Tick', cat: 'Clicks', dur: 0.035,
-      hint: 'A tiny mechanical tick, for a counting number stepping up.',
-      make(buf, rnd) {
-        const high = hp();
-        for (let i = 0; i < buf.length; i++) {
-          const t = i / SR;
-          buf[i] = high(rnd(), 0.75) * ad(t, 0.035, 0.0004, 320);
-        }
-      },
-    },
-    whoosh: {
-      name: 'Whoosh', cat: 'Whooshes', dur: 0.5,
-      hint: 'Filtered noise sweeping up and away. The default for a transition.',
-      make(buf, rnd) {
-        const low = lp(), high = hp();
-        for (let i = 0; i < buf.length; i++) {
-          const u = i / buf.length;
-          // The sweep is what makes it read as movement: the band climbs through the
-          // sound and the amplitude is a bell, so it arrives and leaves rather than
-          // simply starting and stopping.
-          const n = rnd();
-          const band = high(low(n, 0.06 + 0.5 * u), 0.03 + 0.25 * u);
-          buf[i] = band * bell(u) * 1.6;
-        }
-      },
-    },
-    swipe: {
-      name: 'Swipe', cat: 'Whooshes', dur: 0.22,
-      hint: 'A short whoosh, for a fast cut or a small element flying in.',
-      make(buf, rnd) {
-        const low = lp(), high = hp();
-        for (let i = 0; i < buf.length; i++) {
-          const u = i / buf.length;
-          const band = high(low(rnd(), 0.1 + 0.6 * u), 0.08 + 0.3 * u);
-          buf[i] = band * bell(u) * 1.7;
-        }
-      },
-    },
-    riser: {
-      name: 'Riser', cat: 'Risers', dur: 1.3,
-      hint: 'A build. Put its END on the beat, not its start.',
-      make(buf, rnd) {
-        const low = lp();
-        let ph = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const u = i / buf.length;
-          const f = 180 * Math.pow(11, u);
-          ph += 2 * Math.PI * f / SR;
-          const n = low(rnd(), 0.1 + 0.4 * u) * (0.3 + 0.7 * u);
-          buf[i] = (Math.sin(ph) * 0.5 + n) * Math.pow(u, 1.6);
-        }
-      },
-    },
-    impact: {
-      name: 'Impact', cat: 'Impacts', dur: 0.6,
-      hint: 'A hit with a body. The default for cutting hard into a stat.',
-      make(buf, rnd) {
-        const low = lp();
-        let ph = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const t = i / SR;
-          const f = 150 * exp(t, 9) + 48;
-          ph += 2 * Math.PI * f / SR;
-          buf[i] = Math.sin(ph) * ad(t, 0.6, 0.002, 6) +
-                   low(rnd(), 0.35) * 0.5 * ad(t, 0.6, 0.001, 60);
-        }
-      },
-    },
-    sub: {
-      name: 'Sub hit', cat: 'Impacts', dur: 0.8,
-      hint: 'Bottom end only. Layer it under an impact rather than using it alone.',
-      make(buf) {
-        let ph = 0;
-        for (let i = 0; i < buf.length; i++) {
-          const t = i / SR;
-          const f = 62 * exp(t, 3) + 34;
-          ph += 2 * Math.PI * f / SR;
-          buf[i] = Math.sin(ph) * ad(t, 0.8, 0.01, 4.5);
-        }
-      },
-    },
-  };
-
-  const IDS = Object.keys(SOUNDS);
-  /** A stable seed per sound, so `wavFor('pop')` is the same bytes in every process. */
-  const seedOf = (id) => {
-    let h = 2166136261;
-    for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
-    return h >>> 0;
-  };
-
-  /** One sound as a Float32Array, peak-normalised to 0.9. */
-  function samplesFor(id) {
-    const d = SOUNDS[id];
-    if (!d) return null;
-    const buf = new Float32Array(Math.round(d.dur * SR));
-    d.make(buf, noise(seedOf(id)));
-    let peak = 0;
-    for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i]));
-    if (peak > 1e-6) {
-      const g = 0.9 / peak;
-      for (let i = 0; i < buf.length; i++) buf[i] *= g;
-    }
-    // A hard edge at either end is a click of its own. 2 ms is inaudible and enough.
-    const fade = Math.min(Math.round(0.002 * SR), Math.floor(buf.length / 2));
-    for (let i = 0; i < fade; i++) {
-      const g = i / fade;
-      buf[i] *= g;
-      buf[buf.length - 1 - i] *= g;
-    }
-    return buf;
-  }
-
-  /** A 16-bit mono WAV of one sound, as bytes. */
-  function wavFor(id) {
-    const s = samplesFor(id);
-    if (!s) return null;
-    const bytes = new Uint8Array(44 + s.length * 2);
-    const v = new DataView(bytes.buffer);
-    const tag = (off, str) => { for (let i = 0; i < str.length; i++) bytes[off + i] = str.charCodeAt(i); };
-    tag(0, 'RIFF'); v.setUint32(4, 36 + s.length * 2, true); tag(8, 'WAVE');
-    tag(12, 'fmt '); v.setUint32(16, 16, true);
-    v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-    v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true);
-    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-    tag(36, 'data'); v.setUint32(40, s.length * 2, true);
-    for (let i = 0; i < s.length; i++) {
-      const x = clamp(s[i], -1, 1);
-      v.setInt16(44 + i * 2, Math.round(x * 32767), true);
-    }
-    return bytes;
-  }
-
-  /** The bundled library as metadata - what the panel lists and the planner resolves. */
-  function catalogue() {
-    return IDS.map((id) => ({
-      id, name: SOUNDS[id].name, cat: SOUNDS[id].cat,
-      hint: SOUNDS[id].hint, duration: r3(SOUNDS[id].dur), builtin: true,
-    }));
-  }
 
   // ------------------------------------------------------------------ the triggers
 
@@ -256,32 +42,35 @@
    * What Sonify looks for. Adding a trigger is an entry here plus the few lines in the
    * renderer that find its moments - nothing else, because the panel and the planner
    * both build themselves from this table.
+   *
+   * `sound` is empty in every one of them: the library is the user's, so there is no
+   * sensible default to point at until they have imported something.
    */
   const TRIGGERS = {
     graphic: {
-      label: 'Graphic appears', sound: 'pop', offset: 0, gainDb: -2,
-      hint: 'A pop when a graphic clip begins its entry.',
+      label: 'Graphic appears', sound: '', offset: 0, gainDb: -2,
+      hint: 'A sound when a graphic clip begins its entry. A short pop suits it.',
     },
     transition: {
-      label: 'Transition', sound: 'whoosh', offset: -0.06, gainDb: -3,
-      hint: 'A whoosh over each transition. The offset is negative so the sound leads the picture.',
+      label: 'Transition', sound: '', offset: -0.06, gainDb: -3,
+      hint: 'A sound over each transition - a whoosh. The offset is negative so it leads the picture.',
     },
     click: {
-      label: 'Mouse click', sound: 'click', offset: 0, gainDb: -6,
-      hint: 'A click on every mouse-down in a recording\'s telemetry. Silent without it.',
+      label: 'Mouse click', sound: '', offset: 0, gainDb: -6,
+      hint: 'A sound on every mouse-down in a recording\'s telemetry. Silent without it.',
     },
     counter: {
-      label: 'Counting number', sound: 'tick', offset: 0, gainDb: -12,
+      label: 'Counting number', sound: '', offset: 0, gainDb: -12,
       hint: 'Ticks while a counting number climbs, capped so a big number is not a machine gun.',
     },
     cut: {
-      label: 'Cut into a stat', sound: 'impact', offset: 0, gainDb: -4,
-      hint: 'An impact on a hard cut (no transition) into a data graphic.',
+      label: 'Cut into a stat', sound: '', offset: 0, gainDb: -4,
+      hint: 'A sound on a hard cut (no transition) into a data graphic - an impact.',
     },
   };
   const TRIGGER_IDS = Object.keys(TRIGGERS);
 
-  /** Per-trigger rows. The sound picker's options are filled in by the panel. */
+  /** Per-trigger rows. The sound picker's options come from the imported library. */
   const TRIGGER_SCHEMA = [
     { path: 'offset', label: 'Offset', type: 'range', min: -0.5, max: 0.5, step: 0.01, unit: 's', digits: 2 },
     { path: 'gainDb', label: 'Gain', type: 'range', min: -24, max: 12, step: 0.5, unit: 'dB', digits: 1 },
@@ -317,9 +106,6 @@
   /**
    * Fill in settings a project saved before they existed and drop what this build does
    * not know - the same job `Trans.normalize()` and `AudioFX.normalize()` do.
-   *
-   * A trigger pointing at a sound this build has never heard of falls back to its own
-   * default rather than planning a placement with no file behind it.
    */
   function normalizeOpts(o) {
     const d = defaultOpts();
@@ -335,10 +121,10 @@
       const src = (out.triggers || {})[k] || {};
       tr[k] = {
         enabled: src.enabled !== false,
-        // A sound is either a bundled id or the path of an imported file, so anything
-        // non-empty is kept: the renderer resolves it against the library and says so
-        // when it cannot, rather than this dropping a user's own file as "unknown".
-        sound: src.sound ? String(src.sound) : TRIGGERS[k].sound,
+        // A sound is the path of an imported file, so anything non-empty is kept: the
+        // renderer resolves it against the library and says when it cannot, rather than
+        // this dropping a user's own file as "unknown".
+        sound: src.sound ? String(src.sound) : '',
         offset: clamp(src.offset == null ? TRIGGERS[k].offset : src.offset, -0.5, 0.5),
         gainDb: clamp(src.gainDb == null ? TRIGGERS[k].gainDb : src.gainDb, -36, 24),
       };
@@ -358,6 +144,12 @@
       attack: o.duck.attack,
       release: o.duck.release,
     };
+  }
+
+  /** Which triggers are ready to place something: enabled, and pointed at a sound. */
+  function armed(opts) {
+    const o = normalizeOpts(opts);
+    return TRIGGER_IDS.filter((k) => o.triggers[k].enabled && o.triggers[k].sound);
   }
 
   // ------------------------------------------------------------------ the planner
@@ -390,8 +182,11 @@
    * `key`: that is what a later read of the timeline can point at to say "this pop is
    * that graphic's".
    *
+   * A trigger with no sound chosen plans NOTHING. The library ships empty, so this is
+   * the normal state of a fresh project and it must be quiet rather than broken.
+   *
    * Two placements of the SAME trigger closer together than `minGap` collapse into one.
-   * Four graphics entering on the same frame are one pop, not a flam - and a transition
+   * Four graphics entering on the same frame are one sound, not a flam - and a transition
    * whose whoosh would land on top of the last one keeps the first.
    *
    * A placement whose offset pushes it before zero is not dropped: `start` clamps to 0
@@ -404,7 +199,7 @@
     const raw = [];
     const add = (trigger, t, key, label) => {
       const tr = o.triggers[trigger];
-      if (!tr || !tr.enabled) return;
+      if (!tr || !tr.enabled || !tr.sound) return;
       if (!isFinite(t)) return;
       const at = t + tr.offset;
       raw.push({
@@ -443,9 +238,8 @@
   }
 
   const API = {
-    SR, SOUNDS, IDS, TRIGGERS, TRIGGER_IDS, TRIGGER_SCHEMA, DEFAULTS,
-    samplesFor, wavFor, catalogue, seedOf,
-    defaultOpts, defaultTriggers, normalizeOpts, duckFor,
+    TRIGGERS, TRIGGER_IDS, TRIGGER_SCHEMA, DEFAULTS,
+    defaultOpts, defaultTriggers, normalizeOpts, duckFor, armed,
     plan, counterTicks,
   };
 

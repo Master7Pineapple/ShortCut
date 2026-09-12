@@ -498,7 +498,7 @@ select, input[type=number], input[type=text] {
 #sfxPanel .afx-box:first-child { margin-top: 0; border-top: none; padding-top: 0; }
 .sfx-lib { max-height: 168px; overflow-y: auto; border: 1px solid var(--line); border-radius: 3px; }
 .sfx-row {
-  display: grid; grid-template-columns: 1fr auto auto auto; gap: 4px; align-items: center;
+  display: grid; grid-template-columns: 1fr auto auto auto auto; gap: 4px; align-items: center;
   padding: 2px 4px; font-size: 11px; border-bottom: 1px solid var(--line);
 }
 .sfx-row:last-child { border-bottom: none; }
