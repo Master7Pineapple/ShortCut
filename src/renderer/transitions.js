@@ -17,7 +17,41 @@ const Trans = (() => {
     swipe: { label: 'Blurred swipe' },
     burn: { label: 'Film burn' },
     object: { label: 'Object (PNG)' },
+    shape: { label: 'Shape wipe' },
+    luma: { label: 'Luma / gradient wipe' },
+    slide: { label: 'Slide' },
+    scale: { label: 'Scale' },
+    morph: { label: 'Morph (cards)' },
+    punch: { label: 'Zoom punch' },
   };
+
+  /**
+   * The shapes a shape wipe can be cut with.
+   *
+   * Vector paths and canvas primitives, never bitmaps - for the same reason step 10's
+   * chrome presets are vectors: the preview cuts at 540x960 and the export at 1080x1920,
+   * and a bitmap mask would be soft in one of them. `svg` takes path data imported from a
+   * file, which is also how a step 13 graphic's icon gets here: `Graphics.svgPaths()`
+   * produces the same `{d, viewBox}` pair from either source, so there is one code path.
+   */
+  const SHAPES = [
+    { value: 'circle', label: 'Circle' },
+    { value: 'square', label: 'Square' },
+    { value: 'roundRect', label: 'Rounded rectangle' },
+    { value: 'diamond', label: 'Diamond' },
+    { value: 'triangle', label: 'Triangle' },
+    { value: 'star', label: 'Star' },
+    { value: 'chevron', label: 'Chevron' },
+    { value: 'svg', label: 'Imported SVG' },
+  ];
+
+  /** How a luma wipe's threshold map is built. All seeded, never random. */
+  const LUMA_MAPS = [
+    { value: 'linear', label: 'Linear gradient' },
+    { value: 'radial', label: 'Radial' },
+    { value: 'bands', label: 'Bands' },
+    { value: 'clouds', label: 'Clouds' },
+  ];
 
   /**
    * Which way the blurred swipe smears and stretches the picture.
@@ -66,6 +100,25 @@ const Trans = (() => {
         direction: 'left', angle: 30, edge: 0.55, color: '#ff7a1a', hot: '#fffaf0',
         glow: 1, flash: 0.85, peakAt: 0.4, seed: Math.floor(Math.random() * 10000),
       };
+    } else if (base.type === 'shape') {
+      base.params = {
+        shape: 'circle', d: '', viewBox: '0 0 24 24', name: '',
+        x: 0.5, y: 0.5, rotate: 0, spin: 0, feather: 0.02, invert: false, cover: 1.15,
+      };
+    } else if (base.type === 'luma') {
+      base.params = {
+        map: 'linear', direction: 'left', angle: 0, softness: 0.3,
+        bands: 6, seed: Math.floor(Math.random() * 10000), invert: false,
+      };
+    } else if (base.type === 'slide') {
+      base.params = { direction: 'left', push: true, gap: 0, blur: 0 };
+    } else if (base.type === 'scale') {
+      base.params = { from: 0.72, to: 1.18, fade: 1, blur: 6, anchorX: 0.5, anchorY: 0.5 };
+    } else if (base.type === 'morph') {
+      base.params = { auto: true, blur: 10, fade: 1, rotate: 0 };
+      base.easing = { kind: 'bezier', p: [0.16, 1, 0.3, 1] };
+    } else if (base.type === 'punch') {
+      base.params = { amount: 1.5, focusX: 0.5, focusY: 0.5, switchAt: 0.5, blur: 10, hold: 0.35 };
     } else {
       base.params = {
         src: null, direction: 'left', scale: 1, rotate: 0,
@@ -683,10 +736,14 @@ const Trans = (() => {
    * drawable). `p` is raw progress 0..1 through the window; the easing curve is applied
    * here so callers do not have to.
    */
-  function draw(ctx, W, H, tr, p, aImg, bImg, frameDur) {
+  function draw(ctx, W, H, tr, p, aImg, bImg, frameDur, boxes) {
     const raw = Math.max(0, Math.min(1, p));
     const e = TextModel.ease(tr.easing, raw);
     ctx.save();
+    // The morph's two painted boxes, in normalised frame coordinates. Optional, and
+    // handed in the same way the frames are so preview and bake share one source.
+    ctx.__aBox = (boxes && boxes.a) || null;
+    ctx.__bBox = (boxes && boxes.b) || null;
     // If one side has no decodable frame, stand the other in for it. A transition with a
     // missing half must look like the clip that IS there, never like a black frame - at
     // the very edges of the window that is exactly the right picture anyway.
@@ -694,10 +751,510 @@ const Trans = (() => {
     ctx.__bImg = bImg || aImg || null;
     if (tr.type === 'burn') drawBurn(ctx, W, H, tr, e);
     else if (tr.type === 'object') drawObject(ctx, W, H, tr, e, frameDur, raw);
+    else if (tr.type === 'shape') drawShape(ctx, W, H, tr, e);
+    else if (tr.type === 'luma') drawLuma(ctx, W, H, tr, e);
+    else if (tr.type === 'slide') drawSlide(ctx, W, H, tr, e);
+    else if (tr.type === 'scale') drawScale(ctx, W, H, tr, e);
+    else if (tr.type === 'morph') drawMorph(ctx, W, H, tr, e);
+    else if (tr.type === 'punch') drawPunch(ctx, W, H, tr, e, raw);
     else drawSwipe(ctx, W, H, tr, e);
     ctx.__aImg = null;
     ctx.__bImg = null;
+    ctx.__aBox = null;
+    ctx.__bBox = null;
     ctx.restore();
+  }
+
+  // =========================================================== the B2B vocabulary
+  //
+  // Six more types, all built out of the two things the first three already established:
+  // a mask painted on the ALPHA channel, and a plate padded by edge extension before it
+  // is blurred or moved. Both traps are load-bearing and both have been paid for once:
+  //
+  //   - A mask composites on alpha, so a mask painted as opaque black-and-white masks
+  //     nothing. Paint rgba(255,255,255,1) -> rgba(255,255,255,0).
+  //   - A blur must not magnify. Pad the plate by extending its edge pixels, blur or move
+  //     THAT at 1:1, then crop the middle back out - never draw oversized to hide the
+  //     transparent border, which zooms the picture by the blur radius.
+
+  /** The frame with its edge pixels extended outwards by `g` on every side. */
+  function padded(img, g, W, H, name) {
+    const iw = img.videoWidth || img.naturalWidth || img.width || W;
+    const ih = img.videoHeight || img.naturalHeight || img.height || H;
+    if (!iw || !ih) return null;
+    const PW = W + g * 2, PH = H + g * 2;
+    const cv = surface(name || 'pad2', PW, PH);
+    const c = cv.getContext('2d');
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalCompositeOperation = 'source-over';
+    c.globalAlpha = 1;
+    c.filter = 'none';
+    c.clearRect(0, 0, PW, PH);
+    c.drawImage(img, 0, 0, iw, ih, g, g, W, H);
+    if (g > 0) {
+      c.drawImage(img, 0, 0, 1, ih, 0, g, g, H);
+      c.drawImage(img, iw - 1, 0, 1, ih, g + W, g, g, H);
+      c.drawImage(img, 0, 0, iw, 1, g, 0, W, g);
+      c.drawImage(img, 0, ih - 1, iw, 1, g, g + H, W, g);
+      c.drawImage(img, 0, 0, 1, 1, 0, 0, g, g);
+      c.drawImage(img, iw - 1, 0, 1, 1, g + W, 0, g, g);
+      c.drawImage(img, 0, ih - 1, 1, 1, 0, g + H, g, g);
+      c.drawImage(img, iw - 1, ih - 1, 1, 1, g + W, g + H, g, g);
+    }
+    return cv;
+  }
+
+  /**
+   * One frame, blurred without being magnified and returned at exactly WxH.
+   *
+   * `blurPx` is quoted at 1920 tall and scaled to the frame, the way the swipe's is, so a
+   * setting means the same thing in the 540-tall preview and the 1920-tall export.
+   */
+  function softPlate(img, W, H, blurPx, name) {
+    const scale = H / 1920;
+    const px = Math.max(0, num(blurPx, 0)) * scale;
+    const out = surface((name || 'soft') + 'Out', W, H);
+    const oc = out.getContext('2d');
+    oc.setTransform(1, 0, 0, 1, 0, 0);
+    oc.globalCompositeOperation = 'source-over';
+    oc.globalAlpha = 1;
+    oc.filter = 'none';
+    oc.clearRect(0, 0, W, H);
+    if (px <= 0.2) { oc.drawImage(img, 0, 0, W, H); return out; }
+    const g = Math.max(1, Math.ceil(px * 3));
+    const pad = padded(img, g, W, H, (name || 'soft') + 'Pad');
+    if (!pad) { oc.drawImage(img, 0, 0, W, H); return out; }
+    const blurred = surface((name || 'soft') + 'Blur', W + g * 2, H + g * 2);
+    const bc = blurred.getContext('2d');
+    bc.setTransform(1, 0, 0, 1, 0, 0);
+    bc.globalCompositeOperation = 'source-over';
+    bc.globalAlpha = 1;
+    bc.clearRect(0, 0, W + g * 2, H + g * 2);
+    bc.save();
+    bc.filter = 'blur(' + px.toFixed(2) + 'px)';
+    bc.drawImage(pad, 0, 0);
+    bc.restore();
+    oc.drawImage(blurred, g, g, W, H, 0, 0, W, H);
+    return out;
+  }
+
+  /** Draw `img` scaled about a normalised anchor and offset, at alpha. Never magnifies a blur. */
+  function drawPlate(ctx, img, W, H, o) {
+    const s = Math.max(0.0001, o.scale == null ? 1 : o.scale);
+    const ax = (o.anchorX == null ? 0.5 : o.anchorX) * W;
+    const ay = (o.anchorY == null ? 0.5 : o.anchorY) * H;
+    const src = o.blur ? softPlate(img, W, H, o.blur, o.name) : img;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, o.alpha == null ? 1 : o.alpha));
+    ctx.translate(ax + (o.dx || 0), ay + (o.dy || 0));
+    if (o.rot) ctx.rotate(o.rot * Math.PI / 180);
+    ctx.scale(s, s);
+    ctx.translate(-ax, -ay);
+    ctx.drawImage(src, 0, 0, W, H);
+    ctx.restore();
+  }
+
+  // --------------------------------------------------------------- shape wipe
+
+  const shapePaths = new Map();
+  function shapePath2D(d) {
+    const key = String(d || '');
+    if (!key) return null;
+    if (shapePaths.has(key)) return shapePaths.get(key);
+    let p = null;
+    try { p = typeof Path2D === 'function' ? new Path2D(key) : null; } catch (e) { p = null; }
+    shapePaths.set(key, p);
+    return p;
+  }
+
+  /**
+   * Paint the shape at radius `R` (pixels, half-extent) into the mask context.
+   *
+   * Every shape is drawn about the origin at half-extent 1 and scaled, so `cover` means
+   * the same thing for all of them: how far past the frame's own half-diagonal the shape
+   * has to grow before the incoming clip fully covers the outgoing one.
+   */
+  function paintShape(c, shape, R, params) {
+    c.beginPath();
+    if (shape === 'circle') { c.arc(0, 0, R, 0, Math.PI * 2); c.fill(); return; }
+    if (shape === 'square') { c.fillRect(-R, -R, R * 2, R * 2); return; }
+    if (shape === 'roundRect') {
+      const r = Math.min(R, R * 0.28);
+      c.moveTo(-R + r, -R);
+      c.arcTo(R, -R, R, R, r); c.arcTo(R, R, -R, R, r);
+      c.arcTo(-R, R, -R, -R, r); c.arcTo(-R, -R, R, -R, r);
+      c.closePath(); c.fill(); return;
+    }
+    if (shape === 'diamond') {
+      c.moveTo(0, -R); c.lineTo(R, 0); c.lineTo(0, R); c.lineTo(-R, 0);
+      c.closePath(); c.fill(); return;
+    }
+    if (shape === 'triangle') {
+      c.moveTo(0, -R); c.lineTo(R, R); c.lineTo(-R, R);
+      c.closePath(); c.fill(); return;
+    }
+    if (shape === 'chevron') {
+      c.moveTo(-R, -R); c.lineTo(0, 0); c.lineTo(-R, R);
+      c.lineTo(0, R); c.lineTo(R, 0); c.lineTo(0, -R);
+      c.closePath(); c.fill(); return;
+    }
+    if (shape === 'star') {
+      for (let i = 0; i < 10; i++) {
+        const a = -Math.PI / 2 + i * Math.PI / 5;
+        const r = i % 2 ? R * 0.46 : R;
+        const x = Math.cos(a) * r, y = Math.sin(a) * r;
+        if (i) c.lineTo(x, y); else c.moveTo(x, y);
+      }
+      c.closePath(); c.fill(); return;
+    }
+    // Imported path data, mapped through its viewBox so a 24-unit icon and a 512-unit one
+    // reach the same size on the frame - the same rule `Graphics.drawPathData()` lives by.
+    const p = shapePath2D(params && params.d);
+    if (!p) { c.arc(0, 0, R, 0, Math.PI * 2); c.fill(); return; }
+    const vb = (typeof Graphics !== 'undefined' && Graphics.parseViewBox)
+      ? Graphics.parseViewBox(params.viewBox) : [0, 0, 24, 24];
+    const s = (R * 2) / Math.max(1e-6, Math.max(vb[2], vb[3]));
+    c.save();
+    c.scale(s, s);
+    c.translate(-vb[0] - vb[2] / 2, -vb[1] - vb[3] / 2);
+    c.fill(p);
+    c.restore();
+  }
+
+  function paintShapeMask(c, W, H, p, e) {
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalCompositeOperation = 'source-over';
+    c.globalAlpha = 1;
+    c.filter = 'none';
+    c.clearRect(0, 0, W, H);
+    const half = Math.hypot(W, H) / 2 * Math.max(0.2, num(p.cover, 1.15));
+    const R = Math.max(0.01, e * half);
+    const feather = Math.max(0, num(p.feather, 0.02)) * Math.min(W, H);
+    c.save();
+    if (feather > 0.4) c.filter = 'blur(' + feather.toFixed(2) + 'px)';
+    // White with FULL ALPHA: the mask is composited with destination-in, which reads the
+    // alpha channel and ignores the colour entirely.
+    c.fillStyle = OPAQUE;
+    c.strokeStyle = OPAQUE;
+    c.translate(num(p.x, 0.5) * W, num(p.y, 0.5) * H);
+    const spin = num(p.rotate, 0) + num(p.spin, 0) * e;
+    if (spin) c.rotate(spin * Math.PI / 180);
+    paintShape(c, p.shape || 'circle', R, p);
+    c.restore();
+    if (p.invert) {
+      // Invert on ALPHA too: fill the frame opaque, then punch the shape back out.
+      const cut = surface('shapeCut', W, H);
+      const cc = cut.getContext('2d');
+      cc.setTransform(1, 0, 0, 1, 0, 0);
+      cc.globalCompositeOperation = 'source-over';
+      cc.globalAlpha = 1;
+      cc.filter = 'none';
+      cc.clearRect(0, 0, W, H);
+      cc.fillStyle = OPAQUE;
+      cc.fillRect(0, 0, W, H);
+      cc.globalCompositeOperation = 'destination-out';
+      cc.drawImage(c.canvas, 0, 0);
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.globalCompositeOperation = 'copy';
+      c.drawImage(cut, 0, 0);
+      c.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  function drawShape(ctx, W, H, tr, e) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    if (a) ctx.drawImage(a, 0, 0, W, H);
+    if (!b) return;
+    const layer = surface('layer', W, H);
+    const lctx = layer.getContext('2d');
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.globalCompositeOperation = 'source-over';
+    lctx.globalAlpha = 1;
+    lctx.filter = 'none';
+    lctx.clearRect(0, 0, W, H);
+    lctx.drawImage(b, 0, 0, W, H);
+    const mask = surface('mask', W, H);
+    paintShapeMask(mask.getContext('2d'), W, H, tr.params || {}, e);
+    stampMasked(ctx, layer, lctx, mask, W, H);
+  }
+
+  // ---------------------------------------------------------------- luma wipe
+
+  /**
+   * The luma map a gradient wipe thresholds against, built small and scaled up.
+   *
+   * Small and SEEDED, for the reason the burn's streaks are: the preview and the export
+   * build the texture independently at different resolutions, and a map that depended on
+   * either would put the wipe edge in two different places.
+   */
+  const lumaMaps = new Map();
+  function lumaMap(kind, seed, bands, angleDeg) {
+    const key = kind + '|' + seed + '|' + bands + '|' + angleDeg;
+    const hit = lumaMaps.get(key);
+    if (hit) return hit;
+    const w = 192, h = 341;                    // a 9:16-ish plate, fixed at every output size
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const c = cv.getContext('2d');
+    c.fillStyle = '#000';
+    c.fillRect(0, 0, w, h);
+    const rnd = mulberry32((seed || 1) * 31 + 7);
+    if (kind === 'radial') {
+      const g = c.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.hypot(w, h) / 2);
+      g.addColorStop(0, '#000'); g.addColorStop(1, '#fff');
+      c.fillStyle = g; c.fillRect(0, 0, w, h);
+    } else if (kind === 'bands') {
+      const n = Math.max(1, Math.round(num(bands, 6)));
+      c.save();
+      c.translate(w / 2, h / 2);
+      c.rotate(num(angleDeg, 0) * Math.PI / 180);
+      const span = Math.hypot(w, h);
+      for (let i = 0; i < n; i++) {
+        // Each band ramps 0..1 across itself, so thresholding sweeps them in step.
+        const g = c.createLinearGradient(-span / 2, 0, span / 2, 0);
+        g.addColorStop(0, '#000'); g.addColorStop(1, '#fff');
+        c.fillStyle = g;
+        c.fillRect(-span / 2, -span / 2 + (i * span) / n, span, span / n);
+      }
+      c.restore();
+    } else if (kind === 'clouds') {
+      // Seeded value noise: a handful of soft blobs, averaged by overdraw.
+      c.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < 26; i++) {
+        const x = rnd() * w, y = rnd() * h, r = (0.12 + rnd() * 0.35) * w;
+        const g = c.createRadialGradient(x, y, 0, x, y, r);
+        const v = (0.35 + rnd() * 0.65).toFixed(3);
+        g.addColorStop(0, 'rgba(255,255,255,' + v + ')');
+        g.addColorStop(1, 'rgba(255,255,255,0)');
+        c.fillStyle = g;
+        c.fillRect(x - r, y - r, r * 2, r * 2);
+      }
+      c.globalCompositeOperation = 'source-over';
+    } else {
+      c.save();
+      c.translate(w / 2, h / 2);
+      c.rotate(num(angleDeg, 0) * Math.PI / 180);
+      const span = Math.hypot(w, h);
+      const g = c.createLinearGradient(-span / 2, 0, span / 2, 0);
+      g.addColorStop(0, '#000'); g.addColorStop(1, '#fff');
+      c.fillStyle = g;
+      c.fillRect(-span / 2, -span / 2, span, span);
+      c.restore();
+    }
+    lumaMaps.set(key, cv);
+    return cv;
+  }
+
+  /** Which way a luma wipe's gradient runs, in degrees, from the shared direction list. */
+  function lumaAngle(direction, angle) {
+    const base = { left: 0, right: 180, up: 90, down: 270 }[direction];
+    return (base == null ? 0 : base) + num(angle, 0);
+  }
+
+  /**
+   * Threshold the luma map into a reveal mask.
+   *
+   * The threshold is stepped through a soft window, so the edge is a feathered contour of
+   * the map rather than a hard one. Built as ALPHA, like every other mask here: the map's
+   * luminance selects, and what lands in the mask is white at varying alpha.
+   */
+  function paintLumaMask(c, W, H, p, e) {
+    const kind = p.map || 'linear';
+    const src = lumaMap(kind, Math.round(num(p.seed, 1)), num(p.bands, 6),
+      kind === 'radial' || kind === 'clouds' ? 0 : lumaAngle(p.direction, p.angle));
+    const soft = Math.max(0.01, Math.min(1, num(p.softness, 0.3)));
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalCompositeOperation = 'source-over';
+    c.globalAlpha = 1;
+    c.filter = 'none';
+    c.clearRect(0, 0, W, H);
+
+    // Scale the threshold window so both ends of the transition fully clear the map.
+    const lo = e * (1 + soft) - soft;
+    const img = surface('lumaSrc', W, H);
+    const ic = img.getContext('2d');
+    ic.setTransform(1, 0, 0, 1, 0, 0);
+    ic.globalCompositeOperation = 'source-over';
+    ic.globalAlpha = 1;
+    ic.filter = 'none';
+    ic.clearRect(0, 0, W, H);
+    ic.drawImage(src, 0, 0, W, H);
+    const d = ic.getImageData(0, 0, W, H);
+    const px = d.data;
+    const inv = !!p.invert;
+    for (let i = 0; i < px.length; i += 4) {
+      let L = (px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114) / 255;
+      if (inv) L = 1 - L;
+      // Alpha ramps from 0 to 255 across the soft window ending at the threshold.
+      const a = Math.max(0, Math.min(1, (lo + soft - L) / soft));
+      px[i] = 255; px[i + 1] = 255; px[i + 2] = 255;
+      px[i + 3] = Math.round(a * 255);
+    }
+    ic.putImageData(d, 0, 0);
+    c.drawImage(img, 0, 0);
+  }
+
+  function drawLuma(ctx, W, H, tr, e) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    if (a) ctx.drawImage(a, 0, 0, W, H);
+    if (!b) return;
+    const layer = surface('layer', W, H);
+    const lctx = layer.getContext('2d');
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.globalCompositeOperation = 'source-over';
+    lctx.globalAlpha = 1;
+    lctx.filter = 'none';
+    lctx.clearRect(0, 0, W, H);
+    lctx.drawImage(b, 0, 0, W, H);
+    const mask = surface('mask', W, H);
+    paintLumaMask(mask.getContext('2d'), W, H, tr.params || {}, e);
+    stampMasked(ctx, layer, lctx, mask, W, H);
+  }
+
+  // ------------------------------------------------------------------- slide
+
+  /** The unit vector a direction travels along. Zooms have none and stand still. */
+  function slideVector(direction) {
+    if (direction === 'right') return [-1, 0];
+    if (direction === 'up') return [0, 1];
+    if (direction === 'down') return [0, -1];
+    if (direction === 'left') return [1, 0];
+    return [0, 0];
+  }
+
+  function drawSlide(ctx, W, H, tr, e) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    const p = tr.params || {};
+    const [ux, uy] = slideVector(p.direction || 'left');
+    const gap = Math.max(0, num(p.gap, 0));
+    const span = (1 + gap) * (ux ? W : H);
+    const blur = num(p.blur, 0) * Math.sin(Math.PI * Math.max(0, Math.min(1, e)));
+    // B travels in from off-frame; A either holds still or is pushed out ahead of it.
+    if (a) {
+      const off = p.push ? -e * span : 0;
+      drawPlate(ctx, a, W, H, { dx: ux * off, dy: uy * off, blur, name: 'slideA' });
+    }
+    if (b) {
+      const off = (1 - e) * span;
+      drawPlate(ctx, b, W, H, { dx: ux * off, dy: uy * off, blur, name: 'slideB' });
+    }
+  }
+
+  // ------------------------------------------------------------------- scale
+
+  function drawScale(ctx, W, H, tr, e) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    const p = tr.params || {};
+    const peak = Math.sin(Math.PI * Math.max(0, Math.min(1, e)));
+    const blur = Math.max(0, num(p.blur, 6)) * peak;
+    const fade = Math.max(0, Math.min(1, num(p.fade, 1)));
+    const from = Math.max(0.05, num(p.from, 0.72));
+    const to = Math.max(0.05, num(p.to, 1.18));
+    const ax = num(p.anchorX, 0.5), ay = num(p.anchorY, 0.5);
+    // A grows away from the viewer, B arrives from behind it. `fade` at 0 makes it a pure
+    // scale with a hard swap at the midpoint, which is the match-cut version.
+    if (a) {
+      drawPlate(ctx, a, W, H, {
+        scale: 1 + (to - 1) * e, anchorX: ax, anchorY: ay, blur,
+        alpha: fade ? 1 : (e < 0.5 ? 1 : 0), name: 'scaleA',
+      });
+    }
+    if (b) {
+      drawPlate(ctx, b, W, H, {
+        scale: from + (1 - from) * e, anchorX: ax, anchorY: ay, blur,
+        alpha: fade ? Math.min(1, e / Math.max(0.001, fade)) : (e < 0.5 ? 0 : 1), name: 'scaleB',
+      });
+    }
+  }
+
+  // ------------------------------------------------------------------- morph
+
+  /**
+   * A morph between two cards: a cross-dissolve that also carries A's shape onto B's.
+   *
+   * `ctx.__aBox` / `ctx.__bBox` are the painted bounds of the two sides in NORMALISED
+   * frame coordinates, handed in by the caller the same way the two frames are. Both the
+   * preview and the baker get them from one helper, so the two agree by construction; a
+   * side with no bounds (a video clip, an undecoded card) falls back to the whole frame,
+   * and the morph degrades into the cross-dissolve it is built on.
+   */
+  const FULL_BOX = { x: 0, y: 0, w: 1, h: 1 };
+  function boxOrFull(b) {
+    if (!b || !isFinite(b.w) || !isFinite(b.h) || b.w <= 0 || b.h <= 0) return FULL_BOX;
+    return b;
+  }
+
+  /** The transform that carries `from` onto `to`, at progress `e`. */
+  function morphTransform(from, to, e, W, H) {
+    const f = boxOrFull(from), t = boxOrFull(to);
+    const sx = 1 + ((t.w / f.w) - 1) * e;
+    const sy = 1 + ((t.h / f.h) - 1) * e;
+    const s = (sx + sy) / 2;                       // uniform: a squashed card reads as broken
+    const fcx = (f.x + f.w / 2), fcy = (f.y + f.h / 2);
+    const tcx = (t.x + t.w / 2), tcy = (t.y + t.h / 2);
+    return {
+      scale: s,
+      anchorX: fcx, anchorY: fcy,
+      dx: (tcx - fcx) * W * e, dy: (tcy - fcy) * H * e,
+    };
+  }
+
+  function drawMorph(ctx, W, H, tr, e) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    const p = tr.params || {};
+    const peak = Math.sin(Math.PI * Math.max(0, Math.min(1, e)));
+    const blur = Math.max(0, num(p.blur, 10)) * peak;
+    const rot = num(p.rotate, 0);
+    const aBox = p.auto === false ? FULL_BOX : boxOrFull(ctx.__aBox);
+    const bBox = p.auto === false ? FULL_BOX : boxOrFull(ctx.__bBox);
+    const fade = Math.max(0.001, Math.min(1, num(p.fade, 1)));
+    if (a) {
+      const m = morphTransform(aBox, bBox, e, W, H);
+      drawPlate(ctx, a, W, H, Object.assign({}, m, {
+        blur, rot: rot * e, alpha: Math.max(0, 1 - e / fade), name: 'morphA',
+      }));
+    }
+    if (b) {
+      // B runs the same transform backwards: it starts wearing A's shape and relaxes.
+      const m = morphTransform(bBox, aBox, 1 - e, W, H);
+      drawPlate(ctx, b, W, H, Object.assign({}, m, {
+        blur, rot: -rot * (1 - e), alpha: Math.min(1, e / fade), name: 'morphB',
+      }));
+    }
+  }
+
+  // -------------------------------------------------------------- zoom punch
+
+  /**
+   * A zoom punch: both plates rush toward a focus point, the cut happens at the peak
+   * where the movement hides it, and the incoming clip settles back.
+   *
+   * `hold` is how much of the window the punch spends at full zoom - it is what makes the
+   * cut read as a deliberate accent rather than as a slow push in and out.
+   */
+  function punchEnvelope(e, hold) {
+    const h = Math.max(0, Math.min(0.9, num(hold, 0.35)));
+    const ramp = (1 - h) / 2;
+    if (e <= ramp) return e / Math.max(1e-6, ramp);
+    if (e >= 1 - ramp) return (1 - e) / Math.max(1e-6, ramp);
+    return 1;
+  }
+
+  function drawPunch(ctx, W, H, tr, e, rawP) {
+    const a = ctx.__aImg, b = ctx.__bImg;
+    const p = tr.params || {};
+    const v = punchEnvelope(e, p.hold);
+    const amount = Math.max(1, num(p.amount, 1.5));
+    const scale = 1 + (amount - 1) * v;
+    const blur = Math.max(0, num(p.blur, 10)) * v;
+    const switchAt = num(p.switchAt, 0.5);
+    const under = (rawP < switchAt ? a : b) || a || b;
+    if (!under) return;
+    drawPlate(ctx, under, W, H, {
+      scale, blur,
+      anchorX: num(p.focusX, 0.5), anchorY: num(p.focusY, 0.5),
+      name: 'punch',
+    });
   }
 
   /**
@@ -735,8 +1292,11 @@ const Trans = (() => {
   }
 
   return {
-    TYPES, DIRECTIONS, DEFORM_AXES, deformAxisOf, defaults, windowOf, extractPreset, applyPreset,
+    TYPES, DIRECTIONS, DEFORM_AXES, SHAPES, LUMA_MAPS,
+    deformAxisOf, defaults, windowOf, extractPreset, applyPreset,
     loadImage, imageFor, draw, objectPlacement,
     paintWipeMask, leakEnvelope, streakMap, normalize, objectFade,
+    paintShapeMask, paintLumaMask, lumaMap, slideVector, morphTransform, punchEnvelope,
+    padded, softPlate,
   };
 })();

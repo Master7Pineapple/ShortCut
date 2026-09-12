@@ -82,7 +82,29 @@ function log(msg) {
 
 const allClips = () => state.tracks.flatMap((t) => t.clips.map((c) => ({ clip: c, track: t })));
 const findClip = (id) => allClips().find((x) => x.clip.id === id);
-const clipEnd = (c) => c.start + (c.out - c.in);
+/**
+ * THE TWO TIME DOMAINS.
+ *
+ * Before speed there was one: a clip occupied `out - in` seconds of timeline and the
+ * source time under timeline time `t` was `in + (t - start)`. Speed splits that in two,
+ * and these three helpers are the ONLY places the split is expressed. Everything that
+ * used to do the arithmetic inline now goes through them, which is what made a feature
+ * touching trimming, splitting, snapping, transitions, tracking, masking, the baker and
+ * `buildArgs()` a reviewable change rather than a rewrite.
+ *
+ *   clipLen(c)        how many TIMELINE seconds the clip occupies
+ *   srcAt(c, tLocal)  timeline-local seconds  ->  absolute SOURCE seconds
+ *   localOf(c, tSrc)  absolute source seconds ->  timeline-local seconds
+ *
+ * With no speed on the clip all three are arithmetically identical to the expressions
+ * they replaced - `Speed` short-circuits before it touches an integration table - so an
+ * unsped project renders byte-identical ffmpeg arguments and hashes to the render-cache
+ * key it did before speed existed.
+ */
+const clipLen = (c) => Speed.timelineLen(c);
+const srcAt = (c, tLocal) => Speed.srcAt(c, tLocal);
+const localOf = (c, tSrc) => Speed.localOf(c, tSrc);
+const clipEnd = (c) => c.start + clipLen(c);
 
 function projectDuration() {
   let d = 0;
@@ -563,10 +585,40 @@ function dropPreviewGain(clipId) {
   previewMix.nodes.delete(clipId);
 }
 
+/**
+ * Run a clip's element at the rate its speed curve asks for, right now.
+ *
+ * This is the whole of speed in the preview: the playhead advances at wall-clock rate and
+ * the element is told to play faster or slower, so `currentTime` tracks `srcAt()` on its
+ * own instead of being re-seeked every frame. A ramp still drifts from the curve between
+ * corrections - the element interpolates linearly between two rate changes where the
+ * curve bends - and `syncMedia()`'s existing 0.3 s threshold pulls it back. The EXPORT
+ * has no such approximation: the baker seeks to `srcAt()` for each frame.
+ *
+ * `preservesPitch` is the pitch-corrected half of the audio setting. Chromium defaults it
+ * to true, so it has to be turned OFF to get the chipmunk, not on to avoid it.
+ */
+function applyPlaybackRate(clip, el) {
+  if (!el || el.tagName === 'IMG') return;
+  let r = 1;
+  if (Speed.has(clip)) {
+    r = Speed.rateAt(clip, srcAt(clip, state.playhead - clip.start));
+  }
+  r = clamp(r, 0.0625, 16);           // what a media element will accept
+  try {
+    if (Math.abs((el.playbackRate || 1) - r) > 1e-3) el.playbackRate = r;
+    const keepPitch = Speed.audioMode(clip) !== 'mute';
+    if ('preservesPitch' in el) el.preservesPitch = keepPitch;
+  } catch (e) { /* a detached element mid-teardown */ }
+}
+
 /** Put a clip's audible level and mute state onto its element for this frame. */
 function applyPreviewMix(clip, el, trackMuted) {
   const lin = AudioFX.previewGain(clip);
-  el.muted = !!trackMuted;
+  // A ramped clip cannot be time-stretched honestly in the preview any more than it can
+  // in ffmpeg, so the setting that silences it in the render silences it here too - the
+  // viewer must not hear something the file will not contain.
+  el.muted = !!trackMuted || (Speed.has(clip) && Speed.audioMode(clip) === 'mute');
   const node = previewGainNode(clip, el);
   if (node) { node.gain.gain.value = lin; el.volume = 1; }
   else el.volume = clamp(lin, 0, 1);
@@ -980,7 +1032,7 @@ const selectedTransition = () => (state.selTransition ? findTransition(state.sel
 
 /** How long a transition can be before it runs past either clip. */
 function maxTransitionDuration(a, b) {
-  const lenA = a.out - a.in, lenB = b.out - b.in;
+  const lenA = clipLen(a), lenB = clipLen(b);
   return Math.max(0.04, Math.min(lenA, lenB) * 1.9);
 }
 
@@ -1143,7 +1195,7 @@ function renderLanes() {
         (c.linkId ? ' linked' : '') +
         ((t.muted || t.hidden) ? ' muted' : '');
       el.style.left = (c.start * state.pxPerSec) + 'px';
-      el.style.width = Math.max(6, (c.out - c.in) * state.pxPerSec) + 'px';
+      el.style.width = Math.max(6, clipLen(c) * state.pxPerSec) + 'px';
       el.dataset.clipId = c.id;
       const label = isCanvasClip(c) ? CANVAS_PAINTERS[c.kind].name(c) : c.name;
       el.innerHTML =
@@ -1192,7 +1244,7 @@ const WAVE_MAX_PX = 1600;
 const waveCanvases = new Map();
 function drawClipWave(el, c) {
   if (!c.src) return;
-  const wPx = Math.round(Math.max(6, (c.out - c.in) * state.pxPerSec));
+  const wPx = Math.round(Math.max(6, clipLen(c) * state.pxPerSec));
   if (wPx < 12) return;
   const w = Math.min(WAVE_MAX_PX, wPx);
   const h = TRACK_H - 8;
@@ -1229,7 +1281,7 @@ function drawClipWave(el, c) {
  */
 const trackConfCanvases = new Map();
 function drawClipTrackConf(el, c) {
-  const wPx = Math.round(Math.max(6, (c.out - c.in) * state.pxPerSec));
+  const wPx = Math.round(Math.max(6, clipLen(c) * state.pxPerSec));
   if (wPx < 12) return;
   const w = Math.min(WAVE_MAX_PX, wPx);
   const h = 4;
@@ -1244,9 +1296,13 @@ function drawClipTrackConf(el, c) {
     cv.width = w;
     cv.height = h;
     const g = cv.getContext('2d');
-    const per = (c.out - c.in) / w;
+    // Each pixel column is a TIMELINE slice, so the source window it covers comes from
+    // the speed map rather than from dividing the source range evenly - under a ramp
+    // those are different windows, and the strip would report a lost track in the wrong
+    // place.
+    const perT = clipLen(c) / w;
     for (let x = 0; x < w; x++) {
-      const t0 = c.in + x * per, t1 = t0 + per;
+      const t0 = srcAt(c, x * perT), t1 = srcAt(c, (x + 1) * perT);
       let worst = 1, repaired = false;
       for (const tk of c.tracks) {
         const s = Tracker.sampleAt(tk, (t0 + t1) / 2);
@@ -1476,6 +1532,112 @@ function transitionPresetBar(tr) {
   return box;
 }
 
+/**
+ * Slip a clip so that source time `tSrc` is what shows at timeline time `atTime`.
+ *
+ * A SLIP moves what the clip shows without moving the clip: the start stays, the timeline
+ * length stays, and nothing downstream of it shifts. That is the whole point of a match
+ * cut - the join stays where it is and the two sides are aligned by content.
+ *
+ * The length is preserved explicitly rather than by moving `in` and `out` together,
+ * because the rate curve is keyed in absolute source time: slide a clip onto a different
+ * stretch of footage and it meets a different part of the curve, so the out-point has to
+ * be re-derived from the length the clip is supposed to keep.
+ */
+function slipClipTo(c, tSrc, atTime) {
+  const len = clipLen(c);
+  if (!(len > 0)) return 0;
+  const wantLocal = clamp(atTime - c.start, 0, len);
+  const shift = tSrc - srcAt(c, wantLocal);
+  const nin = clamp(c.in + shift, 0, Math.max(0, c.mediaDuration - 0.05));
+  const applied = nin - c.in;
+  c.in = nin;
+  c.out = clamp(Speed.advance(c, c.in, len), c.in + 0.001, c.mediaDuration);
+  return applied;
+}
+
+/**
+ * Where the user has marked a feature on each side of a cut, so the two can be aligned.
+ *
+ * Transient: it names clips and source times, it is not part of the edit, and it is not
+ * serialised - a mark is scaffolding for one gesture, not project state.
+ */
+let matchMarks = { a: null, b: null };
+
+function markMatchPoint(side, r) {
+  const c = side === 'a' ? r.a : r.b;
+  const local = state.playhead - c.start;
+  if (local < -1e-6 || local > clipLen(c) + 1e-6) {
+    setStatus('Put the playhead inside the ' + (side === 'a' ? 'outgoing' : 'incoming') +
+      ' clip before marking it.', 'err');
+    return;
+  }
+  matchMarks[side] = { clipId: c.id, t: srcAt(c, clamp(local, 0, clipLen(c))) };
+  renderTransitionPanel();
+}
+
+/**
+ * Align both marked points ON the cut: the last frame of A and the first frame of B then
+ * show the same moment of the action, which is what makes the join invisible.
+ *
+ * One `pushUndo()` for both slips - it is one edit, not two.
+ */
+function applyMatchCut(r) {
+  const ma = matchMarks.a, mb = matchMarks.b;
+  if (!ma || !mb || ma.clipId !== r.a.id || mb.clipId !== r.b.id) {
+    setStatus('Mark a point in each clip first.', 'err');
+    return;
+  }
+  pushUndo();
+  slipClipTo(r.a, ma.t, r.cut);
+  slipClipTo(r.b, mb.t, r.cut);
+  matchMarks = { a: null, b: null };
+  markDirty();
+  renderAll();
+  log('Matched the cut at ' + fmtTc(r.cut) + '.');
+}
+
+/** Slip the incoming clip by whole frames, keeping the cut and the length where they are. */
+function nudgeMatch(r, side, frames) {
+  const c = side === 'a' ? r.a : r.b;
+  pushUndo();
+  const at = side === 'a' ? r.cut - 0.001 : r.cut + 0.001;
+  slipClipTo(c, srcAt(c, clamp(at - c.start, 0, clipLen(c))) + frames / state.out.fps, at);
+  markDirty();
+  renderAll();
+}
+
+/** The match-cut helpers, on every transition type - they are about the join, not the look. */
+function matchCutBar(r) {
+  const el = TextUI.el;
+  const wrap = el('div', 'tc-row');
+  wrap.appendChild(el('label', 'tc-label', 'Match cut'));
+  const box = el('div', 'tc-file');
+  const mark = (side, label) => {
+    const m = matchMarks[side];
+    const live = m && m.clipId === (side === 'a' ? r.a.id : r.b.id);
+    const btn = el('button', 'mini' + (live ? ' on' : ''),
+      live ? label + ' \u2713 ' + m.t.toFixed(2) + 's' : label);
+    btn.title = 'Mark the feature under the playhead in the ' +
+      (side === 'a' ? 'outgoing' : 'incoming') + ' clip';
+    btn.addEventListener('click', () => markMatchPoint(side, r));
+    return btn;
+  };
+  box.appendChild(mark('a', 'Mark A'));
+  box.appendChild(mark('b', 'Mark B'));
+  const go = el('button', 'mini', 'Align on the cut');
+  go.addEventListener('click', () => applyMatchCut(r));
+  box.appendChild(go);
+  for (const n of [-1, 1]) {
+    const nb = el('button', 'mini', (n > 0 ? '+' : '') + n + 'f B');
+    nb.title = 'Slip the incoming clip one frame without moving the cut';
+    nb.addEventListener('click', () => nudgeMatch(r, 'b', n));
+    box.appendChild(nb);
+  }
+  wrap.appendChild(box);
+  return wrap;
+}
+
 function renderTransitionPanel() {
   const host = $('#transPanel');
   const head = $('#transPanelHead');
@@ -1543,6 +1705,104 @@ function renderTransitionPanel() {
       'A warm light leak blooms across the frame and the clips cut underneath it at the peak, ' +
       'where the bloom is bright enough to hide the join. Spread is how far ember colour trails ' +
       'behind the hot edge; the streaks are seeded, not random, so the preview and the render agree.'));
+  } else if (tr.type === 'shape') {
+    body.appendChild(C({ path: 'params.shape', label: 'Shape', type: 'select', options: Trans.SHAPES }));
+    if (p.shape === 'svg') {
+      const row = el('div', 'tc-row');
+      row.appendChild(el('label', 'tc-label', 'SVG'));
+      const file = el('div', 'tc-file');
+      const name = el('span', null, p.name || (p.d ? 'imported path' : 'none chosen'));
+      const pick = el('button', 'mini', 'Import...');
+      pick.addEventListener('click', async () => {
+        const r2 = await window.api.pickSvg();
+        if (!r2 || !r2.d) { log('That SVG had no <path> this engine could read.'); return; }
+        pushUndo();
+        p.d = r2.d; p.viewBox = r2.viewBox || '0 0 24 24'; p.name = r2.name || '';
+        markDirty();
+        renderTransitionPanel();
+        drawPreview();
+      });
+      file.appendChild(name);
+      file.appendChild(pick);
+      row.appendChild(file);
+      body.appendChild(row);
+    }
+    body.appendChild(C({ path: 'params.x', label: 'Centre X', type: 'range', min: -0.5, max: 1.5, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.y', label: 'Centre Y', type: 'range', min: -0.5, max: 1.5, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.feather', label: 'Feather', type: 'range', min: 0, max: 0.3, step: 0.002, digits: 3 }));
+    body.appendChild(C({ path: 'params.rotate', label: 'Rotation', type: 'range', min: -180, max: 180, step: 1, unit: 'deg' }));
+    body.appendChild(C({ path: 'params.spin', label: 'Spin', type: 'range', min: -720, max: 720, step: 5, unit: 'deg' }));
+    body.appendChild(C({ path: 'params.cover', label: 'Grows to', type: 'range', min: 0.5, max: 3, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.invert', label: 'Invert', type: 'check' }));
+    body.appendChild(el('div', 'tc-hint',
+      'The incoming clip is revealed through a growing shape. The mask is painted on the ' +
+      'ALPHA channel - white at full alpha fading to white at zero - because a mask painted ' +
+      'as opaque black and white masks nothing. "Grows to" is how far past the frame\u2019s own ' +
+      'half-diagonal the shape reaches by the end, so a shape with long points still covers.'));
+  } else if (tr.type === 'luma') {
+    body.appendChild(C({ path: 'params.map', label: 'Map', type: 'select', options: Trans.LUMA_MAPS }));
+    if (p.map === 'linear' || p.map === 'bands') {
+      body.appendChild(C({ path: 'params.direction', label: 'Runs', type: 'select', options: Trans.DIRECTIONS }));
+      body.appendChild(C({ path: 'params.angle', label: 'Diagonal', type: 'range', min: -90, max: 90, step: 1, unit: 'deg' }));
+    }
+    if (p.map === 'bands') {
+      body.appendChild(C({ path: 'params.bands', label: 'Bands', type: 'range', min: 1, max: 24, step: 1 }));
+    }
+    if (p.map === 'clouds') {
+      body.appendChild(C({ path: 'params.seed', label: 'Seed', type: 'range', min: 0, max: 9999, step: 1 }));
+    }
+    body.appendChild(C({ path: 'params.softness', label: 'Edge', type: 'range', min: 0.02, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.invert', label: 'Invert', type: 'check' }));
+    body.appendChild(el('div', 'tc-hint',
+      'A threshold sweeps across a greyscale map and the incoming clip appears wherever it ' +
+      'has passed. The map is built small at a fixed size and scaled up, seeded rather than ' +
+      'random - the preview and the export build it independently, and an unseeded one would ' +
+      'put the wipe edge in two different places.'));
+  } else if (tr.type === 'slide') {
+    body.appendChild(C({ path: 'params.direction', label: 'Enters from', type: 'select', options: Trans.DIRECTIONS }));
+    body.appendChild(C({ path: 'params.push', label: 'Pushes the old clip out', type: 'check' }));
+    body.appendChild(C({ path: 'params.gap', label: 'Gap', type: 'range', min: 0, max: 0.5, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.blur', label: 'Travel blur', type: 'range', min: 0, max: 60, step: 1, unit: 'px' }));
+    body.appendChild(el('div', 'tc-hint',
+      'The incoming clip travels in from off-frame. With "pushes" on, the outgoing clip ' +
+      'leaves ahead of it and the pair moves as one strip; with it off, the new clip slides ' +
+      'over a clip that stays put. Zoom directions have nowhere to travel and stand still.'));
+  } else if (tr.type === 'scale') {
+    body.appendChild(C({ path: 'params.from', label: 'B starts at', type: 'range', min: 0.1, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.to', label: 'A grows to', type: 'range', min: 1, max: 3, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.fade', label: 'Cross fade', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.blur', label: 'Blur', type: 'range', min: 0, max: 60, step: 1, unit: 'px' }));
+    body.appendChild(C({ path: 'params.anchorX', label: 'Anchor X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.anchorY', label: 'Anchor Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(el('div', 'tc-hint',
+      'The outgoing clip grows away and the incoming one arrives from behind it. A cross ' +
+      'fade of 0 makes it a pure scale with a hard swap at the midpoint, which is the ' +
+      'match-cut version - set the anchor on the thing both shots share.'));
+  } else if (tr.type === 'morph') {
+    body.appendChild(C({ path: 'params.auto', label: 'Read the cards\u2019 bounds', type: 'check' }));
+    body.appendChild(C({ path: 'params.fade', label: 'Cross fade', type: 'range', min: 0.05, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.blur', label: 'Blur', type: 'range', min: 0, max: 60, step: 1, unit: 'px' }));
+    body.appendChild(C({ path: 'params.rotate', label: 'Twist', type: 'range', min: -90, max: 90, step: 1, unit: 'deg' }));
+    const kinds = isCanvasClip(r.a) && isCanvasClip(r.b);
+    body.appendChild(el('div', 'tc-hint', kinds
+      ? 'Each card is carried onto the other\u2019s painted box while the two cross-fade, so a ' +
+        'title becomes the next title rather than dissolving into it. The bounds are measured ' +
+        'once per frame and handed to the same draw call the exporter makes.'
+      : 'This cut is not between two cards, so there are no painted bounds to read and the ' +
+        'morph degrades to the cross-fade it is built on. Put it on a cut between two text ' +
+        'cards or two graphics to see it do its job.'));
+  } else if (tr.type === 'punch') {
+    body.appendChild(C({ path: 'params.amount', label: 'Zoom', type: 'range', min: 1, max: 3, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.hold', label: 'Hold', type: 'range', min: 0, max: 0.9, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.focusX', label: 'Focus X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.focusY', label: 'Focus Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.switchAt', label: 'Cut at', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 }));
+    body.appendChild(C({ path: 'params.blur', label: 'Blur', type: 'range', min: 0, max: 60, step: 1, unit: 'px' }));
+    body.appendChild(el('div', 'tc-hint',
+      'Both clips rush toward the focus point, the cut happens at the peak where the ' +
+      'movement hides it, and the incoming clip settles back. "Hold" is how much of the ' +
+      'window is spent at full zoom - it is what makes it read as an accent rather than a ' +
+      'slow push in and out.'));
   } else {
     const row = el('div', 'tc-row');
     row.appendChild(el('label', 'tc-label', 'Image'));
@@ -1582,6 +1842,8 @@ function renderTransitionPanel() {
       'changing how far it moves; fade in and out are fractions of the transition.'));
   }
 
+  body.appendChild(matchCutBar(r));
+
   // Curve + motion blur apply to every type.
   const curveRow = el('div', 'tc-row');
   curveRow.appendChild(el('label', 'tc-label', 'Curve'));
@@ -1604,7 +1866,10 @@ function renderTransitionPanel() {
   body.appendChild(C({ path: 'motionBlur.strength', label: 'MB strength', type: 'range', min: 0, max: 2, step: 0.05, digits: 2 }));
   body.appendChild(C({ path: 'motionBlur.samples', label: 'MB samples', type: 'range', min: 2, max: 32, step: 1 }));
   if (tr.type !== 'object') {
-    body.appendChild(el('div', 'tc-hint', 'Motion blur only moves the object layer, so it has no effect on this type.'));
+    body.appendChild(el('div', 'tc-hint',
+      'Motion blur only moves the object layer, so it has no effect on this type. The ' +
+      'travelling types have their own blur instead, because theirs moves the whole plate ' +
+      'and is far cheaper than averaging the shutter over it.'));
   }
 
   body.appendChild(transitionPresetBar(tr));
@@ -1645,7 +1910,7 @@ function renderInspector() {
     const cards = selectedTextClips();
     $('#textCardMeta').textContent = cards.length > 1
       ? cards.length + ' cards - editing all'
-      : fmtTc(textClip.start) + '  +' + (textClip.out - textClip.in).toFixed(2) + 's';
+      : fmtTc(textClip.start) + '  +' + clipLen(textClip).toFixed(2) + 's';
     $('#textCardMeta').title = cards.length > 1
       ? 'The panel shows the first card. Every change is applied to all ' +
         cards.length + ' selected cards; the wording and the word timings stay their own.'
@@ -1701,7 +1966,7 @@ function renderInspector() {
     '<b>Track</b><span>' + row.track.name + '</span>' +
     '<b>Source</b><span>' + source + '</span>' +
     '<b>Start</b><span>' + fmtTc(c.start) + '</span>' +
-    '<b>Length</b><span>' + fmtTc(c.out - c.in) + '</span>' +
+    '<b>Length</b><span>' + fmtTc(clipLen(c)) + '</span>' +
     (noClock ? '' : '<b>In / Out</b><span>' + fmtTc(c.in) + ' - ' + fmtTc(c.out) + '</span>') +
     (noClock ? '' : '<b>Linked</b><span>' + (c.linkId ? 'yes' : 'no') + '</span>') +
     // Screen telemetry is worth a line precisely because its ABSENCE is normal: an OBS
@@ -1754,6 +2019,10 @@ function renderInspector() {
   // effects say where it is and what happens to it afterwards.
   const gfx = graphicPanel(c);
   if (gfx) box.appendChild(gfx);
+  // Under the picture panels and above the keyframe strip: speed changes the clip's
+  // LENGTH, which every panel above it is measured against.
+  const spd = speedPanel(c);
+  if (spd) box.appendChild(spd);
   const fx = clipFxPanel(c);
   if (fx) box.appendChild(fx);
   const keys = clipKeyPanel(c);
@@ -2685,11 +2954,213 @@ function specForParam(def, key) {
  * makes the bake the single draw path a clip's framing is a constant in an ffmpeg crop.
  * Step 7's effect stack is what fills the registry.
  */
+/**
+ * Every clip a speed change applies to.
+ *
+ * The WHOLE link group, always. Speeding the picture and leaving its sound at 1x is not a
+ * thing anybody means, and the two would drift apart by the length of the ramp - so the
+ * unit of a speed edit is the A/V pair, exactly as it is for a trim or a move.
+ */
+function speedGroup(clip) {
+  return linkGroup(clip).filter((c) => Speed.canSpeed(c));
+}
+
+/**
+ * Speed: one constant rate, or a curve keyed in SOURCE time.
+ *
+ * The panel edits a DRAFT rather than the clip, because `clip.speed` must stay absent
+ * until the rate is actually changed - the same rule `clip.keys` lives by, and what keeps
+ * an untouched project serialising and hashing as it did before speed existed. The draft
+ * is written through to every clip in the link group, and pruned straight back off any
+ * clip it left saying nothing.
+ */
+function speedPanel(clip) {
+  if (!Speed.canSpeed(clip)) return null;
+  const el = TextUI.el;
+  const group = speedGroup(clip);
+  const cur = Speed.of(clip);
+  const ramped = Speed.ramped(clip);
+  const draft = {
+    rate: cur ? Speed.clampRate(cur.rate) : 1,
+    audio: cur && cur.audio === 'mute' ? 'mute' : 'pitch',
+  };
+
+  /** Write the draft onto the whole group, creating and pruning the block as needed. */
+  const apply = () => {
+    for (const c of group) {
+      const sp = Speed.ensure(c);
+      sp.rate = Speed.clampRate(draft.rate);
+      sp.audio = draft.audio;
+      Speed.normalize(c);
+      Speed.prune(c);
+    }
+    markDirty();
+  };
+
+  const hooks = {
+    onEdit: inspectorEdit,
+    onEditEnd: inspectorEditEnd,
+    // Changing the rate changes the clip's LENGTH, so the lanes and the ruler have to be
+    // rebuilt on every notch - but not the inspector, or the slider would be torn out of
+    // the DOM halfway through the drag it is in the middle of.
+    onChanged: () => {
+      apply();
+      renderLanes(); renderRuler(); renderPlayhead(); refreshCacheBands();
+      drawPreview();
+    },
+    rebuild: renderInspector,
+  };
+  const C = (spec) => TextUI.control(spec, draft, { rate: 1, audio: 'pitch' }, hooks);
+
+  /** A structural edit - a key, a preset - is one undo entry and a full rebuild. */
+  const edit = (fn) => {
+    pushUndo();
+    for (const c of group) { Speed.ensure(c); fn(c); Speed.normalize(c); Speed.prune(c); }
+    markDirty();
+    renderAll();
+  };
+
+  return TextUI.section('speed', 'Speed', (b) => {
+    b.appendChild(el('div', 'tc-hint',
+      'The rate curve is keyed in SOURCE time, so trimming slides the clip along the ' +
+      'footage without sliding the ramp along with it. The clip\u2019s timeline length is ' +
+      'the integral of the curve, which is why changing the rate moves everything after ' +
+      'it rather than leaving a hole.'));
+
+    if (!ramped) {
+      b.appendChild(C({
+        path: 'rate', label: 'Rate', type: 'range',
+        min: 0.1, max: 8, step: 0.01, digits: 2, unit: 'x',
+      }));
+      const presets = el('div', 'tc-row');
+      presets.appendChild(el('label', 'tc-label', 'Presets'));
+      const bar = el('div', 'tc-file');
+      for (const v of [0.25, 0.5, 1, 2, 4]) {
+        const btn = el('button', 'mini' + (Math.abs(draft.rate - v) < 1e-6 ? ' on' : ''), v + 'x');
+        btn.addEventListener('click', () => edit((c) => { c.speed.rate = v; c.speed.keys = []; }));
+        bar.appendChild(btn);
+      }
+      presets.appendChild(bar);
+      b.appendChild(presets);
+    }
+
+    b.appendChild(C({
+      path: 'audio', label: 'Audio', type: 'select',
+      options: ramped
+        ? [{ value: 'mute', label: 'Silenced (a ramp cannot be stretched)' }]
+        : Speed.AUDIO_MODES,
+    }));
+    if (ramped) {
+      b.appendChild(el('div', 'tc-hint',
+        'A RAMP silences the clip\u2019s own sound, in the preview and in the render alike. ' +
+        'ffmpeg\u2019s atempo takes one tempo, not a curve, so a ramped clip cannot be ' +
+        'pitch-corrected honestly - and a preview that played something the file will not ' +
+        'contain would be worse than silence.'));
+    }
+
+    // ---- the curve -------------------------------------------------------
+    const keys = (Speed.of(clip) && Speed.of(clip).keys) || [];
+    const list = el('div', 'fx-list');
+    keys.forEach((k, i) => {
+      const row = el('div', 'tc-row');
+      row.appendChild(el('label', 'tc-label',
+        'at ' + k.t.toFixed(2) + 's src'));
+      const box = el('div', 'tc-file');
+
+      const num = el('input', 'tc-num');
+      num.type = 'number'; num.step = '0.05'; num.min = String(Speed.MIN_RATE);
+      num.max = String(Speed.MAX_RATE); num.value = String(k.v);
+      num.title = 'Rate at this point in the source';
+      num.addEventListener('keydown', (e) => e.stopPropagation());
+      num.addEventListener('focus', () => pushUndo());
+      num.addEventListener('input', () => {
+        const v = parseFloat(num.value);
+        if (!isFinite(v)) return;
+        for (const c of group) {
+          const sp = Speed.ensure(c);
+          if (sp.keys[i]) sp.keys[i].v = Speed.clampRate(v);
+        }
+        markDirty();
+        renderLanes(); renderRuler(); drawPreview();
+      });
+      box.appendChild(num);
+
+      const ease = el('select', 'tc-sel');
+      for (const name of Object.keys(Anim.EASING_PRESETS)) {
+        const o = el('option', null, name);
+        o.value = name;
+        ease.appendChild(o);
+      }
+      ease.value = easingName(k.ease);
+      ease.addEventListener('change', () => edit((c) => {
+        if (c.speed.keys[i]) c.speed.keys[i].ease = Anim.cloneEasing(Anim.EASING_PRESETS[ease.value]);
+      }));
+      box.appendChild(ease);
+
+      const go = el('button', 'mini', 'Go');
+      go.title = 'Move the playhead to this point';
+      go.addEventListener('click', () => seek(clip.start + localOf(clip, k.t)));
+      box.appendChild(go);
+
+      const del = el('button', 'mini', '\u00d7');
+      del.title = 'Delete this key';
+      del.addEventListener('click', () => edit((c) => { c.speed.keys.splice(i, 1); }));
+      box.appendChild(del);
+
+      row.appendChild(box);
+      list.appendChild(row);
+    });
+    if (keys.length) b.appendChild(list);
+
+    const add = el('div', 'tc-row');
+    add.appendChild(el('label', 'tc-label', 'Ramp'));
+    const addBox = el('div', 'tc-file');
+    const addBtn = el('button', 'mini', 'Key the rate here');
+    addBtn.addEventListener('click', () => {
+      const local = clamp(state.playhead - clip.start, 0, clipLen(clip));
+      edit((c) => {
+        const t = srcAt(c, clamp(state.playhead - c.start, 0, clipLen(c)));
+        const v = c.speed.keys.length ? Speed.rateAt(c, t) : Speed.clampRate(c.speed.rate);
+        Anim.addKey(c.speed.keys, t, v, Anim.cloneEasing(Anim.EASING_PRESETS.easeInOut));
+      });
+      // The clip's length just changed under the playhead; keep it where it looked.
+      seek(clip.start + Math.min(local, clipLen(clip)));
+    });
+    addBox.appendChild(addBtn);
+    if (keys.length) {
+      const clear = el('button', 'mini', 'Clear the ramp');
+      clear.addEventListener('click', () => edit((c) => { c.speed.keys = []; }));
+      addBox.appendChild(clear);
+    }
+    add.appendChild(addBox);
+    b.appendChild(add);
+
+    const at = Speed.rateAt(clip, srcAt(clip, clamp(state.playhead - clip.start, 0, clipLen(clip))));
+    b.appendChild(el('div', 'tc-hint',
+      'Source ' + (clip.out - clip.in).toFixed(2) + 's \u2192 timeline ' +
+      clipLen(clip).toFixed(2) + 's. ' +
+      (Speed.has(clip) ? Speed.label(clip) + ', ' + at.toFixed(2) + 'x under the playhead. '
+        : 'No speed change. ') +
+      'A sped clip is always composited rather than handed to ffmpeg\u2019s fast chain.'));
+  });
+}
+
+/** The preset name an easing descriptor came from, for a select. */
+function easingName(e) {
+  if (!e) return 'easeInOut';
+  for (const [name, preset] of Object.entries(Anim.EASING_PRESETS)) {
+    if (JSON.stringify(preset) === JSON.stringify(e)) return name;
+  }
+  return 'linear';
+}
+
 function clipKeyPanel(clip) {
   if (!clip || isCanvasClip(clip)) return null;
   const props = Anim.clipPropsFor(clip);
   if (!props.length) return null;
-  const dur = clip.out - clip.in;
+  // Clip keys are timed in TIMELINE seconds from the clip's start, so under a ramp the
+  // strip spans the length the clip actually occupies rather than its source range.
+  const dur = clipLen(clip);
 
   const hooks = {
     dur,
@@ -3402,7 +3873,7 @@ function startMove(e, anchor) {
     const anchorMove = moving.find((m) => m.clip === anchor) || moving[0];
     if (anchorMove) {
       const raw = anchorMove.start0 + delta;
-      const len = anchor.out - anchor.in;
+      const len = clipLen(anchor);
       // Try both edges of the dragged clip and take whichever actually caught an edge,
       // nearest first. Comparing them by distance alone would let a MISS (which returns
       // the raw time, distance zero) beat a real snap and cancel it out.
@@ -3483,16 +3954,24 @@ function startTrim(e, anchor, edge) {
   const onMove = (ev) => {
     moved = true;
     const dt = (ev.clientX - startX) / state.pxPerSec;
+    // A trim is STATED in timeline seconds and APPLIED in source seconds. Under a ramp
+    // those differ by the rate at the edge being dragged, so the wanted timeline length
+    // is converted through Speed rather than added to `in`/`out` directly.
+    // `0 <= in < out <= mediaDuration` still holds - in source time, exactly as before.
     for (const o of orig) {
+      o.c.in = o.in; o.c.out = o.out; o.c.start = o.start;   // measure against the original
+      const len0 = clipLen(o.c);
+      const end0 = o.start + len0;
       if (edge === 'in') {
+        // Head trim: the clip's END is fixed, so the wanted length decides the in-point.
         const rawStart = snapTime(o.start + dt, snaps);
-        const d = clamp(rawStart - o.start, -o.in, (o.out - o.in) - 0.05);
-        o.c.in = o.in + d;
-        o.c.start = Math.max(0, o.start + d);
+        const wanted = Math.max(0.05, end0 - Math.max(0, rawStart));
+        o.c.in = clamp(Speed.retreat(o.c, o.out, wanted), 0, o.out - 0.001);
+        o.c.start = Math.max(0, end0 - clipLen(o.c));
       } else {
-        const rawEnd = snapTime(o.start + (o.out - o.in) + dt, snaps);
-        const d = clamp(rawEnd - (o.start + (o.out - o.in)), -((o.out - o.in) - 0.05), o.c.mediaDuration - o.out);
-        o.c.out = o.out + d;
+        const rawEnd = snapTime(end0 + dt, snaps);
+        const wanted = Math.max(0.05, rawEnd - o.start);
+        o.c.out = clamp(Speed.advance(o.c, o.in, wanted), o.in + 0.001, o.c.mediaDuration);
       }
     }
     renderLanes(); renderRuler(); renderPlayhead();
@@ -4002,15 +4481,69 @@ function drawPreview() {
  * handles either side of the cut).
  */
 function clipFrameAt(clip, atTime, name, P) {
+  return transPlate(clip, atTime, name, P.w, P.h, state.out.fps);
+}
+
+/**
+ * One side of a transition, framed to WxH on black, or null when it has no picture yet.
+ *
+ * The preview and the transition baker both call it, which is what keeps a transition's
+ * two halves identical in the viewer and in the file. A CANVAS clip is painted rather
+ * than decoded - a cut between two title cards is a cut like any other, and until this
+ * existed a transition on one showed black on both sides. That is also what makes the
+ * morph type mean anything: the thing it morphs is usually a card.
+ */
+function transPlate(clip, atTime, name, W, H, fps) {
+  const cv = transSurface(name, W, H);
+  const c2 = cv.getContext('2d');
+  const paint = () => {
+    c2.setTransform(1, 0, 0, 1, 0, 0);
+    c2.globalCompositeOperation = 'source-over';
+    c2.globalAlpha = 1;
+    c2.filter = 'none';
+    c2.fillStyle = '#000';
+    c2.fillRect(0, 0, W, H);
+  };
+  if (isCanvasClip(clip)) {
+    paint();
+    CANVAS_PAINTERS[clip.kind].draw(c2, clip, W, H, atTime - clip.start, 1 / (fps || 30));
+    heldFrames[name] = clip.id;
+    return cv;
+  }
   const el = mediaFor(clip);
   if (!frameReady(el)) return null;
-  const cv = transSurface(name, P.w, P.h);
-  const c2 = cv.getContext('2d');
-  c2.fillStyle = '#000';
-  c2.fillRect(0, 0, P.w, P.h);
-  drawClip(clip, el, c2);
+  paint();
+  drawClipTo(clip, el, c2, W, H);
   heldFrames[name] = clip.id;
   return cv;
+}
+
+/**
+ * A canvas clip's painted box at `atTime`, in NORMALISED frame coordinates - what the
+ * morph carries one side onto the other by. Null for anything that fills the frame.
+ */
+const boxProbe = document.createElement('canvas');
+function transBox(clip, atTime, W, H) {
+  if (!isCanvasClip(clip)) return null;
+  const P = CANVAS_PAINTERS[clip.kind];
+  if (!P || !P.animatedBounds) return null;
+  if (boxProbe.width !== W || boxProbe.height !== H) { boxProbe.width = W; boxProbe.height = H; }
+  const t = atTime - clip.start;
+  let b = null;
+  try { b = P.animatedBounds(boxProbe.getContext('2d'), clip, W, H, 1 / 30, t, t); } catch (e) { b = null; }
+  if (!b || !(b.w > 0) || !(b.h > 0)) return null;
+  return { x: b.x / W, y: b.y / H, w: b.w / W, h: b.h / H };
+}
+
+/**
+ * The boxes a morph needs, computed once for both the preview and the bake.
+ *
+ * Only the morph reads them and measuring costs a bounds sweep per side, so nothing else
+ * pays for them.
+ */
+function transitionBoxes(r, t, W, H) {
+  if (!r || !r.tr || r.tr.type !== 'morph') return null;
+  return { a: transBox(r.a, t, W, H), b: transBox(r.b, t, W, H) };
 }
 
 /**
@@ -4043,8 +4576,8 @@ function transSurface(name, w, h) {
 /** Where in each clip's source a transition samples at timeline time `t`. */
 function transitionSourceTimes(r, t) {
   return {
-    a: clamp(r.a.in + (t - r.a.start), 0, Math.max(0, r.a.mediaDuration - 0.03)),
-    b: clamp(r.b.in + (t - r.b.start), 0, Math.max(0, r.b.mediaDuration - 0.03)),
+    a: clamp(srcAt(r.a, t - r.a.start), 0, Math.max(0, r.a.mediaDuration - 0.03)),
+    b: clamp(srcAt(r.b, t - r.b.start), 0, Math.max(0, r.b.mediaDuration - 0.03)),
   };
 }
 
@@ -4061,7 +4594,8 @@ function drawTransitionFrame(r, P) {
   const cctx = cache.getContext('2d');
   cctx.fillStyle = '#000';
   cctx.fillRect(0, 0, P.w, P.h);
-  Trans.draw(cctx, P.w, P.h, r.tr, p, aImg, bImg, 1 / state.out.fps);
+  Trans.draw(cctx, P.w, P.h, r.tr, p, aImg, bImg, 1 / state.out.fps,
+    transitionBoxes(r, state.playhead, P.w, P.h));
   ctx.drawImage(cache, 0, 0);
   frameCacheValid = true;
   return true;
@@ -4129,7 +4663,8 @@ function syncMedia() {
       if (!live) { if (el && !el.paused) el.pause(); continue; }
       const m = mediaFor(clip);
       m.muted = true;                       // the band already carries this mix
-      const target = clip.in + (state.playhead - clip.start);
+      const target = srcAt(clip, state.playhead - clip.start);
+      applyPlaybackRate(clip, m);
       if (state.playing) {
         if (!m.seeking && Math.abs(m.currentTime - target) > 0.3) m.currentTime = target;
         if (m.paused) m.play().catch(() => {});
@@ -4188,7 +4723,9 @@ function syncMedia() {
       // arrives meant every cut started on an empty, still-loading video element.
       if (!el && clip.start > state.playhead && clip.start - state.playhead < PRELOAD_AHEAD) {
         const warm = mediaFor(clip);
-        const seed = () => { try { warm.currentTime = clip.in; } catch (e) {} };
+        const seed = () => {
+          try { warm.currentTime = clip.in; applyPlaybackRate(clip, warm); } catch (e) {}
+        };
         if (warm.readyState >= 1) seed();
         else warm.addEventListener('loadedmetadata', seed, { once: true });
       } else if (el) {
@@ -4199,8 +4736,9 @@ function syncMedia() {
       continue;
     }
 
-    const target = clip.in + (state.playhead - clip.start);
+    const target = srcAt(clip, state.playhead - clip.start);
     const m = mediaFor(clip);
+    applyPlaybackRate(clip, m);
     if (clip.kind === 'audio') applyPreviewMix(clip, m, track.muted);
     // Never stack a seek on top of one still in flight - that kept readyState pinned low.
     if (state.playing) {
@@ -4486,10 +5024,15 @@ function splitAtPlayhead() {
       if (t <= c.start + 0.02 || t >= clipEnd(c) - 0.02) continue;
       if (sel && !sel.includes(c)) continue;
       const offset = t - c.start;
+      // The cut is a TIMELINE time; where it lands in the source is the speed map's
+      // answer. Both halves keep the whole rate curve - it is keyed in ABSOLUTE source
+      // time, so each half reads the part of it covering its own range and the two
+      // together play exactly what the one clip did.
+      const srcCut = srcAt(c, offset);
       const right = Object.assign({}, c, {
         id: nextId(),
         start: t,
-        in: c.in + offset,
+        in: srcCut,
         linkId: c.linkId ? c.linkId + '_r' + Math.random().toString(36).slice(2, 5) : null,
       });
       // `Object.assign` is shallow, so both halves would otherwise SHARE the one object
@@ -4499,7 +5042,8 @@ function splitAtPlayhead() {
         const field = CANVAS_PAINTERS[c.kind].defField;
         if (c[field]) right[field] = JSON.parse(JSON.stringify(c[field]));
       }
-      c.out = c.in + offset;
+      if (c.speed) right.speed = JSON.parse(JSON.stringify(c.speed));
+      c.out = srcCut;
       track.clips.push(right);
       did = true;
     }
@@ -4751,23 +5295,24 @@ function removeTimelineSpan(a, b, cutIds) {
         const right = Object.assign({}, c, {
           id: nextId(),
           start: a,
-          in: c.in + (b - s),
+          in: srcAt(c, b - s),
           out: c.out,
         });
+        if (c.speed) right.speed = JSON.parse(JSON.stringify(c.speed));
         // Both halves of a cut pair must stay linked to their opposite numbers, or the
         // next drag moves the picture without the sound.
         if (c.linkId) {
           if (!relink.has(c.linkId)) relink.set(c.linkId, nextId());
           right.linkId = relink.get(c.linkId);
         }
-        c.out = c.in + (a - s);
+        c.out = srcAt(c, a - s);
         kept.push(c);
         kept.push(right);
       } else if (s < a - E) {
-        c.out = c.in + (a - s);                                       // trim the tail off
+        c.out = srcAt(c, a - s);                                      // trim the tail off
         kept.push(c);
       } else {
-        c.in += (b - s);                                              // trim the head off
+        c.in = srcAt(c, b - s);                                       // trim the head off
         c.start = a;
         kept.push(c);
       }
@@ -5386,12 +5931,16 @@ function trimToPlayhead(edge) {
   pushUndo();
   for (const { clip } of sel) {
     for (const c of linkGroup(clip)) {
+      // Same two domains as `startTrim()`: the playhead states a timeline length, and
+      // Speed turns it into the source point that produces it.
+      const end0 = clipEnd(c);
       if (edge === 'in') {
-        const d = clamp(state.playhead - c.start, -c.in, (c.out - c.in) - 0.05);
-        c.in += d; c.start = Math.max(0, c.start + d);
+        const wanted = Math.max(0.05, end0 - state.playhead);
+        c.in = clamp(Speed.retreat(c, c.out, wanted), 0, c.out - 0.001);
+        c.start = Math.max(0, end0 - clipLen(c));
       } else {
-        const d = clamp(state.playhead - clipEnd(c), -((c.out - c.in) - 0.05), c.mediaDuration - c.out);
-        c.out += d;
+        const wanted = Math.max(0.05, state.playhead - c.start);
+        c.out = clamp(Speed.advance(c, c.in, wanted), c.in + 0.001, c.mediaDuration);
       }
     }
   }
@@ -6101,6 +6650,10 @@ async function openProject(filePath) {
       Graphics.normalizeClip(c);
       Tracker.normalizeClip(c);
       MagicMask.normalizeClip(c);
+      // Clamp a hand-edited or out-of-range rate curve, and drop a speed block that no
+      // longer says anything, so an old project keys exactly as an untouched one does.
+      Speed.normalize(c);
+      Speed.prune(c);
       // 'contain' or absent, and nothing else: an unknown value from a hand-edited or
       // newer file would fall through every branch of drawClipTo() as 'crop' anyway, so
       // it is normalised away rather than carried around meaning nothing.
@@ -6153,8 +6706,21 @@ function buildJob(outPath, range) {
         src: c.src,
         kind: c.kind,
         start: Math.max(0, c.start - r.from),
-        in: c.in + headCut,
-        out: c.out - tailCut,
+        // The range crops in TIMELINE seconds; where those land in the source is the
+        // speed map's answer, so a ranged render of a ramped clip starts on the frame
+        // the playhead was showing rather than `headCut` seconds into the footage.
+        in: srcAt(c, headCut),
+        out: srcAt(c, clipLen(c) - tailCut),
+        // How much timeline this entry occupies. Equal to `out - in` for everything
+        // that is not sped, which is what keeps the emitted arguments byte-identical.
+        // Taken from the cropped in/out for an unsped clip rather than computed a
+        // second way, so it is the SAME float `out - in` has always been and the emitted
+        // argument string is byte-identical to the pre-speed one.
+        len: Speed.has(c) ? Math.max(0, clipLen(c) - headCut - tailCut)
+          : Math.max(0, (c.out - tailCut) - (c.in + headCut)),
+        speed: Speed.digest(c),
+        speedAudio: Speed.has(c) ? Speed.audioMode(c) : undefined,
+        rate: Speed.has(c) ? Speed.constantRate(c) : undefined,
         panX: c.panX, panY: c.panY, zoom: c.zoom,
         volume: c.volume,
         // The audio chain and the track it sits on. `trackId` is what a ducking effect
@@ -6213,6 +6779,7 @@ function buildJob(outPath, range) {
           start: Math.max(0, from - r.from),
           in: 0,
           out: to - from,
+          len: to - from,
           panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
           visible: true,
           audible: false,
@@ -6367,7 +6934,7 @@ function jobCacheKey(job) {
     if (c.transRef) {
       // Everything a transition's pixels depend on: its settings and both clips' framing.
       const framing = (x) => ({ src: x.src, in: x.in, start: x.start, out: x.out,
-        panX: x.panX, panY: x.panY, zoom: x.zoom });
+        panX: x.panX, panY: x.panY, zoom: x.zoom, speed: Speed.digest(x) });
       e.trans = c.transRef.tr;
       e.transA = framing(c.transRef.a);
       e.transB = framing(c.transRef.b);
@@ -6428,7 +6995,7 @@ async function bakeTransitions(job) {
   const bctx = bCv.getContext('2d');
 
   const totalFrames = entries.reduce(
-    (n, e) => n + Math.max(1, Math.round((e.out - e.in) * job.fps)), 0);
+    (n, e) => n + Math.max(1, Math.round(jobLen(e) * job.fps)), 0);
   let done = 0;
 
   try {
@@ -6436,7 +7003,7 @@ async function bakeTransitions(job) {
       const r = e.transRef;
       if (r.tr.type === 'object') await Trans.loadImage(r.tr.params.src);
 
-      const frames = Math.max(1, Math.round((e.out - e.in) * job.fps));
+      const frames = Math.max(1, Math.round(jobLen(e) * job.fps));
       const aEl = mediaFor(r.a);
       const bEl = mediaFor(r.b);
       aEl.muted = bEl.muted = true;
@@ -6460,15 +7027,22 @@ async function bakeTransitions(job) {
       for (let i = 0; i < frames; i++) {
         const t = r.from + e.tStart + i / job.fps;
         const st = transitionSourceTimes(r, t);
-        await Promise.all([seekMedia(aEl, st.a), seekMedia(bEl, st.b)]);
+        await Promise.all([
+          isCanvasClip(r.a) ? Promise.resolve() : seekMedia(aEl, st.a),
+          isCanvasClip(r.b) ? Promise.resolve() : seekMedia(bEl, st.b),
+        ]);
 
+        // The same plate function the viewer uses, so a transition's two halves are the
+        // same pixels in the preview and in the file - cards included.
         let aImg = null, bImg = null;
-        if (aEl.readyState >= 2 && aEl.videoWidth) {
+        if (isCanvasClip(r.a)) aImg = transPlate(r.a, t, 'bakeA', job.width, job.height, job.fps);
+        else if (aEl.readyState >= 2 && aEl.videoWidth) {
           actx.fillStyle = '#000'; actx.fillRect(0, 0, job.width, job.height);
           drawClipTo(r.a, aEl, actx, job.width, job.height);
           aImg = aCv;
         }
-        if (bEl.readyState >= 2 && bEl.videoWidth) {
+        if (isCanvasClip(r.b)) bImg = transPlate(r.b, t, 'bakeB', job.width, job.height, job.fps);
+        else if (bEl.readyState >= 2 && bEl.videoWidth) {
           bctx.fillStyle = '#000'; bctx.fillRect(0, 0, job.width, job.height);
           drawClipTo(r.b, bEl, bctx, job.width, job.height);
           bImg = bCv;
@@ -6477,7 +7051,8 @@ async function bakeTransitions(job) {
         fctx.fillStyle = '#000';
         fctx.fillRect(0, 0, job.width, job.height);
         const p = (e.tStart + i / job.fps) / Math.max(0.001, r.dur);
-        Trans.draw(fctx, job.width, job.height, r.tr, p, aImg, bImg, 1 / job.fps);
+        Trans.draw(fctx, job.width, job.height, r.tr, p, aImg, bImg, 1 / job.fps,
+          transitionBoxes(r, t, job.width, job.height));
 
         batch.set(fctx.getImageData(0, 0, job.width, job.height).data, inBatch * frameBytes);
         inBatch++;
@@ -6548,7 +7123,23 @@ async function bakeTransitions(job) {
  * build does not know, is not an effect - `FX.active()` decides, so the answer here and
  * the answer the draw path gives can never disagree.
  */
+/**
+ * How much TIMELINE a job entry occupies.
+ *
+ * `out - in` for everything that is not sped, and the entry carries `len` explicitly
+ * either way - the fallback is for a job built before this field existed (a preset, a
+ * cached key read back off disk) rather than for anything the app writes today.
+ */
+function jobLen(e) {
+  return e && e.len != null ? e.len : (e.out - e.in);
+}
+
 function clipNeedsBake(c) {
+  // A speed ramp disqualifies the fast path. ffmpeg's trim/setpts chain can express a
+  // CONSTANT rate and nothing else, and a chain that is right for half the settings is
+  // exactly the preview/export drift step 6 exists to end - so any rate other than 1
+  // goes through the baker, where the speed map is the same function the viewer uses.
+  if (Speed.has(c)) return true;
   // A 'contain' still is transparent around its edges, which ffmpeg's crop-and-fill chain
   // cannot express - it would scale the picture up to fill the frame and crop it, which
   // is the opposite of what the mode says. So it composites, exactly as an effect does.
@@ -6560,7 +7151,7 @@ function clipNeedsBake(c) {
 function transitionWindows(job) {
   return job.clips
     .filter((c) => c.kind === 'trans')
-    .map((c) => ({ from: job.rangeFrom + c.start, to: job.rangeFrom + c.start + (c.out - c.in) }));
+    .map((c) => ({ from: job.rangeFrom + c.start, to: job.rangeFrom + c.start + jobLen(c) }));
 }
 
 /** Would the frame at `t` have to be composited, rather than overlaid by ffmpeg? */
@@ -6656,7 +7247,7 @@ async function bakeComposite(job) {
         const el = mediaFor(c);
         if (el.tagName === 'IMG') return Promise.resolve();
         el.muted = true;
-        return seekMedia(el, clamp(c.in + (t - c.start), 0, Math.max(0, c.mediaDuration - 0.03)));
+        return seekMedia(el, clamp(srcAt(c, t - c.start), 0, Math.max(0, c.mediaDuration - 0.03)));
       }));
 
       compositeLayers(fctx, job.width, job.height, layers, t,
@@ -6698,7 +7289,7 @@ async function bakeComposite(job) {
   for (const e of job.clips) {
     if (!e.visible || e.kind === 'baked' || e.kind === 'trans') continue;
     const a = job.rangeFrom + e.start;
-    if (covered(a, a + (e.out - e.in))) {
+    if (covered(a, a + jobLen(e))) {
       e.visible = false;
       // Its card or graphic is in the composite already; nothing is left to bake for it.
       for (const k of Object.keys(CANVAS_PAINTERS)) delete e[CANVAS_PAINTERS[k].ref];
@@ -6766,7 +7357,7 @@ async function bakeTextClips(job) {
   const sctx = scratch.getContext('2d');
 
   const totalFrames = entries.reduce(
-    (n, e) => n + Math.max(1, Math.round((e.out - e.in) * job.fps)), 0);
+    (n, e) => n + Math.max(1, Math.round(jobLen(e) * job.fps)), 0);
   let done = 0;
 
   for (const e of entries) {
@@ -6774,7 +7365,7 @@ async function bakeTextClips(job) {
     const clip = e[P.ref];
     // Only scan the part of the card or graphic this job actually shows.
     const scanFrom = e.tStart || 0;
-    const scanTo = scanFrom + (e.out - e.in);
+    const scanTo = scanFrom + jobLen(e);
     const bounds = P.animatedBounds(sctx, clip, job.width, job.height,
       1 / Math.min(job.fps, 20), scanFrom, scanTo);
     const cv = document.createElement('canvas');
@@ -7322,7 +7913,7 @@ function trkQuality(tex) {
  * look, drag it onto the feature, THEN solve. The button that solves says so.
  */
 async function addTracker(clip, fx, fy) {
-  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
   const p = trkSourcePoint(clip, fx, fy);
   const scored = await trkScorePoint(clip, tSrc, p.x, p.y);
   pushUndo();
@@ -7386,9 +7977,9 @@ FX.setBinder((clip, bind, tLocal, W, H) => {
   const owner = bindOwner(clip, bind);
   if (!owner) return null;
   const A = (Number(W) || 9) / (Number(H) || 16);
-  if (owner === clip) return Tracker.bindPos(clip, bind, clip.in + tLocal, A, tLocal);
+  if (owner === clip) return Tracker.bindPos(clip, bind, srcAt(clip, tLocal), A, tLocal);
   // Across clips: this clip's local time -> the timeline -> the owner's source time.
-  const tOwner = owner.in + ((clip.start + tLocal) - owner.start);
+  const tOwner = srcAt(owner, (clip.start + tLocal) - owner.start);
   return Tracker.bindPos(owner, bind, tOwner, A, tLocal);
 });
 
@@ -7398,10 +7989,10 @@ function trackMarkers() {
   const out = [];
   for (const c of sel) {
     const tLocal = state.playhead - c.start;
-    if (tLocal < -1e-6 || tLocal > (c.out - c.in) + 1e-6) continue;
+    if (tLocal < -1e-6 || tLocal > clipLen(c) + 1e-6) continue;
     const m = Tracker.frameMap(c, state.out.w / state.out.h);
     for (const tk of c.tracks) {
-      const s = Tracker.sampleAt(tk, c.in + tLocal);
+      const s = Tracker.sampleAt(tk, srcAt(c, tLocal));
       if (!s) continue;
       const p = m(s.x, s.y);
       out.push({ clip: c, track: tk, x: p.x, y: p.y, c: s.c });
@@ -7524,7 +8115,7 @@ canvas.addEventListener('pointerup', (e) => {
  */
 async function reanchorTracker(clip, track, fx, fy) {
   const wasSolved = Tracker.isSolved(track);
-  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
   const p = trkSourcePoint(clip, fx, fy);
   const scored = await trkScorePoint(clip, tSrc, p.x, p.y);
   pushUndo();
@@ -7550,7 +8141,7 @@ async function reanchorTracker(clip, track, fx, fy) {
  */
 function fixTrackerHere(clip, track, fx, fy) {
   const p = trkSourcePoint(clip, fx, fy);
-  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
   pushUndo();
   Tracker.fixPointAt(track, tSrc, p.x, p.y);
   Tracker.normalizeClip(clip);
@@ -8135,7 +8726,7 @@ async function mmLive(clip, mask, force) {
   const el = mediaFor(clip);
   if (!el || (Mask.busy && !force)) return null;
   const t0 = performance.now();
-  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
   const { aw, ah } = mmSize(clip, mask);
   const img = await trkFrame(el, tSrc, aw, ah);
   if (!img) return null;
@@ -8194,7 +8785,7 @@ async function mmTestFrame(clip, mask) {
     setStatus('Paint a stroke first - a test needs something to cut from.', 'err');
     return null;
   }
-  const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
   if (!MagicMask.promptsAt(mask, tSrc, 100, 100).length) {
     const at = MagicMask.anchorFor(mask, tSrc);
     setStatus('No strokes on this frame. Scrub to ' + (at == null ? 'a painted frame' :
@@ -8295,7 +8886,7 @@ canvas.addEventListener('pointerdown', (e) => {
     .filter((c) => c.kind === 'video' && MagicMask.hasMasks(c))
     .find((c) => {
       const l = state.playhead - c.start;
-      return l >= -1e-6 && l <= (c.out - c.in) + 1e-6;
+      return l >= -1e-6 && l <= clipLen(c) + 1e-6;
     });
   if (!clip) return;
   const mask = mmActive(clip);
@@ -8314,7 +8905,7 @@ canvas.addEventListener('pointerdown', (e) => {
     // change halfway through a drag would give a single stroke two meanings.
     clip, mask, sign: e.altKey ? -Mask.sign : Mask.sign,
     pts: [s.x, s.y],
-    t: clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out),
+    t: clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out),
   };
   try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
 }, true);
@@ -8365,10 +8956,10 @@ function drawMaskOverlay(c, W, H) {
     .filter((x) => x.kind === 'video' && MagicMask.hasMasks(x));
   for (const clip of sel) {
     const local = state.playhead - clip.start;
-    if (local < -1e-6 || local > (clip.out - clip.in) + 1e-6) continue;
+    if (local < -1e-6 || local > clipLen(clip) + 1e-6) continue;
     const mask = mmActive(clip);
     if (!mask) continue;
-    const tSrc = clip.in + local;
+    const tSrc = srcAt(clip, local);
     const map = Tracker.frameMap(clip, W / Math.max(1, H));
     const eps = 1 / (2 * (mask.rate || MagicMask.DEFAULTS.rate));
 
@@ -8605,7 +9196,7 @@ function maskPanel(clip) {
     clr.title = 'Removes the strokes painted on the frame at the playhead, and nothing else.';
     clr.disabled = Mask.busy;
     clr.addEventListener('click', () => {
-      const tSrc = clamp(clip.in + (state.playhead - clip.start), clip.in, clip.out);
+      const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
       pushUndo();
       const gone = MagicMask.clearStrokesAt(mask, tSrc);
       MagicMask.normalizeClip(clip);
@@ -8994,7 +9585,7 @@ function clipTelemetry(clip) {
  */
 function clipCursorAt(clip, tLocal) {
   const t = clipTelemetry(clip);
-  return t ? ScreenTel.cursorAt(t, clip.in + tLocal) : null;
+  return t ? ScreenTel.cursorAt(t, srcAt(clip, tLocal)) : null;
 }
 
 /**

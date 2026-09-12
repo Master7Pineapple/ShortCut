@@ -147,8 +147,12 @@ There are twenty-eight suites:
   pixels the preview canvas painted. It needs **no fixture**: every frame is painted by the
   suite.
 - `tools/smoke-transitions.js` — transitions: finding cuts, the fast grab, length and
-  alignment, all three types drawing correctly, the render job, an end-to-end ffmpeg
-  render read back from the MP4, and presets.
+  alignment, the original three types drawing correctly, the render job, an end-to-end
+  ffmpeg render read back from the MP4, and presets. It predates step 15 and does not
+  cover the six types added there, nor speed - **no suite does**, deliberately: step 15
+  shipped without one at the owner's call, so the six new types, the speed map and the
+  match-cut slip are the one part of this codebase with no automated coverage. Treat that
+  as a debt, not as a precedent.
 - `tools/smoke-previewrender.js` — preview renders: that the file lands in the app cache
   and not the user's folders, that the **viewer actually decodes it** instead of
   compositing, that the source clips fall silent underneath it, and that the span and its
@@ -370,7 +374,8 @@ src/renderer/track-worker.js  its message loop; concatenated onto track.js into 
 src/renderer/text/model.js  text cards: defaults, animation layers, how they compose with keys
 src/renderer/text/draw.js   text cards: all canvas painting (preview AND export)
 src/renderer/text/ui.js     text cards: the editor panel
-src/renderer/transitions.js transitions: every pixel of all three types (preview AND export)
+src/renderer/speed.js     the speed map: source time <-> timeline time, and its integral
+src/renderer/transitions.js transitions: every pixel of all nine types (preview AND export)
 src/renderer/waveform.js  audio peaks: decode once per file, draw a slice per clip
 src/renderer/quickbin.js  the QuickBin: a media library kept in userData, not in the project
 src/screen.js             screen telemetry: the sidecar shape, alignment, normalisation
@@ -444,7 +449,10 @@ Clip = {
   id, src,               // absolute path to the media file; null for text cards
   name, kind: 'video' | 'audio' | 'text' | 'image' | 'graphic',
   start,                 // position on the timeline, seconds
-  in, out,               // source in/out points, seconds; length = out - in
+  in, out,               // source in/out points, seconds
+                         //   TIMELINE length is `Speed.timelineLen(clip)`, which is
+                         //   `out - in` unless the clip carries a speed ramp
+  speed,                 // optional { rate, audio, keys }; ABSENT until the rate changes
   mediaDuration,         // full length of the source, the ceiling for `out`
   srcW, srcH, fps,
   panX, panY,            // 0..1 crop position within the source
@@ -481,7 +489,13 @@ Clip = {
 
 Invariants worth preserving when you change things:
 
-- `0 <= in < out <= mediaDuration`, and clip length is always `out - in`.
+- `0 <= in < out <= mediaDuration`. This still holds, in **source** time — but clip
+  length is **no longer** `out - in`. Since speed (step 15) a clip lives in two time
+  domains and three helpers in `app.js` are the only place the split is expressed:
+  `clipLen(c)` (timeline seconds), `srcAt(c, tLocal)` (timeline-local → absolute source)
+  and `localOf(c, tSrc)` (the inverse). Anything computing `in + (t - start)` or
+  `out - in` by hand is a bug waiting for the first ramped clip. With no speed on the clip
+  all three are arithmetically identical to the expressions they replaced. See "Speed".
 - Importing a video **with** audio creates **two** clips — a video clip on V1 and an
   audio clip on A1 sharing a fresh `linkId`. Video clips never carry audio in preview or
   render; all sound comes from clips on audio tracks. This keeps preview and ffmpeg
@@ -598,10 +612,15 @@ ffmpeg can build *identically* and far faster still goes down the old chain. A s
 on the fast path when **both** of these hold:
 
 1. at most **one** picture clip (`kind:'video'` or `kind:'image'`) is visible across it;
-2. **no** clip contributing to it carries a live effect (`FX.active(clip)` is empty).
+2. **no** clip contributing to it carries a live effect (`FX.active(clip)` is empty);
+3. **no** clip contributing to it carries a speed change (`Speed.has(clip)` is false).
 
 Anything else bakes. In practice that means real alpha compositing — two or more pictures
-stacked — or any effect at all. `clipNeedsBake()` asks `FX.active()` rather than reading
+stacked — any effect at all, or any rate other than 1x. Speed is on that list for the
+same reason an effect is: ffmpeg's `trim`/`setpts` chain can express a *constant* rate and
+nothing else, and a chain that is right for half the settings is exactly the preview/export
+drift step 6 exists to end. The baker seeks to `srcAt()` for every frame, which is the same
+function the viewer uses, so a ramp is correct by construction rather than by agreement. `clipNeedsBake()` asks `FX.active()` rather than reading
 `clip.fx` itself, so a bypassed effect, or one of a type this build does not know, leaves
 the clip on the fast path — and the answer it gives can never disagree with the answer
 the draw path gives, because they are the same call.
@@ -3270,6 +3289,97 @@ Entries live under `userData/cache/text/` with a `manifest.json` marking them co
 (a half-written sequence is never reused). The cache is pruned oldest-first once it passes
 ~1.5 GB, and the Render panel has a **Clear cache** button plus a size readout.
 
+### Speed
+
+A video or audio clip can carry `clip.speed = { rate, audio, keys }`. It is **absent**
+until the rate is actually changed - the rule `clip.keys` lives by, and what keeps an
+untouched project serialising and hashing exactly as it did before speed existed. Setting
+the rate back to 1 prunes the block straight off again.
+
+#### The two time domains
+
+Before speed there was one: a clip occupied `out - in` seconds of timeline, and the source
+time under timeline time `t` was `in + (t - start)`. That single sentence was written
+inline in about thirty places - trimming, splitting, snapping, transitions, the tracker,
+the mask, the cursor overlays, the baker and `buildArgs()`. Speed ends it, and `Speed`
+(`src/renderer/speed.js`) plus three one-line helpers in `app.js` are the only place the
+split is now expressed:
+
+| helper | direction |
+| --- | --- |
+| `clipLen(c)` | how many **timeline** seconds the clip occupies |
+| `srcAt(c, tLocal)` | timeline-local seconds → absolute **source** seconds |
+| `localOf(c, tSrc)` | absolute source seconds → timeline-local seconds |
+
+With no speed on the clip all three short-circuit before they touch an integration table
+and are arithmetically identical to the expressions they replaced — which is why an unsped
+project emits byte-identical ffmpeg arguments and hashes to the same render-cache key.
+
+#### Which domain the curve lives in
+
+The rate curve is keyed in **absolute source time**, not in timeline time and not relative
+to the in-point. Two reasons, both load-bearing:
+
+1. **Timeline length is the integral of the curve.** Keying the curve in timeline time
+   would define the length in terms of a domain whose size *is* the length. Source time is
+   the free variable; the timeline length falls out of it.
+2. **Trimming must not slide the ramp along the footage.** A slow-motion moment belongs to
+   a moment in the *recording*, so it is addressed by its time in the recording. Move the
+   in-point and the ramp stays on the frames it was put on. It is also what lets a split
+   hand both halves the same curve and have them play exactly what the one clip did.
+
+#### The integral, and its exact inverse
+
+Timeline length is the integral of `1/rate` over the source range, evaluated by trapezoid
+on a **fixed** grid of `Speed.STEP` (1/240 s) source seconds. Fixed, because the preview
+and the export must agree to the sample: a grid that depended on the clip's length or on
+the output fps would give the viewer and the file two different lengths.
+
+The inverse solves the same trapezoid exactly - one quadratic per step - so
+`localOf(srcAt(t)) === t` to floating point. That round trip is what makes a split at the
+playhead land on the frame the playhead was showing. The cumulative tables are cached in
+the module, keyed by the curve and the source length; **nothing** non-serialisable is
+stored on the clip.
+
+#### Trimming, splitting, snapping
+
+A trim is *stated* in timeline seconds and *applied* in source seconds, so `startTrim()`
+and `trimToPlayhead()` convert the wanted timeline length through `Speed.advance()` (tail,
+the in-point is fixed) or `Speed.retreat()` (head, the **end** is fixed) rather than adding
+a delta to `in`/`out`. Splitting converts the cut through `srcAt()` and hands both halves
+the curve. Snapping needed no change at all beyond `clipEnd()` - which is the point of
+routing everything through one helper.
+
+#### Audio
+
+- A **constant** rate is pitch-corrected with `atempo`, chained because one instance only
+  accepts 0.5–100 (two at 0.5 give 0.25, and so on down). The preview matches with
+  `playbackRate` plus `preservesPitch`.
+- A **ramp** is silenced, in the preview and in the render alike. `atempo` takes one tempo,
+  not a curve, and there is no honest way to time-stretch audio along one in a single
+  pass. The inspector says so, and the preview mutes the same clip - a preview that played
+  something the file will not contain would be worse than silence. `volume=0` rather than
+  dropping the stream keeps the mix's input count, and therefore the graph's shape,
+  unchanged.
+
+A speed edit applies to the whole **link group**, always. Speeding the picture and leaving
+its sound at 1x is not a thing anybody means, and the two would drift apart by the length
+of the ramp.
+
+#### In the preview, and in the render
+
+The preview sets `el.playbackRate` from the curve each frame and lets `currentTime` track
+`srcAt()` on its own instead of re-seeking. A ramp drifts a little between rate changes -
+the element interpolates linearly where the curve bends - and `syncMedia()`'s existing
+0.3 s threshold pulls it back. The **export** has no such approximation: a sped clip is
+disqualified from the fast path, and the baker seeks to `srcAt()` for every frame.
+
+The job carries `len` (timeline seconds) alongside `in`/`out` (source seconds), plus
+`Speed.digest()` of the curve. The digest is in the render key because two ramps can
+produce the same `in`, `out` and length while showing different frames at every instant
+between them; `len` is taken from the cropped in/out for an unsped clip rather than
+computed a second way, so it is the same float `out - in` always was.
+
 ### Transitions
 
 A transition sits on a **cut** - two clips on the same video track whose edges touch. It is
@@ -3292,12 +3402,20 @@ of reach, so the preview could never match. Baking sidesteps all of it: in the r
 free, and `Trans.draw()` paints exactly what the preview paints. The cost is two video
 seeks per baked frame, which is nothing for a window measured in tenths of a second.
 
-`Trans.draw(ctx, W, H, tr, p, aImg, bImg, frameDur)` is the single entry point. It takes
-the outgoing and incoming frames already framed (cropped and panned) as images, so it never
-needs to know where they came from - the preview hands it live video elements, the baker
-hands it canvases.
+`Trans.draw(ctx, W, H, tr, p, aImg, bImg, frameDur, boxes)` is the single entry point. It
+takes the outgoing and incoming frames already framed (cropped and panned) as images, so it
+never needs to know where they came from - the preview hands it live video elements, the
+baker hands it canvases. `boxes` is optional and only the **morph** reads it: the painted
+bounds of each side in normalised frame coordinates, produced by `transitionBoxes()`, which
+both the preview and the baker call so the two cannot disagree.
 
-#### The three types
+Both sides come from **one** function, `transPlate()`, in the preview and in the bake. That
+also means a cut between two **cards** now has pictures on both sides: until step 15 a
+transition on a text-card cut drew black, because the plate came from `mediaFor()` and a
+card has no media element. It is what makes `morph` mean anything, since the thing being
+morphed is usually a card.
+
+#### The nine types
 
 - **Blurred swipe** - both clips blur as they swap, peaking mid-transition, revealed
   through a feathered edge. Directions are left/right/up/down plus zoom in and zoom out
@@ -3390,6 +3508,67 @@ texture independently, so `Math.random()` would make them disagree - the export 
 streak differently from the preview. `streakMap()` is also built at a fixed small size
 rather than the frame size, so the same seed gives the same streaks at preview resolution
 and at export resolution.
+
+#### The six added for B2B (step 15)
+
+Each follows the existing pattern exactly - an entry in `TYPES`, a branch in `defaults()`,
+a `draw*()` in `transitions.js` and a branch in `renderTransitionPanel()` - so
+`normalize()` fills old projects in for free and the preset library carries them with no
+change at all.
+
+- **Shape wipe** (`shape`) - the incoming clip revealed through a growing shape: circle,
+  square, rounded rectangle, diamond, triangle, star, chevron, or path data imported from
+  an SVG through `Graphics.svgPaths()`, which is the same parser the `icon` graphic uses,
+  so an icon and a wipe shape are one code path. Vectors, never bitmaps, for the reason
+  step 10's chrome presets are: the preview cuts at 540x960 and the export at 1080x1920.
+  `cover` is how far past the frame's own half-diagonal the shape grows, which is what
+  lets a shape with long points still finish covering.
+- **Luma / gradient wipe** (`luma`) - a threshold sweeps across a greyscale map and the
+  incoming clip appears wherever it has passed. Four maps: linear, radial, bands and
+  seeded clouds. The map is built at a **fixed small size** and scaled up, the same rule
+  the burn's streaks live by and for the same reason: the preview and the export build it
+  independently, and a map that varied with resolution would put the wipe edge in two
+  different places.
+- **Slide** (`slide`) - the incoming clip travels in from off-frame, optionally pushing
+  the outgoing one out ahead of it so the pair moves as one strip.
+- **Scale** (`scale`) - the outgoing clip grows away and the incoming one arrives from
+  behind it. A cross fade of 0 makes it a pure scale with a hard swap at the midpoint,
+  which is the match-cut version; put the anchor on whatever the two shots share.
+- **Morph** (`morph`) - a cross-dissolve that also carries each card's painted box onto
+  the other's, so a title *becomes* the next title rather than dissolving into it. With no
+  bounds to read - a video clip, an undecoded card - the transform is the identity and it
+  degrades to the cross-dissolve it is built on, which is the honest failure.
+- **Zoom punch** (`punch`) - both plates rush toward a focus point, the cut happens at the
+  peak where the movement hides it, and the incoming clip settles back. `hold` is how much
+  of the window is spent at full zoom; it is what makes it read as an accent rather than
+  as a slow push in and out.
+
+Two traps are paid for once and shared by all of them, in `paintShapeMask()`,
+`paintLumaMask()`, `padded()` and `softPlate()`:
+
+- **A mask composites on the ALPHA channel.** A mask painted as opaque black and white
+  masks nothing at all. Paint `rgba(255,255,255,1)` → `rgba(255,255,255,0)` - including
+  the *inverted* case, which fills opaque and then punches the shape out with
+  `destination-out` rather than drawing black over it.
+- **A blur must not magnify.** Pad the plate by extending its edge pixels outwards, blur
+  or move *that* at 1:1, then crop the middle back out. Drawing oversized to hide the
+  transparent border zooms the picture by the blur radius, and because the blur peaks
+  mid-transition the zoom peaks with it - the bug the swipe already shipped once.
+
+#### Match cuts
+
+Every type carries the same match-cut bar, because it is about the **join**, not the look.
+Mark a feature under the playhead in each clip, then **Align on the cut** slips both so the
+two marked source frames sit exactly on the cut - the last frame of A and the first frame
+of B are then the same moment of the action, which is what makes the join invisible. Two
+nudge buttons slip the incoming clip by a frame either way.
+
+`slipClipTo()` is the whole of it. A **slip** changes what a clip shows without moving the
+clip: the start stays, the timeline length stays, and nothing downstream shifts. The length
+is preserved *explicitly* rather than by moving `in` and `out` together - the rate curve is
+keyed in absolute source time, so sliding onto a different stretch of footage meets a
+different part of the curve and the out-point has to be re-derived from the length the clip
+is supposed to keep. Both slips are one `pushUndo()`: it is one edit, not two.
 
 #### Adding one
 

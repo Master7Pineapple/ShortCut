@@ -1860,6 +1860,17 @@ function buildArgs(job, opts) {
   const aClips = clips.filter((c) => c.audible);
   const args = ['-y', '-hide_banner'];
 
+  /**
+   * How much TIMELINE a job entry occupies.
+   *
+   * `out - in` is its SOURCE length, and speed made the two different numbers: a clip at
+   * 2x is half as long on the timeline as it is in the file. Every overlay window, every
+   * still's `-t` and the audio delay are timeline quantities, so they read this.
+   * `buildJob()` sets `len` from the cropped in/out for anything unsped, so an unsped
+   * project emits the same float - and therefore the same string - it always did.
+   */
+  const lenOf = (c) => (c && c.len != null ? c.len : c.out - c.in);
+
   // One ffmpeg input per clip occurrence - simple, and lets one file appear many times.
   const inputs = [];
   for (const c of clips) {
@@ -1880,7 +1891,7 @@ function buildArgs(job, opts) {
       // A still is an endless input, so it needs an explicit duration or ffmpeg would
       // sit on it forever - the filter's own trim ends the stream, but only after the
       // demuxer has been asked for frames that will never stop coming.
-      args.push('-loop', '1', '-t', r3(Math.max(0.001, c.out - c.in)), '-i', c.src);
+      args.push('-loop', '1', '-t', r3(Math.max(0.001, lenOf(c))), '-i', c.src);
     } else {
       args.push('-i', c.src);
     }
@@ -1901,6 +1912,31 @@ function buildArgs(job, opts) {
    *
    * Returns false when there is nothing audible.
    */
+  /**
+   * The filters that make a clip's audio match its speed.
+   *
+   * A CONSTANT rate is pitch-corrected with `atempo`, chained because one instance only
+   * accepts 0.5-100 - two at 0.5 give 0.25, and so on down.
+   *
+   * A RAMP is silenced, and deliberately: `atempo` takes one tempo, not a curve, and
+   * there is no honest way to time-stretch audio along one in a single pass. The renderer
+   * says so in the inspector and the preview mutes the same clip, so the viewer never
+   * hears something the file will not contain. `volume=0` rather than dropping the stream
+   * keeps the mix's input count - and therefore the whole graph's shape - unchanged.
+   */
+  function speedChain(c) {
+    if (!c.speed) return [];
+    if (c.speedAudio === 'mute' || c.rate == null) return ['volume=0'];
+    const r = c.rate;
+    if (!(r > 0) || Math.abs(r - 1) < 1e-9) return [];
+    const out = [];
+    let left = r;
+    while (left < 0.5 - 1e-9) { out.push('atempo=0.5'); left /= 0.5; }
+    while (left > 100 + 1e-9) { out.push('atempo=100'); left /= 100; }
+    out.push('atempo=' + r3(left));
+    return out;
+  }
+
   function buildAudioGraph(printLoudness) {
     if (!aClips.length) return false;
 
@@ -1909,6 +1945,7 @@ function buildArgs(job, opts) {
     const names = [];
     aClips.forEach((c, i) => {
       const idx = inputs.indexOf(c);
+      // SOURCE seconds: `atrim` cuts the file, and the file has not been sped yet.
       const dur = c.out - c.in;
       const delay = Math.max(0, Math.round(c.start * 1000));
       const parts = [
@@ -1916,6 +1953,11 @@ function buildArgs(job, opts) {
         'asetpts=PTS-STARTPTS',
         'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo',
       ]
+        // Speed, between the trim and the clip's own effects: the chain that follows is
+        // written against the clip as it will be HEARD, so a compressor's attack means
+        // the same thing at 2x as it does at 1x. A clip with no speed contributes
+        // nothing here, which is what keeps the argument string byte-identical.
+        .concat(speedChain(c))
         .concat(AudioFX.chain(c.afx))
         .concat([
           'volume=' + r3(c.volume),
@@ -2007,7 +2049,8 @@ function buildArgs(job, opts) {
   let last = 'base0';
   vClips.forEach((c, i) => {
     const idx = inputs.indexOf(c);
-    const dur = c.out - c.in;
+    // TIMELINE seconds: every `enable='between(t,...)'` below is an output-time window.
+    const dur = lenOf(c);
 
     if (c.kind === 'text' || c.kind === 'graphic') {
       // A graphic bakes exactly as a card does - cropped to its painted bounds, raw RGBA,
@@ -2059,8 +2102,13 @@ function buildArgs(job, opts) {
     // timeline to seek into: its trim always starts at 0, whatever the range lopped off
     // the head. Using c.in there would cut the same head off twice.
     const tin = c.kind === 'image' ? 0 : c.in;
+    // `trim` cuts the SOURCE, so it takes the source duration - the same number as `dur`
+    // for everything that reaches this branch today, since a sped clip is composited by
+    // the baker and never handed to this chain. Stated separately rather than shared,
+    // because the two being one number is exactly the assumption speed ended.
+    const srcDur = c.kind === 'image' ? dur : Math.max(0.001, c.out - c.in);
     fc.push(
-      '[' + idx + ':v]trim=start=' + r3(tin) + ':duration=' + r3(dur) +
+      '[' + idx + ':v]trim=start=' + r3(tin) + ':duration=' + r3(srcDur) +
       ',setpts=PTS-STARTPTS+' + r3(c.start) + '/TB' +
       ",crop=w='" + cw + "':h='" + ch + "':x='(iw-ow)*" + r3(c.panX) + "':y='(ih-oh)*" + r3(c.panY) + "'" +
       ',scale=' + width + ':' + height + ':flags=' + scaleFlags +
