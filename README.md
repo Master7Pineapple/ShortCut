@@ -1230,7 +1230,7 @@ that find its moments.
 | --- | --- | --- |
 | `graphic` | A graphic clip's **entry** | -2 dB — a short pop suits it |
 | `transition` | The start of a transition's window | -3 dB, offset **-0.06 s** so it leads the picture |
-| `click` | Each mouse-down in a recording's telemetry | -6 dB |
+| `click` | Each mouse-down, from a sidecar **or** a performed take | -6 dB |
 | `counter` | Each step of a counting number, capped | -12 dB |
 | `cut` | A **hard** cut into a data graphic | -4 dB |
 
@@ -1238,11 +1238,14 @@ Four details that are decisions rather than accidents:
 
 - **A graphic's moment is its entry, not its clip edge.** `inDelay` exists so an object
   can arrive late; a pop on the clip's start would then be a pop at nothing.
-- **A click's moment comes through `clipClicks()`**, which retimes source-time telemetry
-  by the clip's `in` point. Reaching into `clip.screen.events` here instead would put
-  every sound back where the untrimmed file had it — the trap the note on `clipCursorAt()`
-  exists to head off. A clip with no telemetry contributes nothing, which is the normal
-  case and not an error: step 8's degradation contract, honoured.
+- **A click's moment comes through `clipAllClicks()`**, which covers **both** click
+  sources — step 8's recorded `clip.screen` sidecar *and* a performed `clip.mouse` take —
+  and retimes each by the clip's `in` point. Both are needed: on Windows a window capture
+  writes no sidecar, so a take is often the only click data a recording has, and reading
+  one source left a project full of takes completely silent. Reaching into either event
+  array directly would put every sound back where the untrimmed file had it — the trap the
+  note on `clipCursorAt()` exists to head off. A clip with neither contributes nothing,
+  which is the normal case and not an error: step 8's degradation contract, honoured.
 - **The tick count is capped** (`maxTicks`, default 12). A number counting to 1240 does
   not get 1240 ticks; the ticks are spread over the entry, which is the window the number
   is actually moving in.
@@ -1520,8 +1523,16 @@ happened on. So use the two helpers in `app.js` rather than reaching into
 
 ```js
 clipCursorAt(clip, tLocal)   // seconds into the clip -> {x, y} in 0..1, or null
-clipClicks(clip)             // mouse-downs inside the clip's span, retimed to its start
+clipClicks(clip)             // mouse-downs from `clip.screen`, retimed to the clip's start
+clipTakeClicks(clip)         // the same, from a performed `clip.mouse` take
+clipAllClicks(clip)          // BOTH sources merged - what anything sounding clicks wants
 ```
+
+`clipClicks()` alone is the **screen sidecar only**, and that distinction has already
+cost one bug: Sonify read it and nothing else, so a project whose clicks all came from
+performed takes — the normal case on Windows, where a window capture writes no sidecar —
+got no click sounds at all and looked like it could not see the telemetry. Anything asking
+"where were the clicks" wants `clipAllClicks()`.
 
 Both go through `clip.in`, the same way `mediaFor()` and the framing maths do. `screen`
 is plain JSON on the clip like everything else, because undo is `JSON.stringify` of the

@@ -5538,10 +5538,14 @@ function isStatClip(c) {
  *  - A graphic's moment is its ENTRY, not its clip start: `inDelay` exists precisely so
  *    an object can arrive late, and a pop on the clip's edge would then be a pop at
  *    nothing. The counting number's ticks are spread over `inDur` for the same reason.
- *  - A click's moment comes through `clipClicks()`, which retimes source-time telemetry
- *    by the clip's `in` point. Reaching into `clip.screen.events` here instead would put
- *    every sound back where the untrimmed file had it - see the note on
- *    `clipCursorAt()`. A clip with no telemetry contributes nothing, and that is normal.
+ *  - A click's moment comes through `clipAllClicks()`, which covers BOTH click sources -
+ *    step 8's recorded `clip.screen` sidecar and a performed `clip.mouse` take - and
+ *    retimes each by the clip's `in` point. Both matter: on Windows a window capture
+ *    writes no sidecar, so the take is usually the only click data there is, and reading
+ *    one source was the bug that left a whole project of takes silent. Reaching into
+ *    either event array directly would put every sound back where the untrimmed file had
+ *    it - see the note on `clipCursorAt()`. A clip with neither contributes nothing, and
+ *    that is normal.
  */
 function sonifyScene() {
   const scene = { graphics: [], transitions: [], clicks: [], counters: [], cuts: [] };
@@ -5559,7 +5563,7 @@ function sonifyScene() {
         });
       }
     }
-    for (const e of clipClicks(clip)) {
+    for (const e of clipAllClicks(clip)) {
       scene.clicks.push({ id: clip.id + '@' + Math.round(e.t * 1000), t: clip.start + e.t });
     }
   }
@@ -8993,11 +8997,51 @@ function clipCursorAt(clip, tLocal) {
   return t ? ScreenTel.cursorAt(t, clip.in + tLocal) : null;
 }
 
-/** Mouse-downs inside a clip's visible span, retimed to seconds from the clip's start. */
+/**
+ * Mouse-downs from SCREEN telemetry, inside the clip's span, retimed to its start.
+ *
+ * `clip.screen` only - see `clipTakeClicks()` for the other source, and
+ * `clipAllClicks()` for "every click this clip has", which is what sonifying wants.
+ */
 function clipClicks(clip) {
   const t = clipTelemetry(clip);
   if (!t) return [];
   return ScreenTel.clicksIn(t, clip.in, clip.out).map((e) => ({ t: e.t - clip.in, x: e.x, y: e.y }));
+}
+
+/**
+ * Mouse-downs from an ON-RENDER take, inside the clip's span, retimed to its start.
+ *
+ * `clip.mouse` is the other half of the split `cursor.js` opens with: a take performed
+ * over the finished 9:16 picture, in OUTPUT-frame fractions. Its `t` is still source time
+ * (`splitTake()` cuts a timeline take into per-clip source-time takes), so the `clip.in`
+ * arithmetic is identical to the screen path's - only the coordinate space differs, and a
+ * sound does not care where on screen the click was.
+ *
+ * On Windows this is where clicks usually are: a window capture writes no sidecar at all,
+ * so a performed take is how a recording gets click data. Reading only `clip.screen` is
+ * why Sonify placed no click sounds on a project full of takes.
+ */
+function clipTakeClicks(clip) {
+  if (!Cursor.has(clip && clip.mouse)) return [];
+  return Cursor.clicksOf(clip.mouse)
+    .filter((e) => e.t >= clip.in - 1e-6 && e.t < clip.out - 1e-6)
+    .map((e) => ({ t: Math.max(0, e.t - clip.in), x: e.x, y: e.y }));
+}
+
+/**
+ * Every mouse-down on a clip, whichever source it came from.
+ *
+ * Both lists are kept: a clip may carry a recorded sidecar AND a take performed over it,
+ * and those are different events rather than two copies of one. Only exact coincidences
+ * are collapsed here (1 ms); anything merely close is left for the planner's `minGap`,
+ * which is the knob the user can actually see and change.
+ */
+function clipAllClicks(clip) {
+  const all = [...clipClicks(clip), ...clipTakeClicks(clip)].sort((a, b) => a.t - b.t);
+  const out = [];
+  for (const e of all) if (!out.length || e.t - out[out.length - 1].t > 1e-3) out.push(e);
+  return out;
 }
 
 function recSetStatus(msg) {
