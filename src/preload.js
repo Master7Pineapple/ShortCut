@@ -22,6 +22,12 @@ contextBridge.exposeInMainWorld('api', {
   binPickFolder: () => ipcRenderer.invoke('bin:pickFolder'),
   binListDir: (dir) => ipcRenderer.invoke('bin:listDir', dir),
 
+  // The SFX library: the bundled sounds (synthesised into userData/sfx on first ask)
+  // plus whatever the user imported. Nothing is copied; an imported entry is a path.
+  sfxLibrary: () => ipcRenderer.invoke('sfx:library'),
+  sfxImport: () => ipcRenderer.invoke('sfx:import'),
+  sfxRemove: (id) => ipcRenderer.invoke('sfx:remove', id),
+
   // Audio peaks for the timeline waveforms, cached on disk by path + size + mtime.
   waveRead: (p) => ipcRenderer.invoke('wave:read', p),
   waveWrite: (p, peaks, duration) => ipcRenderer.invoke('wave:write', { path: p, peaks, duration }),

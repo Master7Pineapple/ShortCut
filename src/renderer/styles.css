@@ -491,6 +491,28 @@ select, input[type=number], input[type=text] {
 #capPanel[hidden] { display: none; }
 #capPanel .afx-box:first-child { margin-top: 0; border-top: none; padding-top: 0; }
 
+/* The sound design panel, same shape as the captions one and for the same reason: a
+   bare <div> needs its own padding or every row sits against the column edge. */
+#sfxPanel { padding: 8px 10px 16px; }
+#sfxPanel[hidden] { display: none; }
+#sfxPanel .afx-box:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+.sfx-lib { max-height: 168px; overflow-y: auto; border: 1px solid var(--line); border-radius: 3px; }
+.sfx-row {
+  display: grid; grid-template-columns: 1fr auto auto auto; gap: 4px; align-items: center;
+  padding: 2px 4px; font-size: 11px; border-bottom: 1px solid var(--line);
+}
+.sfx-row:last-child { border-bottom: none; }
+.sfx-row.missing { opacity: .45; text-decoration: line-through; }
+.sfx-row .sfx-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sfx-row .sfx-dur { color: var(--dim); font-variant-numeric: tabular-nums; }
+.sfx-cat { padding: 3px 4px; font-size: 10px; color: var(--dim); background: #14161b; text-transform: uppercase; letter-spacing: .06em; }
+.sfx-trig { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 6px; }
+.sfx-trig.off { opacity: .5; }
+.sfx-trig-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: #14161b; }
+.sfx-trig-head b { flex: 1; font-weight: 600; }
+.sfx-trig-body { padding: 6px; }
+.sfx-status { margin-top: 6px; line-height: 1.35; }
+
 #transPanel[hidden] { display: none; }
 #transPanel { padding: 0 0 12px; }
 #btnDelTransition { padding: 0 6px; font-size: 14px; line-height: 1; }

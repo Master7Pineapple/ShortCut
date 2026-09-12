@@ -52,6 +52,10 @@ const state = {
    *  Tighten's: changing one snapshots no undo entry, it only changes what the next
    *  Generate would produce. Saved in the .scut so a project keeps its caption style. */
   captions: Object.assign({}, Captions.DEFAULTS),
+  /** Sound design settings - the triggers, the levels and the duck. Settings like
+   *  Tighten's and Captions': changing one snapshots no undo entry, it only changes what
+   *  the next Sonify would place. Saved in the .scut, so a project keeps its sound. */
+  sfx: SFX.defaultOpts(),
 };
 
 let undoStack = [];
@@ -1630,6 +1634,7 @@ function renderInspector() {
   const sel = selectedClips();
   renderTransitionPanel();
   renderCaptionsPanel();
+  renderSfxPanel();
 
   // A selected text card opens the editor drawer on the far right. The left column keeps
   // showing the normal clip inspector, so the preview area is never resized by it.
@@ -5445,6 +5450,7 @@ function newProject() {
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
   state.captions = Object.assign({}, Captions.DEFAULTS);
+  state.sfx = SFX.defaultOpts();
   transcriptCache.clear();
   syncLoudnessControl();
   undoStack = []; redoStack = [];
@@ -5452,6 +5458,506 @@ function newProject() {
   renderAll();
   zoomFit();
 }
+
+// ======================================== 7c. sound design (SFX + Sonify)
+//
+// The rule this implements is "if something appears on screen, it should make a sound",
+// and the design point is that it is executed the way an editor would execute it: every
+// placement is a real audio clip on a real audio track, movable, trimmable and
+// deletable. Nothing here is a hidden effect, and nothing here renders by a path of its
+// own - a sonified project reaches ffmpeg through exactly the audio chain step 1 built.
+//
+// The split is the same one the captions pass uses. `SFX.plan()` (src/sfx.js) is a pure
+// function from a description of the timeline to a list of placements; this section finds
+// the moments, because only it knows how `clip.in` maps a recording's telemetry into
+// timeline time, and then turns each placement into a clip.
+
+const SFX_DEFAULTS = SFX.defaultOpts();
+
+/** The library, fetched once: the bundled sounds plus the user's imports. */
+let sfxLib = { items: [], dir: '' };
+let sfxPanelPaint = null;
+let sfxStatusMsg = '';
+let sfxAudition = null;    // the <audio> the library rows preview through
+
+function sfxOpts() { return SFX.normalizeOpts(state.sfx); }
+
+async function refreshSfxLibrary() {
+  try {
+    const r = await window.api.sfxLibrary();
+    if (r && Array.isArray(r.items)) sfxLib = r;
+  } catch (e) { sfxLib = { items: [], dir: '' }; }
+  return sfxLib;
+}
+
+/** A sound by id - a bundled id, or the path of an imported file. */
+function sfxSound(id) {
+  return sfxLib.items.find((i) => i.id === id) || null;
+}
+
+/** Play a sound once, at the level the panel is set to, without touching the timeline. */
+function auditionSfx(snd) {
+  if (!snd || snd.missing) return;
+  if (!sfxAudition) sfxAudition = new Audio();
+  sfxAudition.src = snd.path;
+  sfxAudition.volume = clamp(AudioFX.linFromDb(sfxOpts().level), 0, 1);
+  sfxAudition.currentTime = 0;
+  const p = sfxAudition.play();
+  if (p && p.catch) p.catch(() => {});
+}
+
+/**
+ * The SFX track: one audio track marked `sfx: true`, kept at the bottom.
+ *
+ * A plain boolean on the track, exactly like the caption track's `captions` flag, so it
+ * serialises with everything else and a re-run finds its own previous output without
+ * guessing from the track's name.
+ */
+function sfxTrack(create) {
+  let t = state.tracks.find((x) => x.type === 'audio' && x.sfx);
+  if (t || create === false) return t || null;
+  t = makeTrack('audio', state.tracks.filter((x) => x.type === 'audio').length + 1);
+  t.name = 'SFX';
+  t.sfx = true;
+  state.tracks.push(t);
+  return t;
+}
+
+/** Is this clip a stat card - a data graphic, the thing a hard cut wants an impact on? */
+function isStatClip(c) {
+  if (!Graphics.hasGraphic(c)) return false;
+  const d = Graphics.DEFS[c.graphic.type];
+  return !!d && d.group === 'Data';
+}
+
+/**
+ * Everything on the timeline worth a sound, in TIMELINE seconds.
+ *
+ * Two things are worth saying out loud:
+ *
+ *  - A graphic's moment is its ENTRY, not its clip start: `inDelay` exists precisely so
+ *    an object can arrive late, and a pop on the clip's edge would then be a pop at
+ *    nothing. The counting number's ticks are spread over `inDur` for the same reason.
+ *  - A click's moment comes through `clipClicks()`, which retimes source-time telemetry
+ *    by the clip's `in` point. Reaching into `clip.screen.events` here instead would put
+ *    every sound back where the untrimmed file had it - see the note on
+ *    `clipCursorAt()`. A clip with no telemetry contributes nothing, and that is normal.
+ */
+function sonifyScene() {
+  const scene = { graphics: [], transitions: [], clicks: [], counters: [], cuts: [] };
+  for (const { clip, track } of allClips()) {
+    if (track.type !== 'video' || track.hidden) continue;
+    if (Graphics.hasGraphic(clip)) {
+      const p = clip.graphic.params || {};
+      const at = clip.start + Math.max(0, Number(p.inDelay) || 0);
+      const label = Graphics.title(clip);
+      scene.graphics.push({ id: clip.id, t: at, label });
+      if (clip.graphic.type === 'counter') {
+        scene.counters.push({
+          id: clip.id, t: at, inDur: Number(p.inDur) || 0,
+          from: p.from, to: p.to, decimals: p.decimals, label,
+        });
+      }
+    }
+    for (const e of clipClicks(clip)) {
+      scene.clicks.push({ id: clip.id + '@' + Math.round(e.t * 1000), t: clip.start + e.t });
+    }
+  }
+  const live = activeTransitions().filter((r) => !r.track.hidden);
+  for (const r of live) {
+    scene.transitions.push({ id: r.tr.id, t: r.from, label: Trans.TYPES[r.tr.type].label });
+  }
+  // An impact belongs on a HARD cut - a cut that already has a transition has a whoosh
+  // of its own, and stacking the two reads as a mistake rather than as emphasis.
+  const softened = new Set(live.map((r) => r.tr.aId + '>' + r.tr.bId));
+  for (const cut of allCuts()) {
+    if (cut.track.hidden || softened.has(cut.a.id + '>' + cut.b.id)) continue;
+    if (!isStatClip(cut.b)) continue;
+    scene.cuts.push({ id: cut.b.id, t: cut.cut, label: Graphics.title(cut.b) });
+  }
+  return scene;
+}
+
+/** What Sonify would place, right now. The panel shows its count before committing. */
+function sonifyPlan() { return SFX.plan(sonifyScene(), sfxOpts()); }
+
+/** This pass's own clips - the tag is what makes a re-run replace instead of double. */
+function generatedSfxClips() {
+  const out = [];
+  for (const track of state.tracks) {
+    for (const c of track.clips) if (c.sfx && c.sfx.gen) out.push({ track, clip: c });
+  }
+  return out;
+}
+
+/**
+ * The chain a placed clip carries: its gain, and the duck when one is set up.
+ *
+ * The gain is an `AudioFX` gain effect rather than `clip.volume` for two reasons: it is
+ * in dB, which is what the panel talks in, and the preview mirrors gain effects already
+ * (`AudioFX.previewGain`), so the balance while editing matches the render.
+ */
+function sfxChain(gainDb, duck) {
+  const afx = [];
+  const g = AudioFX.create('gain');
+  g.params.db = Math.round((Number(gainDb) || 0) * 10) / 10;
+  afx.push(g);
+  if (duck) {
+    const d = AudioFX.create('duck');
+    Object.assign(d.params, duck);
+    afx.push(d);
+  }
+  return afx;
+}
+
+/** Put one sound on the SFX track by hand. Untagged, so Sonify never sweeps it away. */
+function insertSfx(id, at) {
+  const snd = sfxSound(id);
+  if (!snd || snd.missing) { log('That sound is not there.'); return null; }
+  const dur = Math.max(0.02, Number(snd.duration) || 0);
+  pushUndo();
+  const track = sfxTrack(true);
+  const clip = {
+    id: nextId(), src: snd.path, name: snd.name, kind: 'audio',
+    start: Math.max(0, at == null ? state.playhead : at),
+    in: 0, out: dur, mediaDuration: dur,
+    srcW: 0, srcH: 0, fps: 0,
+    panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+    afx: sfxChain(sfxOpts().level, SFX.duckFor(sfxOpts())),
+  };
+  track.clips.push(clip);
+  sortTracks();
+  setSelection([clip.id], false);
+  markDirty();
+  renderAll();
+  log('Placed "' + snd.name + '" at ' + fmtTc(clip.start) + '.');
+  return clip;
+}
+
+/**
+ * The Sonify pass. ONE pushUndo() for the whole thing.
+ *
+ * Re-running REPLACES this pass's own previous placements and leaves everything else
+ * alone - only clips carrying `sfx.gen` are swept, so a sound the user dropped in by
+ * hand, moved or retimed survives. Doubling every sound each time somebody nudges the
+ * SFX level is the failure mode this avoids, and it is the same tag the caption pass
+ * uses for the same reason.
+ */
+function sonify() {
+  const o = sfxOpts();
+  const placements = SFX.plan(sonifyScene(), o);
+  const old = generatedSfxClips();
+  if (!placements.length && !old.length) {
+    log('Sonify: nothing on the timeline to sound - add a graphic, a transition, or a recording with clicks.');
+    return null;
+  }
+  const duck = SFX.duckFor(o);
+  pushUndo();
+  for (const { track, clip } of old) {
+    track.clips = track.clips.filter((c) => c !== clip);
+    dropMedia(clip.id);
+  }
+  const track = placements.length ? sfxTrack(true) : sfxTrack(false);
+  const made = [];
+  let missing = 0;
+  for (const p of placements) {
+    const snd = sfxSound(p.sound);
+    if (!snd || snd.missing) { missing++; continue; }
+    const dur = Math.max(0.02, Number(snd.duration) || 0);
+    const clip = {
+      id: nextId(), src: snd.path, name: snd.name, kind: 'audio',
+      start: p.start,
+      // A negative offset at the very top of the timeline cannot move the clip before
+      // zero, so the sound's HEAD is trimmed instead and its body still lands where the
+      // offset asked. `p.trim` is how much the planner could not give back.
+      in: Math.min(p.trim, Math.max(0, dur - 0.02)),
+      out: dur, mediaDuration: dur,
+      srcW: 0, srcH: 0, fps: 0,
+      panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+      afx: sfxChain(p.gainDb, duck),
+      // The tag: plain JSON, like everything else on a clip. `trigger` and `key` say
+      // what put it there, which is what lets a re-run replace exactly its own output.
+      sfx: { gen: true, trigger: p.trigger, key: p.key },
+    };
+    if (track) { track.clips.push(clip); made.push(clip); }
+  }
+  const liveIds = new Set(allClips().map((x) => x.clip.id));
+  state.selection = new Set([...state.selection].filter((id) => liveIds.has(id)));
+  sortTracks();
+  markDirty();
+  renderAll();
+  const byTrigger = {};
+  for (const c of made) byTrigger[c.sfx.trigger] = (byTrigger[c.sfx.trigger] || 0) + 1;
+  const parts = SFX.TRIGGER_IDS.filter((k) => byTrigger[k]).map((k) => byTrigger[k] + ' x ' + k);
+  log('Sonify: ' + made.length + ' sound(s)' + (parts.length ? ' (' + parts.join(', ') + ')' : '') +
+      (old.length ? ', replacing ' + old.length + ' previous placement(s)' : '') +
+      (missing ? '. ' + missing + ' placement(s) had no sound file' : '') + '.');
+  return { made: made.length, replaced: old.length, missing, clips: made };
+}
+
+/** Remove this pass's placements. One undo entry, or none when there is nothing to do. */
+function clearSonify() {
+  const doomed = generatedSfxClips();
+  if (!doomed.length) { log('No generated sounds to remove.'); return 0; }
+  pushUndo();
+  for (const { track, clip } of doomed) {
+    track.clips = track.clips.filter((c) => c !== clip);
+    dropMedia(clip.id);
+  }
+  const live = new Set(allClips().map((x) => x.clip.id));
+  state.selection = new Set([...state.selection].filter((id) => live.has(id)));
+  markDirty();
+  renderAll();
+  log('Removed ' + doomed.length + ' generated sound(s).');
+  return doomed.length;
+}
+
+/**
+ * The Sound design panel.
+ *
+ * Rows are `TextUI.control` like every other panel, and - exactly as the Tighten and
+ * Captions panels do - they pass their own hooks: these are project SETTINGS, so moving
+ * one snapshots no undo entry and dirties nothing. Only Sonify, Clear and the library's
+ * "+" touch the timeline, and each is one undo entry.
+ */
+function sfxPanelBody() {
+  const el = TextUI.el;
+  const box = el('div', 'afx-box sfx-box');
+  // Normalise in place, so a project saved by an older build (or hand-edited) has every
+  // setting the rows below are about to bind to, and an edit lands on the same object
+  // `serialize()` writes out.
+  state.sfx = SFX.normalizeOpts(state.sfx);
+  const o = state.sfx;
+
+  const head = el('div', 'afx-head');
+  head.appendChild(el('b', null, 'Sonify'));
+  const count = el('span', 'tc-hint');
+  head.appendChild(count);
+  box.appendChild(head);
+  box.appendChild(el('div', 'tc-hint afx-note',
+    'Walks the timeline and places sound effects as ordinary audio clips on the SFX ' +
+    'track - movable, trimmable, deletable. One undo entry, and running it again ' +
+    'replaces its own placements rather than doubling them.'));
+
+  const status = el('div', 'tc-hint sfx-status');
+  const body = el('div', 'tc-body');
+
+  const paint = () => {
+    const plan = sonifyPlan();
+    count.textContent = plan.length ? plan.length + ' sound' + (plan.length === 1 ? '' : 's') : 'nothing to sound';
+    const here = generatedSfxClips().length;
+    status.textContent = sfxStatusMsg || (
+      plan.length
+        ? 'Would place ' + plan.length + ' sound(s)' + (here ? ', replacing the ' + here + ' already there' : '') + '.'
+        : here ? here + ' generated sound(s) on the timeline; nothing new to place.'
+          : 'Nothing to sound yet.');
+  };
+  sfxPanelPaint = paint;
+
+  const hooks = { onEdit: () => {}, onEditEnd: () => {}, onChanged: paint };
+  const C = (spec, obj, defs) => TextUI.control(spec, obj, defs, hooks);
+
+  body.appendChild(C({
+    path: 'level', label: 'SFX level', type: 'range',
+    min: -36, max: 12, step: 0.5, unit: 'dB', digits: 1,
+  }, state.sfx, SFX_DEFAULTS));
+  body.appendChild(C({
+    path: 'minGap', label: 'Collapse within', type: 'range',
+    min: 0, max: 0.5, step: 0.01, unit: 's', digits: 2,
+  }, state.sfx, SFX_DEFAULTS));
+  body.appendChild(C({
+    path: 'maxTicks', label: 'Max ticks per number', type: 'range',
+    min: 1, max: 40, step: 1, digits: 0,
+  }, state.sfx, SFX_DEFAULTS));
+  box.appendChild(body);
+
+  // ---- one block per trigger
+  const options = sfxLib.items.filter((i) => !i.missing).map((i) => ({ value: i.id, label: i.name }));
+  for (const key of SFX.TRIGGER_IDS) {
+    const def = SFX.TRIGGERS[key];
+    const t = state.sfx.triggers[key];
+    const row = el('div', 'sfx-trig' + (t.enabled ? '' : ' off'));
+    row.dataset.trigger = key;
+    const bar = el('div', 'sfx-trig-head');
+    const on = el('input');
+    on.type = 'checkbox';
+    on.checked = !!t.enabled;
+    on.title = 'Include this trigger';
+    on.addEventListener('change', () => { t.enabled = on.checked; renderSfxPanel(); });
+    bar.appendChild(on);
+    bar.appendChild(el('b', null, def.label));
+    row.appendChild(bar);
+
+    const tbody = el('div', 'sfx-trig-body');
+    tbody.appendChild(el('div', 'tc-hint', def.hint));
+    const sel = el('select');
+    for (const opt of options) {
+      const oEl = el('option');
+      oEl.value = opt.value;
+      oEl.textContent = opt.label;
+      sel.appendChild(oEl);
+    }
+    // A sound the library cannot find is shown as missing rather than silently swapped:
+    // the trigger still says what it was pointed at, which is what makes it fixable.
+    if (!options.some((x) => x.value === t.sound)) {
+      const oEl = el('option');
+      oEl.value = t.sound;
+      oEl.textContent = t.sound + ' (missing)';
+      sel.appendChild(oEl);
+    }
+    sel.value = t.sound;
+    sel.addEventListener('change', () => { t.sound = sel.value; paint(); });
+    const sr = el('div', 'tc-row');
+    sr.appendChild(el('label', 'tc-label', 'Sound'));
+    sr.appendChild(sel);
+    tbody.appendChild(sr);
+    for (const spec of SFX.TRIGGER_SCHEMA) {
+      tbody.appendChild(C(spec, t, SFX_DEFAULTS.triggers[key]));
+    }
+    row.appendChild(tbody);
+    box.appendChild(row);
+  }
+
+  // ---- ducking, through step 1's sidechain
+  const duckBox = el('div', 'sfx-trig');
+  const dBar = el('div', 'sfx-trig-head');
+  const dOn = el('input');
+  dOn.type = 'checkbox';
+  dOn.checked = !!o.duck.enabled;
+  dOn.addEventListener('change', () => { state.sfx.duck.enabled = dOn.checked; renderSfxPanel(); });
+  dBar.appendChild(dOn);
+  dBar.appendChild(el('b', null, 'Duck under voice'));
+  duckBox.appendChild(dBar);
+  const dBody = el('div', 'sfx-trig-body');
+  dBody.appendChild(el('div', 'tc-hint',
+    'Every placed sound gets a sidechain compressor keyed to a voice track - the same ' +
+    'ducking effect the audio chain offers, applied to the whole pass. It is written ' +
+    'onto the clips, so it renders and is visible in each clip\'s own chain.'));
+  const dSel = el('select');
+  const d0 = el('option');
+  d0.value = '';
+  d0.textContent = 'Choose a voice track...';
+  dSel.appendChild(d0);
+  // Never the SFX track itself: ducking a bus to itself is refused downstream, and
+  // offering it here would only make that refusal look like a bug.
+  for (const t of state.tracks.filter((x) => x.type === 'audio' && !x.sfx)) {
+    const oEl = el('option');
+    oEl.value = t.id;
+    oEl.textContent = t.name;
+    dSel.appendChild(oEl);
+  }
+  dSel.value = o.duck.voiceTrack;
+  dSel.addEventListener('change', () => { state.sfx.duck.voiceTrack = dSel.value; paint(); });
+  const dRow = el('div', 'tc-row');
+  dRow.appendChild(el('label', 'tc-label', 'Voice track'));
+  dRow.appendChild(dSel);
+  dBody.appendChild(dRow);
+  if (o.duck.enabled && !o.duck.voiceTrack) {
+    dBody.appendChild(el('div', 'tc-hint', 'Without a voice track nothing ducks.'));
+  }
+  duckBox.appendChild(dBody);
+  box.appendChild(duckBox);
+
+  box.appendChild(status);
+
+  const runBar = el('div', 'tc-btns');
+  const run = el('button', 'mini', 'Sonify');
+  run.title = 'Place a sound for every trigger above. One undo entry.';
+  run.addEventListener('click', () => { sonify(); renderSfxPanel(); });
+  const clear = el('button', 'mini', 'Clear');
+  clear.title = 'Remove the sounds this pass placed. Hand-placed ones stay.';
+  clear.addEventListener('click', () => { clearSonify(); renderSfxPanel(); });
+  runBar.appendChild(run);
+  runBar.appendChild(clear);
+  box.appendChild(runBar);
+
+  // ---- the library
+  const lib = el('div', 'afx-box sfx-libbox');
+  const lHead = el('div', 'afx-head');
+  lHead.appendChild(el('b', null, 'Library'));
+  lHead.appendChild(el('span', 'tc-hint', sfxLib.items.length + ' sound(s)'));
+  lib.appendChild(lHead);
+  lib.appendChild(el('div', 'tc-hint afx-note',
+    'The bundled sounds are synthesised into the app\'s own folder on first use, so they ' +
+    'work offline and never change. Imported ones are referenced where they are, like ' +
+    'the QuickBin - nothing is copied, and nothing is deleted from disk.'));
+  const list = el('div', 'sfx-lib');
+  let cat = null;
+  for (const it of sfxLib.items) {
+    if (it.cat !== cat) { cat = it.cat; list.appendChild(el('div', 'sfx-cat', cat || 'Sounds')); }
+    const row = el('div', 'sfx-row' + (it.missing ? ' missing' : ''));
+    row.dataset.id = it.id;
+    const name = el('span', 'sfx-name', it.name);
+    name.title = (it.missing ? 'MISSING - ' : '') + (it.hint || it.path);
+    row.appendChild(name);
+    row.appendChild(el('span', 'sfx-dur', (Number(it.duration) || 0).toFixed(2) + 's'));
+    const playBtn = el('button', 'mini', '▶');
+    playBtn.title = 'Listen';
+    playBtn.addEventListener('click', () => auditionSfx(it));
+    row.appendChild(playBtn);
+    const placeBtn = el('button', 'mini', '+');
+    placeBtn.title = 'Place it on the SFX track at the playhead';
+    placeBtn.addEventListener('click', () => { insertSfx(it.id); renderSfxPanel(); });
+    row.appendChild(placeBtn);
+    row.addEventListener('dblclick', () => auditionSfx(it));
+    list.appendChild(row);
+  }
+  if (!sfxLib.items.length) list.appendChild(el('div', 'tc-hint', 'The library is empty.'));
+  lib.appendChild(list);
+  const lBar = el('div', 'tc-btns');
+  const imp = el('button', 'mini', 'Import...');
+  imp.title = 'Add your own sound files to the library';
+  imp.addEventListener('click', async () => {
+    let r = null;
+    try { r = await window.api.sfxImport(); } catch (e) { r = null; }
+    await refreshSfxLibrary();
+    renderSfxPanel();
+    log('SFX library: added ' + ((r && r.added) || 0) + ' sound(s).');
+  });
+  lBar.appendChild(imp);
+  const rm = el('button', 'mini', 'Forget imports');
+  rm.title = 'Stop listing the sounds you imported. Nothing is deleted from disk.';
+  rm.addEventListener('click', async () => {
+    const mine = sfxLib.items.filter((i) => !i.builtin);
+    if (!mine.length) { log('Nothing imported to forget - the bundled sounds stay.'); return; }
+    for (const it of mine) { try { await window.api.sfxRemove(it.id); } catch (e) { /* ignore */ } }
+    await refreshSfxLibrary();
+    renderSfxPanel();
+    log('SFX library: forgot ' + mine.length + ' imported entry(ies). Nothing was deleted from disk.');
+  });
+  lBar.appendChild(rm);
+  box.appendChild(lib);
+  lib.appendChild(lBar);
+
+  paint();
+  return box;
+}
+
+function renderSfxPanel() {
+  const host = $('#sfxPanel');
+  if (!host) return;
+  host.innerHTML = '';
+  sfxPanelPaint = null;
+  // The count is on the HEAD, so a collapsed panel still reports what is placed.
+  const meta = $('#sfxMeta');
+  if (meta) {
+    const n = generatedSfxClips().length;
+    meta.textContent = n ? n + ' sound' + (n === 1 ? '' : 's') : '';
+  }
+  if (host.hidden) return;
+  host.appendChild(sfxPanelBody());
+}
+
+function toggleSfx(show) {
+  const hide = show == null ? !$('#sfxPanel').hidden : !show;
+  $('#sfxPanel').hidden = hide;
+  $('#btnSfxCollapse').textContent = hide ? '+' : '−';
+  renderSfxPanel();
+}
+
+// The library is materialised the first time anything asks for it, so ask once at
+// startup rather than making the first press of Sonify wait for a disk write.
+refreshSfxLibrary().then(() => renderSfxPanel()).catch(() => {});
 
 // ================================== 8. project save/open
 
@@ -5466,6 +5972,7 @@ function serialize() {
     outPoint: state.outPoint,
     tighten: state.tighten,
     captions: state.captions,
+    sfx: state.sfx,
     tracks: state.tracks,
   };
 }
@@ -5520,6 +6027,7 @@ async function openProject(filePath) {
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
   state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
+  state.sfx = SFX.normalizeOpts(d.sfx);
   transcriptCache.clear();
   for (const t of state.tracks) {
     if (!t.transitions) t.transitions = [];
@@ -8674,6 +9182,7 @@ $('#btnBinRemove').addEventListener('click', () => QuickBin.removeSelection());
 $('#btnBinCollapse').addEventListener('click', () => toggleBin());
 
 $('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
+$('#btnSfxCollapse').addEventListener('click', () => toggleSfx());
 
 /** Show / hide the Captions panel. Collapsed it costs nothing: it builds no rows. */
 function toggleCaptions(show) {

@@ -13,6 +13,9 @@ const AudioFX = require('./audiofx.js');
 // Same trick again: the screen-recording telemetry rules are shared with the renderer,
 // which loads this exact file as a <script> global.
 const ScreenTel = require('./screen.js');
+// And again: the SFX library's synthesiser and the Sonify planner. Main writes the
+// bundled sounds to disk; the renderer plans placements with the same module.
+const SFX = require('./sfx.js');
 
 // Magic Mask: MobileSAM through onnxruntime-node, the model downloads, and the matte
 // cache. It registers its own handlers in install() below, next to the window.
@@ -849,6 +852,99 @@ ipcMain.handle('bin:listDir', (_e, dir) => {
     }
   } catch (e) { /* unreadable folder - report nothing rather than throwing */ }
   return out;
+});
+
+// ------------------------------------------------------------- the SFX library
+
+/**
+ * The sound library: the bundled sounds, plus whatever the user imported.
+ *
+ * The bundled ones are SYNTHESISED by src/sfx.js and written into `userData/sfx` the
+ * first time anything asks for them - a few hundred lines of arithmetic in the repo
+ * instead of a few megabytes of audio, royalty-free because nobody else wrote them, and
+ * byte-identical on every run because every generator is seeded. A file is rewritten
+ * only when it is missing or the wrong size, so the second launch costs a `statSync`.
+ *
+ * The user's own sounds are NOT copied - an entry in `sfx.json` is a path and a name,
+ * exactly as a QuickBin item is, and a file that has moved comes back `missing` so the
+ * row can be greyed out instead of failing when somebody sonifies with it.
+ */
+const sfxDir = () => {
+  const dir = path.join(app.getPath('userData'), 'sfx');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+};
+const sfxListFile = () => path.join(app.getPath('userData'), 'sfx.json');
+
+function readSfxList() {
+  try {
+    const j = JSON.parse(fs.readFileSync(sfxListFile(), 'utf8'));
+    return Array.isArray(j && j.items) ? j.items : [];
+  } catch (e) { return []; }
+}
+function writeSfxList(items) {
+  const f = sfxListFile();
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify({ version: 1, items }, null, 2), 'utf8');
+}
+
+/** Write any bundled sound that is not already on disk. Returns the catalogue. */
+function materialiseSfx() {
+  const dir = sfxDir();
+  const out = [];
+  for (const entry of SFX.catalogue()) {
+    const file = path.join(dir, entry.id + '.wav');
+    const bytes = SFX.wavFor(entry.id);
+    const want = bytes ? bytes.length : 0;
+    let have = -1;
+    try { have = fs.statSync(file).size; } catch (e) { /* not written yet */ }
+    if (have !== want && bytes) {
+      try { fs.writeFileSync(file, Buffer.from(bytes)); } catch (e) { continue; }
+    }
+    out.push(Object.assign({}, entry, { path: file }));
+  }
+  return out;
+}
+
+ipcMain.handle('sfx:library', async () => {
+  let builtin = [];
+  try { builtin = materialiseSfx(); } catch (e) { builtin = []; }
+  const mine = readSfxList().map((it) => Object.assign({}, it, {
+    builtin: false,
+    missing: !(it.path && fs.existsSync(it.path)),
+  }));
+  return { items: builtin.concat(mine), dir: sfxDir() };
+});
+
+ipcMain.handle('sfx:import', async () => {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Import sound effects',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Audio', extensions: [...AUDIO_EXT].map((e) => e.slice(1)) }],
+  });
+  if (r.canceled || !r.filePaths.length) return { added: 0 };
+  const items = readSfxList();
+  let added = 0;
+  for (const f of r.filePaths) {
+    if (items.some((it) => it.path === f)) continue;
+    const m = await probe(f);
+    if (!m || !(m.duration > 0)) continue;
+    // The path is the id. An imported sound is referenced by a trigger and by a placed
+    // clip, and a path is the one name for it that means the same thing in both.
+    items.push({ id: f, path: f, name: path.basename(f), cat: 'Imported', duration: m.duration });
+    added++;
+  }
+  if (added) writeSfxList(items);
+  return { added };
+});
+
+ipcMain.handle('sfx:remove', (_e, id) => {
+  const items = readSfxList();
+  const keep = items.filter((it) => it.id !== id);
+  // Only the user's own entries are removable, and removing one deletes nothing from
+  // disk - the QuickBin's contract, for the same reason.
+  if (keep.length !== items.length) writeSfxList(keep);
+  return items.length - keep.length;
 });
 
 // -------------------------------------------------------- waveform peak cache

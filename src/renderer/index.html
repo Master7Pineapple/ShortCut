@@ -233,6 +233,15 @@
            pass rather than a per-clip control. -->
       <div id="capPanel" hidden></div>
 
+      <div class="panel-head" id="sfxPanelHead">
+        <span class="title">Sound design</span>
+        <span id="sfxMeta" class="tc-meta"></span>
+        <button id="btnSfxCollapse" class="mini" title="Show / hide the sound design panel">+</button>
+      </div>
+      <!-- Collapsed by default, like the captions panel: sonifying is a pass over the
+           whole edit rather than a per-clip control. -->
+      <div id="sfxPanel" hidden></div>
+
       <div class="panel-head" id="transPanelHead" hidden>
         <span class="title">Transition</span>
         <span id="transMeta" class="tc-meta"></span>
@@ -280,6 +289,7 @@
   <script src="../audiofx.js"></script>
   <script src="../screen.js"></script>
   <script src="../captions.js"></script>
+  <script src="../sfx.js"></script>
   <script src="meter.js"></script>
   <script src="anim.js"></script>
   <script src="cursor.js"></script>

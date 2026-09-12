@@ -380,6 +380,8 @@ src/recorder-preload.js   contextBridge for the recorder window - video bytes an
 src/renderer/recorder.html + recorder.js   the hidden capture window (MediaRecorder)
 src/captions.js           transcripts and captions: parsing, phrasing, placement, fillers
                           (loaded twice, like audiofx.js - see "Transcription and captions")
+src/sfx.js                sound design: the synthesised SFX library and the Sonify planner
+                          (loaded twice, like audiofx.js - see "Sound design")
 ```
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
@@ -403,7 +405,7 @@ Three columns, set by the `#app` grid in `styles.css`:
 | --- | --- |
 | `#left` — the left third | **The short itself and nothing else**: the preview canvas plus the transport strip. No settings panel may be added here; anything that would squeeze the viewer belongs in the inspector. |
 | `#right` — the middle | Toolbar, ruler, timeline tracks, and the render/log footer. Gives up width when the inspector is widened. |
-| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector (which grows the graphic editor and the effect stack as the selection calls for them), and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
+| `#inspectorCol` — the right | The QuickBin, framing, the clip inspector (which grows the graphic editor and the effect stack as the selection calls for them), the Captions and Sound design panels (both collapsed by default, because each is a pass over the whole edit rather than a per-clip control), and the text card editor (which appears only when exactly one text clip is selected). Resizable by dragging its left edge; the width lives in the `--insp-w` custom property. |
 
 The left column's width is `minmax(320px, 33.333%)` and never changes with panel state.
 
@@ -421,6 +423,8 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
   playhead: 0,
   tighten: { threshold, pad, noise },        // Tighten's settings - see below
   captions: { ... },                         // caption settings - see "Captions" below
+  sfx: { level, minGap, maxTicks,            // sound design settings - see "Sound design"
+         duck: {...}, triggers: {...} },
   tracks: [ Track, ... ] // index 0 is the TOPMOST track; video tracks sit above audio
 }
 ```
@@ -429,6 +433,10 @@ A project is one plain JSON object. `serialize()` in `app.js` writes it and
 Track = {
   id, type: 'video' | 'audio', name,   // 'V1', 'A2', ...
   muted, hidden, locked,
+  captions,                            // OPTIONAL - true on the one video track the
+                                       //   caption generator owns. See "Captions"
+  sfx,                                 // OPTIONAL - true on the one audio track Sonify
+                                       //   owns. See "Sound design"
   clips: [ Clip, ... ]                 // kept sorted by start
 }
 
@@ -451,6 +459,10 @@ Clip = {
   graphic,               // graphic clips only - the whole object, { type, params, keys }.
                          //   See "The graphics engine"; plain JSON, exactly like `card`
   captions,              // generated captions only - { gen: true, src } - see below
+  sfx,                   // SONIFIED sounds only - { gen: true, trigger, key }. The tag is
+                         //   what makes re-running Sonify replace its own placements
+                         //   instead of doubling them; a hand-placed sound has no `sfx`
+                         //   and is never swept. See "Sound design" below
   fit,                   // OPTIONAL - 'contain' draws the WHOLE picture inside the frame
                          //   and leaves the rest transparent; absent means the default,
                          //   which fills the frame and crops. See "Framing"
@@ -1164,6 +1176,134 @@ on the way out. `previewBandNode()` routes each span's element through the same
 `createMediaElementSource -> gain -> master` path a clip's audio takes, under the same two
 rules: only while the context is running, and the node is dropped with the element,
 because `createMediaElementSource` cannot be undone.
+
+### Sound design (SFX and Sonify)
+
+The rule is "if something appears on screen, it should make a sound". That is a rule an
+editor can execute, so it is a rule the app executes: **Sonify** walks the timeline,
+finds the moments, and places a sound at each one.
+
+The load-bearing decision is that **every placement is an ordinary audio clip**. Nothing
+here is a hidden effect: a sonified project is a project with more clips on an audio
+track, and those clips move, trim, retime, mute, delete and render through exactly the
+audio chain step 1 built. There is no second render path, so preview and export cannot
+drift — a placed sound is mixed by `syncMedia()` in the viewer and by `buildArgs()` in
+ffmpeg, the same way a music bed is.
+
+`src/sfx.js` is loaded **twice**, like `audiofx.js` and `screen.js`: as a `<script>`
+global `SFX` in `index.html`, and as a CommonJS module by `main.js`. Main needs the
+synthesiser; the renderer needs the planner.
+
+#### The bundled sounds are synthesised, not shipped
+
+There are eight of them — `pop`, `click`, `tick`, `whoosh`, `swipe`, `riser`, `impact`,
+`sub` — and none of them is a file in this repository. Each is a few lines of arithmetic
+in `SOUNDS` (a chirp with an exponential decay; noise through a one-pole band whose
+centre sweeps; a sine sliding down into a floor), rendered by `samplesFor()` and wrapped
+as a 16-bit mono WAV by `wavFor()`. `materialiseSfx()` in main writes them into
+`userData/sfx` the first time anything asks, and rewrites one only when it is missing or
+the wrong size — so the second launch costs a `statSync` each.
+
+Three things fall out of that, and all three are the point:
+
+- They are royalty-free because nobody else wrote them.
+- They work with no network and no download UI.
+- **Every generator is seeded** (`noise(seedOf(id))` — never `Math.random()`), so the
+  bytes are identical on every run and in every process. This is the same rule the film
+  burn's streaks and step 16's grain live by, and here it protects the render cache: a
+  sound file that changed between launches would silently invalidate every cached render
+  that used it.
+
+The user's own sounds are **not copied**. `sfx.json` in userData holds a path and a name
+per import, exactly as the QuickBin does, and a file that has moved comes back `missing`
+so the row greys out instead of failing when somebody sonifies with it. "Forget imports"
+removes entries from that list and deletes nothing from disk.
+
+#### The five triggers
+
+One entry each in `SFX.TRIGGERS`, and the panel and the planner both build themselves
+from that table — adding a sixth is an entry there plus the few lines in `sonifyScene()`
+that find its moments.
+
+| Trigger | Moment | Default |
+| --- | --- | --- |
+| `graphic` | A graphic clip's **entry** | `pop`, -2 dB |
+| `transition` | The start of a transition's window | `whoosh`, -3 dB, offset -0.06 s |
+| `click` | Each mouse-down in a recording's telemetry | `click`, -6 dB |
+| `counter` | Each step of a counting number, capped | `tick`, -12 dB |
+| `cut` | A **hard** cut into a data graphic | `impact`, -4 dB |
+
+Four details that are decisions rather than accidents:
+
+- **A graphic's moment is its entry, not its clip edge.** `inDelay` exists so an object
+  can arrive late; a pop on the clip's start would then be a pop at nothing.
+- **A click's moment comes through `clipClicks()`**, which retimes source-time telemetry
+  by the clip's `in` point. Reaching into `clip.screen.events` here instead would put
+  every sound back where the untrimmed file had it — the trap the note on `clipCursorAt()`
+  exists to head off. A clip with no telemetry contributes nothing, which is the normal
+  case and not an error: step 8's degradation contract, honoured.
+- **The tick count is capped** (`maxTicks`, default 12). A number counting to 1240 does
+  not get 1240 ticks; the ticks are spread over the entry, which is the window the number
+  is actually moving in.
+- **An impact goes on a hard cut only.** A cut with a transition on it already has a
+  whoosh, and stacking the two reads as a mistake rather than as emphasis.
+
+`SFX.plan(scene, opts)` is a **pure function** from a scene — five arrays of moments in
+timeline seconds — to a list of placements. It touches no clip and no DOM, which is what
+makes trigger timing checkable without a fixture; the renderer's `sonifyScene()` builds
+the scene, because only it knows how a clip's `in` point maps telemetry into timeline
+time. Two placements of the same trigger closer together than `minGap` (default 0.06 s)
+**collapse into one**: four graphics entering on the same frame are one pop, not a flam.
+A placement whose negative offset would push it before zero is not dropped — `start`
+clamps to 0 and `trim` says how much of the sound's head to cut, so the body of it still
+lands where the offset asked.
+
+#### Re-running replaces, and one undo covers the lot
+
+A placed clip carries `sfx: { gen: true, trigger, key }` — plain JSON, like everything
+else on a clip, because undo is `JSON.stringify` of the track list. That tag is the whole
+mechanism:
+
+- **Sonify is ONE `pushUndo()`**, however many sounds it places, and it ends in
+  `markDirty()` + `renderAll()` like every other timeline mutation.
+- Re-running sweeps away only clips carrying `sfx.gen` and places its output again, so it
+  **replaces rather than doubles**. Doubling every sound each time somebody nudges the SFX
+  level is the failure mode this avoids, and it is the same tag the caption generator uses
+  for the same reason.
+- A sound placed by hand from the library (the `+` button) is deliberately **untagged**,
+  so it survives every re-run and **Clear**. Once Sonify's output has been moved or
+  retimed it is still tagged, and a re-run will replace it — the tag means "this pass put
+  it here", not "nobody has touched it".
+
+They land on one dedicated audio track flagged `sfx: true` and named `SFX`, at the bottom
+of the stack. The flag is a plain boolean on the track, exactly like the caption track's
+`captions`, so it serialises with everything else and a re-run finds its own previous
+output without guessing from the track's name.
+
+#### Levels, and ducking through step 1's sidechain
+
+Each placement's gain is written onto the clip as an **`AudioFX` gain effect**, not as
+`clip.volume`: it is in dB, which is what the panel talks in, and the preview already
+mirrors gain effects (`AudioFX.previewGain`), so the balance while editing matches the
+render. The global **SFX level** is added to each trigger's own gain, so one knob is "all
+of it, quieter".
+
+Ducking is the same ducking the audio chain offers, applied to the whole pass: turn it on,
+name a voice track, and every placed clip gets a `duck` effect keyed to it, which
+`buildArgs()` wires as a `sidechaincompress` exactly as it does for a music bed. The SFX
+track is not offered as its own voice source — ducking a bus to itself is refused
+downstream, and offering it here would make that refusal look like a bug.
+
+#### The panel
+
+`#sfxPanel`, in the inspector column under Captions and collapsed by default for the same
+reason: sonifying is a pass over the whole edit, not a per-clip control. Rows are
+`TextUI.control` like every other panel — slider **and** typable box **and** scroll-nudge
+**and** reset — and, exactly as Tighten and Captions do, they pass their own hooks: these
+are project **settings**, so moving one snapshots no undo entry and dirties nothing. It
+shows what the next pass **would** place before committing, and the count of what is
+already there stays on the panel head so a collapsed panel still reports. Only Sonify,
+Clear and the library's `+` touch the timeline, and each is one undo entry.
 
 ### Tighten (silence removal)
 
@@ -3727,6 +3867,8 @@ through the hooks passed to `QuickBin.init()` in section 10 of `app.js`, and it 
 | A visual **effect** | one entry in `FX.DEFS` (`src/renderer/fx.js`) — its `params` are the defaults, its `schema` builds the inspector rows AND the keyframe strips, its `draw(L, p, t, entry, clip)` paints. There is no ffmpeg half; lengths go through `pxMin()` |
 | A **generator** that writes keyframes | a pure function returning tracks of `{t, v, ease, gen:'<name>'}` + `Cursor.applyGenerated()` to merge them + one panel with its own Generate/Clear. Never an opaque effect — see "Screen-recording treatment" |
 | A source of spans for Tighten to cut | `registerTightenSpans(fn)` in `app.js` §7 — return `[[start, end], ...]` in **source** time |
+| A **sonify trigger** | one entry in `SFX.TRIGGERS` (`src/sfx.js`) - its default sound, offset and gain, and the panel block and the planner both build themselves from it - plus the few lines in `sonifyScene()` (`app.js` §7c) that find its moments |
+| A bundled sound effect | one entry in `SFX.SOUNDS` (`src/sfx.js`): a length and a generator. It must be SEEDED - `noise(seedOf(id))`, never `Math.random()` - or the file rewritten on the next launch would invalidate every cached render that used it |
 | A caption setting | one entry in `Captions.DEFAULTS` (`src/captions.js`) + one `C({...})` row in `captionsPanelBody()` (`app.js` §7b) |
 | A per-card property that must NOT propagate across a multi-selection | one entry in `TEXT_PEER_SKIP` (`app.js` §4) |
 | A transcript format | a parser in `src/captions.js` and a branch in `parseTranscript()` — everything downstream takes `[{w, start, end, conf}]` |
@@ -3778,6 +3920,14 @@ track list — cheap and total; don't put non-serialisable values on clips or tr
   both of them hit the same disk cache, so the second one is a file read.
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The
   numbers are in "The fast path, and exactly what leaves it".
+- Sonify sounds five things - a graphic's entry, a transition, a mouse-down, a counting
+  number's steps and a hard cut into a stat. It does not listen to the audio: there is no
+  beat detection, so nothing is placed on the music. It also has no per-placement
+  variation - the same trigger uses the same file at the same gain every time, and the
+  answer to "these all sound identical" is to move or swap the clips it placed, which is
+  exactly what they are for.
+- The bundled sounds are synthesised, which makes them free, offline and reproducible, and
+  also makes them plain. A real library imports over them - see "Sound design".
 - The preview mirrors audio level and mute only; the DSP (denoise, EQ, de-ess, compression,
   ducking, loudness) is applied on render. This is the one deliberate preview/render
   disagreement in the app, and the inspector says so on screen.
