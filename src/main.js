@@ -17,8 +17,8 @@ const ScreenTel = require('./screen.js');
 // bundled sounds to disk; the renderer plans placements with the same module.
 const SFX = require('./sfx.js');
 
-// Magic Mask: MobileSAM through onnxruntime-node, the model downloads, and the matte
-// cache. It registers its own handlers in install() below, next to the window.
+// Resolve Matte: mattes rendered from DaVinci Resolve's Magic Mask, decoded once with
+// ffmpeg and cached. It registers its own handlers in install() below, next to the window.
 const Mask = require('./mask.js');
 // The agent API's outside door: a headless runner and a localhost server, both calling
 // Agent.dispatch() in the renderer. See src/agentserver.js and src/renderer/agent.js.
@@ -188,11 +188,10 @@ function createWindow() {
   win.on('closed', () => { win = null; });
 }
 
-// Magic Mask's handlers - the model downloads, MobileSAM itself and the matte cache.
-// Registered once, before the window exists, so a renderer that asks for `mask:state`
-// during its first paint gets an answer rather than a rejected invoke.
+// Resolve Matte's handlers - picking, probing and decoding a matte video. Registered
+// once, before the window exists, so a project opened on launch can load its mattes.
 Mask.install({
-  app, ipcMain,
+  app, ipcMain, dialog, ffmpegPath, ffprobePath,
   send: (ch, d) => { if (win && !win.isDestroyed()) win.webContents.send(ch, d); },
 });
 

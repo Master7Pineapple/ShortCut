@@ -66,19 +66,12 @@ contextBridge.exposeInMainWorld('api', {
   onScreenHotkeyToggle: (cb) => ipcRenderer.on('screen:hotkeyToggle', () => cb()),
   onScreenFailed: (cb) => ipcRenderer.on('screen:failed', (_e, m) => cb(m)),
 
-  // Magic Mask. Everything degrades to `{ ok:false, reason }` - no onnxruntime, no model,
-  // no network - and the renderer falls back to the local region-grow engine, which needs
-  // nothing. `mask:segment` is the injected engine `MagicMask` runs its loop through.
-  maskState: () => ipcRenderer.invoke('mask:state'),
-  maskFetch: () => ipcRenderer.invoke('mask:fetch'),
-  maskCancelFetch: () => ipcRenderer.invoke('mask:cancelFetch'),
-  maskSegment: (req) => ipcRenderer.invoke('mask:segment', req),
-  onMaskProgress: (cb) => ipcRenderer.on('mask:progress', (_e, d) => cb(d)),
-
-  // Mattes, cached on disk by path + size + mtime + the mask's own key - the waveform
-  // cache's rules, and the clip's timeline position is deliberately not in the key.
-  matteRead: (p, key) => ipcRenderer.invoke('mask:read', { path: p, key }),
-  matteWrite: (p, key, w, h, frames) => ipcRenderer.invoke('mask:write', { path: p, key, w, h, frames }),
+  // Resolve Matte. A matte video rendered from DaVinci Resolve, decoded once in main into
+  // run-length planes and cached on disk. Every call answers `{ ok:false, error }` on failure.
+  mattePick: () => ipcRenderer.invoke('matte:pick'),
+  matteProbe: (p) => ipcRenderer.invoke('matte:probe', p),
+  matteDecode: (req) => ipcRenderer.invoke('matte:decode', req),
+  onMatteProgress: (cb) => ipcRenderer.on('matte:progress', (_e, d) => cb(d)),
 
   saveProject: (data, filePath) => ipcRenderer.invoke('project:save', { data, filePath }),
   openProject: (filePath) => ipcRenderer.invoke('project:open', filePath),

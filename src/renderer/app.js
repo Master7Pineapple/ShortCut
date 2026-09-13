@@ -2648,15 +2648,15 @@ function clipFxPanel(clip) {
         'No mouse take on this clip, so this draws nothing. Record one with Mouse.'));
     }
     if (d.needs === 'mask') {
-      const mk = MagicMask.maskById(clip, fx.params.mask) ||
-        (MagicMask.hasMasks(clip) ? clip.masks[0] : null);
+      const mk = Matte.maskFor(clip, fx.params.mask);
+      const store = rmStore(mk);
       if (!mk) {
         row.appendChild(el('div', 'tc-hint fx-warn',
-          'No mask painted on this clip, so this draws nothing. Paint one in Magic Mask.'));
-      } else if (!Mask.mattes.get(mmKey(clip, mk))) {
+          'No matte on this clip, so this draws nothing. Import one in Resolve Matte.'));
+      } else if (!store || store.status !== 'ready') {
         row.appendChild(el('div', 'tc-hint fx-warn',
-          mk.name + ' has not been solved yet, so this draws nothing. Press Solve in ' +
-          'Magic Mask. A solve is cached on disk, so it comes back instantly next time.'));
+          mk.name + (store && store.status === 'error' ? ' failed to load: ' + store.error
+            : ' is still loading, so this draws the clip unmasked for now.')));
       }
     }
 
@@ -2826,9 +2826,9 @@ function clipFxPanel(clip) {
     o.value = type;
     const need = FX.DEFS[type].needs;
     o.disabled = (need === 'mouse' && !clipHasTake(clip)) ||
-      (need === 'mask' && !MagicMask.hasMasks(clip));
+      (need === 'mask' && !Matte.hasMasks(clip));
     o.textContent = FX.DEFS[type].label +
-      (o.disabled ? (need === 'mask' ? '  - needs a painted mask' : '  - needs a mouse take') : '');
+      (o.disabled ? (need === 'mask' ? '  - needs an imported matte' : '  - needs a mouse take') : '');
     add.appendChild(o);
   }
   add.addEventListener('change', () => {
@@ -4936,9 +4936,6 @@ function loop() {
     // And the track markers, for the same reason and on the same terms: an
     // affordance over the picture, never a layer in it.
     drawTrackOverlay(ctx, previewSize().w, previewSize().h);
-    // And the mask brush, on the same terms again: strokes and the live matte are
-    // what you told the model, painted over the picture rather than into it.
-    drawMaskOverlay(ctx, previewSize().w, previewSize().h);
     drawMeter();
   } catch (e) {
     // Reported once per distinct fault, so a persistent one does not flood the log at
@@ -7137,7 +7134,7 @@ async function openProject(filePath) {
       FX.normalizeClip(c);
       Graphics.normalizeClip(c);
       Tracker.normalizeClip(c);
-      MagicMask.normalizeClip(c);
+      Matte.normalizeClip(c);
       // Clamp a hand-edited or out-of-range rate curve, and drop a speed block that no
       // longer says anything, so an old project keys exactly as an untouched one does.
       Speed.normalize(c);
@@ -7243,11 +7240,10 @@ function buildJob(outPath, range) {
         // it is identical to. `Tracker.digest()` carries no timeline position, which is
         // the rule that lets a bound clip keep its cached render when it is dragged.
         tracks: trackDigests(c),
-        // And one step further along: a `matte` effect draws the object a set of painted
-        // strokes selected, so those strokes decide pixels the key could not otherwise
-        // see. The strokes themselves are small, but a digest is the right shape anyway -
-        // it is the prompts that matter, and `MagicMask.digest()` carries no timeline
-        // position, which is what lets a masked clip keep its cached render when it moves.
+        // And one step further along: a `matte` effect draws through an imported matte
+        // FILE, so the file (path, size, mtime), channel, detail and offset decide pixels
+        // the key could not otherwise see. `Matte.digest()` carries no timeline position,
+        // which is what lets a masked clip keep its cached render when it moves.
         masks: maskDigests(c),
         // And the last of the same family: a `lut` effect draws the grade a FILE holds,
         // so swapping the cube at that path is a different picture the key could not
@@ -7388,24 +7384,18 @@ function trackDigests(c) {
 }
 
 /**
- * The painted prompts every enabled `matte` effect on this clip reads, as checksums.
+ * The imported mattes every enabled `matte` effect on this clip reads, as checksums.
  *
- * Undefined when nothing masks, so a clip that merely carries a mask keys exactly as one
- * that never had one - painting is authoring, and a mask nothing cuts with changes no
- * pixels. The same rule, and the same shape, as `mouseDigest()` and `trackDigests()`.
- *
- * What is NOT in here is the matte. The mattes are the deterministic output of these
- * prompts over this file at this resolution, so hashing them as well would be hashing the
- * same fact twice - and it would drag fifty megabytes through a function the timeline
- * calls on every repaint to ask whether a span is still cached.
+ * Undefined when nothing masks, so a clip that merely carries a matte keys exactly as one
+ * that never had one. The same rule, and the same shape, as `trackDigests()`.
  */
 function maskDigests(c) {
   const out = [];
   for (const f of (c.fx || [])) {
     if (!(f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'mask')) continue;
-    const mk = MagicMask.maskById(c, f.params && f.params.mask) ||
-      (MagicMask.hasMasks(c) ? c.masks[0] : null);
-    out.push(mk ? MagicMask.digest(c, mk.id) : null);
+    const mk = Matte.maskFor(c, f.params && f.params.mask);
+    const store = rmStore(mk);
+    out.push(mk ? Matte.digest(mk, store && store.stamp) : null);
   }
   return out.length ? out : undefined;
 }
@@ -7866,6 +7856,9 @@ async function bakeOverlays(job) {
   // not arrived draws nothing, and the frame it drew nothing on is in the file forever.
   // One door, before anything is baked - see FX.preloadLuts().
   await FX.preloadLuts(allClips().map((x) => x.clip), state.master);
+  // And every imported matte: one that has not loaded draws the clip unmasked, and that
+  // frame is in the file forever.
+  await rmPreload(allClips().map((x) => x.clip));
   // The composite goes first: it decides which cards and clips are left to bake at all.
   const c = await bakeComposite(job);
   const a = await bakeTextClips(job);
@@ -8546,6 +8539,7 @@ async function composeCover(time, W, H) {
   // painted wrong, and unlike a viewer frame this one is written to a file.
   await FX.preloadImages(clips);
   await FX.preloadLuts(clips, state.master);
+  await rmPreload(clips);
   const layers = layersAt(time);
   await Promise.all(layers.filter(isPictureClip).map((c) => {
     const el = mediaFor(c);
@@ -9749,169 +9743,130 @@ function trackPanel(clip) {
 }
 
 
-// ---- Magic Mask ----------------------------------------------------------
+// ---- Resolve Matte -------------------------------------------------------
 //
-// Paint over the object, get the object.
-//
-// By step 12 this needed no new plumbing at all, which is exactly why it sits here and
-// not at the start of the roadmap. Step 5 gave the compositor alpha; step 6 made the bake
-// the single draw path so an effect is written once; step 7 made an effect a `DEFS` entry
-// with keyframes, a shutter and serialisation for free. So an extracted object is one
-// `destination-in` in `fx.js` and everything below: the brush, the propagation driver,
-// the matte store, and the provider that hands `fx.js` a plate.
+// A mask cut in DaVinci Resolve 19's Magic Mask, rendered out as a matte video and
+// imported here. Resolve does the tracking; ShortCut decodes the file once (in main, with
+// ffmpeg - see `src/mask.js`) and cuts the clip with it through the `matte` effect.
 //
 // WHAT LIVES WHERE, AND WHY THE MATTES ARE NOT ON THE CLIP
 //
-//   clip.masks    the PROMPTS - a few hundred bytes of strokes. Plain JSON, in the .scut,
-//                 in every undo snapshot.
-//   Mask.mattes   the PIXELS - tens of megabytes a minute. A renderer-side store keyed by
-//                 clip and mask, backed by the disk cache in `src/mask.js`.
+//   clip.masks    the REFERENCE - a path, a channel, a resolution and an offset. Plain
+//                 JSON, in the .scut, in every undo snapshot.
+//   RM.stores     the PIXELS - run-length planes, decoded once and cached on disk. A
+//                 renderer-side store keyed by file, channel and resolution.
 //
-// Putting a matte on a clip would put fifty megabytes through `JSON.stringify` on every
-// mutation of the timeline, which is what undo is. The rule the codebase has kept since
-// step 1 - nothing non-serialisable, and nothing large, on a clip - answers this on its
-// own: the strokes are the document, the mattes are a cache of what the strokes mean.
-//
-// SOLVING IS NOT AN UNDOABLE EDIT. Painting a stroke is - `pushUndo()` below - and running
-// the propagation is not, because it changes no timeline state at all: it fills a cache.
-// That is the same reason a waveform scan and a preview render take no undo entry.
+// Loading a matte is not an undoable edit: it changes no timeline state, it fills a cache.
 
-const Mask = {
-  on: false,           // is the brush armed? The viewer paints instead of framing while it is
-  busy: false,
-  cancel: false,
-  sign: 1,             // +1 object, -1 background
-  brush: MagicMask.DEFAULTS.brush,
-  stroke: null,        // { clip, mask, sign, pts, t } while the pointer is down
-  engine: 'local',     // which segmenter answered last: 'local' or 'sam'
-  state: null,         // the main process's model state, refreshed on demand
-  fetch: null,         // { got, total } while a model download is running
-  mattes: new Map(),   // clipId|maskId -> { key, w, h, frames: [{ t, alpha }] }
-  live: null,          // { clipId, maskId, t, w, h, alpha } - the frame being painted on
+const RM = {
+  stores: new Map(),   // storeKey -> { status, w, h, fps, channel, stamp, frames, error, done, total }
+  planes: new Map(),   // storeKey#index -> decoded Uint8Array, a small LRU
   plate: null,         // the last plate handed to fx.js, memoised by its own signature
-  perFrame: 0,         // seconds one matte actually took here, so a solve can be priced
-  active: new Map(),   // clipId -> maskId, which mask the panel is painting into
 };
+const RM_PLANES = 12;
 
-/** The store key. A clip and a mask, and nothing about where either one sits in time. */
-const mmKey = (clip, mask) => clip.id + '|' + mask.id;
+/** The store key: what decides the decoded pixels, and nothing about the clip. */
+const rmKey = (mask) => mask.src + '|' + mask.channel + '|' + mask.res;
 
-/** The analysis size for a mask - one place, so the brush and the solve agree. */
-function mmSize(clip, mask) {
-  const sw = clip.srcW || 1920, sh = clip.srcH || 1080;
-  const res = (mask && mask.res) || MagicMask.DEFAULTS.res;
-  const scale = Math.min(1, res / Math.max(1, Math.max(sw, sh)));
-  return { aw: Math.max(16, Math.round(sw * scale)), ah: Math.max(16, Math.round(sh * scale)) };
+function rmStore(mask) {
+  return mask ? RM.stores.get(rmKey(mask)) || null : null;
 }
 
-/**
- * The segmenter, installed once.
- *
- * MobileSAM through the main process when it is there, and the local region-grow when it
- * is not. The fall-back is INSIDE the engine rather than at the call sites, so the
- * propagation loop, the live preview and the smoke suite all get the same degradation
- * without any of them knowing there are two engines - and `Mask.engine` records which one
- * actually answered, so the panel can say so and the cache key can carry it.
- */
-MagicMask.setEngine(async (req) => {
-  const st = Mask.state;
-  if (st && st.ready) {
+/** Decode (or read from the disk cache) the matte a mask names. One flight per key. */
+function rmLoad(mask, force) {
+  const k = rmKey(mask);
+  const cur = RM.stores.get(k);
+  if (cur && !force && (cur.status === 'ready' || cur.status === 'loading')) return cur.promise;
+  const rec = { status: 'loading', src: mask.src, done: 0, total: 0 };
+  RM.stores.set(k, rec);
+  for (const pk of [...RM.planes.keys()]) if (pk.startsWith(k + '#')) RM.planes.delete(pk);
+  RM.plate = null;
+  rec.promise = (async () => {
+    let r;
     try {
-      const r = await window.api.maskSegment({
-        w: req.w, h: req.h, rgba: req.rgba,
-        points: req.points, box: req.box,
-        prevLow: req.prevLow ? Array.from(req.prevLow) : null,
-        key: req.key,
+      r = await window.api.matteDecode({ src: mask.src, channel: mask.channel, res: mask.res });
+    } catch (e) {
+      r = { ok: false, error: String((e && e.message) || e) };
+    }
+    if (RM.stores.get(k) !== rec) return rec;
+    if (r && r.ok) {
+      Object.assign(rec, {
+        status: 'ready', w: r.w, h: r.h, fps: r.fps, channel: r.channel, stamp: r.stamp,
+        frames: r.frames, cached: r.cached, error: null,
       });
-      if (r && r.ok && r.alpha) {
-        Mask.engine = 'sam';
-        return { alpha: r.alpha };
-      }
-      // A model that answers `{ok:false}` mid-solve is not a reason to abandon the solve.
-      // It falls through to the local engine for this frame and the panel says which one
-      // cut the matte - the degradation contract, applied one frame at a time.
-    } catch (e) { /* falls through, deliberately */ }
-  }
-  Mask.engine = 'local';
-  return MagicMask.localEngine(req);
-});
-
-/** Refresh what main knows about onnxruntime and the model files. */
-async function mmRefresh() {
-  try { Mask.state = await window.api.maskState(); } catch (e) { Mask.state = null; }
-  return Mask.state;
+      setStatus('Matte loaded: ' + r.frames.length + ' frames at ' + r.fps + ' fps from its ' +
+        r.channel + ' channel' + (r.cached ? ' (from the cache).' : '.'));
+    } else {
+      Object.assign(rec, { status: 'error', error: (r && r.error) || 'decode failed' });
+      setStatus('Matte failed to load: ' + rec.error, 'err');
+    }
+    RM.plate = null;
+    try { renderAll(); renderInspector(); } catch (e) { /* nothing selected */ }
+    return rec;
+  })();
+  return rec.promise;
 }
 
-async function mmFetchModels() {
-  if (Mask.fetch) { try { await window.api.maskCancelFetch(); } catch (e) { /* nothing to stop */ } return; }
-  Mask.fetch = { got: 0, total: 1 };
-  renderInspector();
-  let r = null;
-  try { r = await window.api.maskFetch(); } catch (e) { r = { ok: false, reason: 'failed', error: String(e) }; }
-  Mask.fetch = null;
-  await mmRefresh();
-  if (r && r.ok) setStatus('MobileSAM is ready. Re-solve a mask to cut it with the model.');
-  else if (r && r.reason === 'cancelled') setStatus('Download stopped.');
-  else {
-    setStatus('Could not download MobileSAM (' + ((r && (r.error || r.reason)) || 'unknown') +
-      '). Magic Mask keeps working on the built-in colour engine.', 'err');
+/** Every matte an enabled `matte` effect reads, loaded before anything is baked. */
+async function rmPreload(clips) {
+  const want = [];
+  for (const c of clips || []) {
+    if (!c || !Matte.hasMasks(c)) continue;
+    for (const f of (c.fx || [])) {
+      if (!(f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'mask')) continue;
+      const mk = Matte.maskFor(c, f.params && f.params.mask);
+      if (mk) want.push(rmLoad(mk));
+    }
   }
-  renderInspector();
+  await Promise.all(want);
 }
 
-// -------------------------------------------------------------- the matte store
+try {
+  window.api.onMatteProgress((d) => {
+    if (!d) return;
+    for (const s of RM.stores.values()) {
+      if (s.status === 'loading' && s.src === d.src) { s.done = d.done; s.total = d.total; }
+    }
+    setStatus('Decoding matte... ' + Math.min(100, Math.round(100 * d.done / Math.max(1, d.total))) + '%');
+  });
+} catch (e) { /* no bridge in a bare load */ }
 
-/** The matte nearest a SOURCE time, HELD rather than interpolated. */
-function mmFrameAt(store, t) {
-  if (!store || !store.frames.length) return null;
-  const f = store.frames;
-  // Held, never blended. Two mattes a twelfth of a second apart are two different cut-outs
-  // of a moving object, and averaging them gives a ghost of the object in both places -
-  // which is a worse picture than the object being one frame late.
-  let lo = 0, hi = f.length - 1;
-  if (t <= f[0].t) return f[0];
-  if (t >= f[hi].t) return f[hi];
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (f[mid].t <= t) lo = mid; else hi = mid;
-  }
-  return (t - f[lo].t) <= (f[hi].t - t) ? f[lo] : f[hi];
+/** One decoded plane, from a small LRU - a paused viewer decodes one frame, not sixty. */
+function rmPlane(mask, store, idx) {
+  const pk = rmKey(mask) + '#' + idx;
+  let a = RM.planes.get(pk);
+  if (a) { RM.planes.delete(pk); RM.planes.set(pk, a); return a; }
+  a = Matte.rleDecode(store.frames[idx], store.w * store.h);
+  RM.planes.set(pk, a);
+  while (RM.planes.size > RM_PLANES) RM.planes.delete(RM.planes.keys().next().value);
+  return a;
 }
 
 /**
  * The plate `fx.js` masks with: a canvas whose ALPHA is the matte, in FRAME space.
  *
- * Two jobs, and both are why this lives here rather than in `fx.js`.
+ * The matte is in SOURCE space and the layer is the FRAMED picture, so the plane is drawn
+ * through the same crop `drawClipTo()` uses - `Tracker.frameMap()`. Pan, zoom or re-frame
+ * the clip and the matte moves with the picture.
  *
- * 1. THE EDGE OPERATIONS run on the plane, at the mask's own resolution, in fractions of
- *    that plane's shorter side - so a feather of 0.004 is the same softness in the
- *    540x960 viewer and in the 1080x1920 file. That is `fx.js`'s unit rule, one file along.
- * 2. THE FRAMING. The matte is in SOURCE fractions and the layer is the FRAMED picture,
- *    so the plane is drawn through the same crop `drawClipTo()` uses - `Cursor.mapper()`,
- *    reached through `Tracker.frameMap()`, which is the single place that knows it. Pan,
- *    zoom or re-frame the clip and the matte moves with the picture because it is read
- *    through the same map, not because anything re-solved.
- *
- * Memoised on its own signature, so a paused viewer at 60fps builds one.
+ * The plate is built as TRANSPARENCY - white at full alpha falling to white at zero -
+ * never as black-and-white, which would be opaque everywhere and mask nothing.
  */
-function mmPlate(clip, mask, tSrc, W, H, p) {
-  const store = Mask.mattes.get(mmKey(clip, mask));
-  const eps = 1 / (2 * (mask.rate || MagicMask.DEFAULTS.rate));
-  const live = Mask.live && Mask.live.clipId === clip.id && Mask.live.maskId === mask.id &&
-    Math.abs(Mask.live.t - tSrc) <= eps ? Mask.live : null;
-  const rec = live || mmFrameAt(store, tSrc);
-  if (!rec) return null;
-  const w = live ? live.w : store.w, h = live ? live.h : store.h;
-  if (!w || !h) return null;
+function rmPlate(clip, mask, tSrc, W, H, p) {
+  const store = rmStore(mask);
+  if (!store || store.status !== 'ready' || !store.frames.length) return null;
+  const idx = Matte.frameIndex(mask, store.fps, store.frames.length, tSrc);
+  if (idx < 0) return null;
+  const { w, h } = store;
 
   const crop = Tracker.frameMap(clip, W / Math.max(1, H)).crop;
   const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
-  const sig = [clip.id, mask.id, rec.t, live ? 'L' : 'S', W, H,
+  const sig = [rmKey(mask), idx, W, H,
     r4(p.feather), r4(p.grow), p.invert ? 1 : 0, r4(p.mix),
     r4(crop.x), r4(crop.y), r4(crop.w), r4(crop.h)].join('|');
-  if (Mask.plate && Mask.plate.sig === sig) return Mask.plate.cv;
+  if (RM.plate && RM.plate.sig === sig) return RM.plate.cv;
 
-  const a = MagicMask.edge(rec.alpha, w, h, {
+  const a = Matte.edge(rmPlane(mask, store, idx), w, h, {
     feather: p.feather, grow: p.grow, invert: !!p.invert,
   });
   const mix = clamp(isFinite(Number(p.mix)) ? Number(p.mix) : 1, 0, 1);
@@ -9922,8 +9877,7 @@ function mmPlate(clip, mask, tSrc, W, H, p) {
   const img = pc.createImageData(w, h);
   for (let i = 0, k = 0; i < w * h; i++, k += 4) {
     img.data[k] = img.data[k + 1] = img.data[k + 2] = 255;
-    // `mix` fades the matte towards "no matte at all", which is alpha 255 EVERYWHERE -
-    // not towards alpha 0, which would fade the clip out instead of unmasking it.
+    // `mix` fades towards "no matte at all", which is alpha 255 EVERYWHERE.
     img.data[k + 3] = 255 - mix * (255 - a[i]);
   }
   pc.putImageData(img, 0, 0);
@@ -9936,450 +9890,107 @@ function mmPlate(clip, mask, tSrc, W, H, p) {
   c.drawImage(plane,
     crop.x * w, crop.y * h, Math.max(1, crop.w * w), Math.max(1, crop.h * h),
     0, 0, W, H);
-  Mask.plate = { sig, cv };
+  RM.plate = { sig, cv };
   return cv;
 }
 
 /**
- * The provider `fx.js` calls from inside a `matte` draw. `t` is CLIP-LOCAL time.
- *
- * The conversion to source time happens here and only here, because the clip is the only
- * thing that knows its own `in` - the same division of labour `Tracker.bindPos()` keeps.
- * `fx.js` must never see `clip.start`, and it does not: it sees a canvas.
+ * The provider `fx.js` calls from inside a `matte` draw. `t` is CLIP-LOCAL time; the
+ * conversion to source time happens here, because only the clip knows its own `in`.
+ * A matte that has not loaded yet starts loading and draws the clip unmasked meanwhile.
  */
 FX.setMatteProvider((clip, entry, t, W, H, p) => {
-  if (!clip || !MagicMask.hasMasks(clip)) return null;
-  const mask = MagicMask.maskById(clip, p && p.mask) || clip.masks[0];
+  if (!clip || !Matte.hasMasks(clip)) return null;
+  const mask = Matte.maskFor(clip, p && p.mask);
   if (!mask) return null;
   try {
-    return mmPlate(clip, mask, (Number(clip.in) || 0) + t, W, H, p || {});
+    if (!rmStore(mask)) { rmLoad(mask); return null; }
+    return rmPlate(clip, mask, (Number(clip.in) || 0) + t, W, H, p || {});
   } catch (e) {
     // A failed plate is a clip that draws unmasked, never a frame that does not draw.
     return null;
   }
 });
 
-// ------------------------------------------------------------- solving a mask
-
-/** The cache key for a mask's mattes over a clip's whole source range. */
-function mmCacheKey(clip, mask) {
-  return MagicMask.cacheKey({
-    t0: clip.in, t1: clip.out, res: mask.res, rate: mask.rate,
-    engine: (Mask.state && Mask.state.ready) ? 'sam' : 'local',
-    mask,
-  });
+/** Pick a matte file, attach it to the clip, and cut the clip with it. One undo entry. */
+async function rmImport(clip) {
+  let src = null;
+  try { src = await window.api.mattePick(); } catch (e) { src = null; }
+  if (!src) return null;
+  return rmAttach(clip, src);
 }
 
-function mmStatus(msg, cls) {
-  setStatus(msg, cls);
-  renderInspector();
-}
-
-/**
- * Cut the whole clip. The disk cache first, then the planned propagation.
- *
- * NOTHING HERE MUTATES THE CLIP, so there is no `pushUndo()` - a solve fills a cache.
- * What it must do is yield: a minute of frames at a second of inference each cannot be
- * allowed to hold the render loop, so every frame awaits a timeout, `loop()` keeps
- * painting, the window keeps answering, and Stop keeps working.
- */
-async function mmSolve(clip, mask) {
-  if (Mask.busy) { setStatus('A mask is already solving.', 'err'); return null; }
-  const el = mediaFor(clip);
-  if (!el) { setStatus('That clip has no media to mask.', 'err'); return null; }
-  if (!MagicMask.anchors(mask).length) {
-    setStatus('Paint on the object first - arm the brush, scrub to a frame and drag ' +
-      'across what you want to keep.', 'err');
+async function rmAttach(clip, src) {
+  const info = await window.api.matteProbe(src);
+  if (!info || !info.ok) {
+    setStatus('That file cannot be used as a matte: ' + ((info && info.error) || 'unreadable'), 'err');
     return null;
   }
-  const { aw, ah } = mmSize(clip, mask);
-  const key = mmCacheKey(clip, mask);
-
-  let cached = null;
-  try { cached = clip.src ? await window.api.matteRead(clip.src, key) : null; } catch (e) { cached = null; }
-  if (cached && cached.frames && cached.frames.length) {
-    Mask.mattes.set(mmKey(clip, mask), { key, w: cached.w, h: cached.h, frames: cached.frames });
-    Mask.plate = null;
-    renderAll();
-    mmStatus('Mask ready - ' + cached.frames.length + ' mattes, from the cache.');
-    return cached.frames;
-  }
-
-  const steps = MagicMask.plan(mask, clip.in, clip.out, mask.rate);
-  if (!steps.length) { setStatus('Nothing to solve over that range.', 'err'); return null; }
-
-  Mask.busy = true;
-  Mask.cancel = false;
-  const t0 = performance.now();
-  const frames = [];
-  try {
-    mmStatus('Cutting the mask...');
-    let i = 0;
-    await MagicMask.propagate(mask, steps, async (t) => {
-      const img = await trkFrame(el, t, aw, ah);
-      if (!img) return null;
-      return { w: aw, h: ah, rgba: img.data };
-    }, {
-      should: () => !Mask.cancel,
-      onFrame: async (rec) => {
-        frames.push(rec);
-        i++;
-        if (i % 3 === 0) setStatus('Cutting the mask... ' + Math.round(100 * i / steps.length) + '%');
-        // Never hang the render loop. `loop()` re-arms in a `finally` for the same reason.
-        await new Promise((res) => setTimeout(res, 0));
-      },
-    });
-    if (!frames.length) {
-      mmStatus('Nothing came back - the strokes did not select anything on that frame.', 'err');
-      return null;
-    }
-    frames.sort((a, b) => a.t - b.t);
-    Mask.mattes.set(mmKey(clip, mask), { key, w: aw, h: ah, frames });
-    Mask.plate = null;
-    Mask.live = null;
-    if (!Mask.cancel && clip.src) {
-      try {
-        await window.api.matteWrite(clip.src, key, aw, ah,
-          frames.map((f) => ({ t: f.t, alpha: Array.from(f.alpha) })));
-      } catch (e) { /* cache only - a solve that cannot be saved is still a solve */ }
-    }
-    markDirty();
-    renderAll();
-    // A completed solve is a better measurement than a test frame, because it includes the
-    // seek the test frame does not.
-    Mask.perFrame = Math.max(0.01, (performance.now() - t0) / 1000 / frames.length);
-    mmStatus('Mask cut: ' + frames.length + ' mattes in ' +
-      ((performance.now() - t0) / 1000).toFixed(1) + 's, by ' +
-      (Mask.engine === 'sam' ? 'MobileSAM' : 'the built-in colour engine') + '.');
-    return frames;
-  } catch (e) {
-    mmStatus('Masking failed: ' + ((e && e.message) || e), 'err');
-    return null;
-  } finally {
-    Mask.busy = false;
-  }
-}
-
-/**
- * Re-cut the ONE frame being painted on, so the mask previews live under the brush.
- *
- * This is the whole reason the encoder and the decoder are separate sessions: the second
- * stroke on a frame costs the decoder alone, ~90 ms, because main still holds that
- * frame's embedding under the same key. The key is the clip's source and the frame time,
- * which is exactly "the same picture" and nothing else.
- */
-async function mmLive(clip, mask, force) {
-  const el = mediaFor(clip);
-  if (!el || (Mask.busy && !force)) return null;
-  const t0 = performance.now();
-  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
-  const { aw, ah } = mmSize(clip, mask);
-  const img = await trkFrame(el, tSrc, aw, ah);
-  if (!img) return null;
-  const points = MagicMask.promptsAt(mask, tSrc, aw, ah);
-  if (!points.length) { Mask.live = null; Mask.plate = null; renderAll(); return null; }
-  const alpha = await MagicMask.solveFrame({
-    w: aw, h: ah, rgba: img.data, points, box: null, prev: null, prevLow: null,
-    anchor: true, key: (clip.src || clip.id) + '@' + tSrc.toFixed(4),
-  });
-  if (!alpha) return null;
-  Mask.live = { clipId: clip.id, maskId: mask.id, t: tSrc, w: aw, h: ah, alpha };
-  Mask.plate = null;
-  /*
-   * WHAT ONE FRAME COST, kept so the panel can price a whole solve BEFORE it is run.
-   *
-   * A solve is minutes, not seconds - the encoder is the expensive half and it runs once
-   * per matte. Asking someone to commit to that with no idea whether it is thirty seconds
-   * or six minutes is how a feature gets abandoned halfway through its first use. The
-   * estimate is measured rather than assumed, and it is measured on THIS machine with
-   * THIS engine on THIS clip, which is the only number that would ever be right.
-   *
-   * A test frame is the fair measurement for a propagated one: both run the encoder once
-   * and the decoder once. What it does not include is the seek, which is why the panel
-   * says "about".
-   */
-  Mask.perFrame = Math.max(0.01, (performance.now() - t0) / 1000);
-  renderAll();
-  return alpha;
-}
-
-/** How much of the frame this matte covers, as a percentage. The number a test answers. */
-function mmCoverage(alpha) {
-  if (!alpha || !alpha.length) return 0;
-  let n = 0;
-  for (let i = 0; i < alpha.length; i++) if (alpha[i] >= 128) n++;
-  return 100 * n / alpha.length;
-}
-
-/**
- * TEST ONE FRAME, then commit to the clip. The two-stage flow this feature needs.
- *
- * Every stroke already re-cuts the frame under the brush - that is what the tint is - but
- * it happens implicitly, and "implicitly" is not something anybody can rely on before
- * spending four minutes of inference. This is the same work with a button on it and a
- * NUMBER at the end, so the settings above can be dialled in against one frame and the
- * clip solved once, rather than solved three times to find out.
- *
- * The coverage is the honest read. A matte over 92% of the frame has selected the picture
- * rather than the object, which is what a too-small analysis resolution does and what the
- * first build shipped doing - so the panel names that case rather than leaving someone to
- * infer it from a wash of tint.
- */
-async function mmTestFrame(clip, mask) {
-  if (Mask.busy) { setStatus('A mask is already solving.', 'err'); return null; }
-  if (!MagicMask.anchors(mask).length) {
-    setStatus('Paint a stroke first - a test needs something to cut from.', 'err');
-    return null;
-  }
-  const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
-  if (!MagicMask.promptsAt(mask, tSrc, 100, 100).length) {
-    const at = MagicMask.anchorFor(mask, tSrc);
-    setStatus('No strokes on this frame. Scrub to ' + (at == null ? 'a painted frame' :
-      (at - clip.in).toFixed(2) + 's into the clip') + ', or paint here first.', 'err');
-    return null;
-  }
-  Mask.busy = true;
-  renderInspector();
-  try {
-    setStatus('Cutting this frame...');
-    const alpha = await mmLive(clip, mask, true);
-    if (!alpha) { mmStatus('That frame could not be cut - no decodable picture there.', 'err'); return null; }
-    const cov = mmCoverage(alpha);
-    const eng = Mask.engine === 'sam' ? 'MobileSAM' : 'the built-in colour engine';
-    if (cov > 92) {
-      mmStatus('This frame came back covering ' + cov.toFixed(0) + '% of the picture - that ' +
-        'is the whole frame, not the object. Raise Detail, or add a Subtract stroke on ' +
-        'the background.', 'err');
-    } else if (cov < 0.4) {
-      mmStatus('This frame came back nearly empty (' + cov.toFixed(1) + '%). Try a longer ' +
-        'stroke across the middle of the object.', 'err');
-    } else {
-      mmStatus('This frame: the matte covers ' + cov.toFixed(1) + '% of the picture, cut by ' +
-        eng + ' in ' + Mask.perFrame.toFixed(1) + 's. Happy with it? Press Solve clip.');
-    }
-    return alpha;
-  } finally {
-    Mask.busy = false;
-    renderInspector();
-  }
-}
-
-/** What a whole solve would cost, from what one frame actually took. */
-function mmEstimate(clip, mask) {
-  const n = MagicMask.plan(mask, clip.in, clip.out, mask.rate).length;
-  if (!n) return null;
-  // Until a frame has been measured, price it with the engine's own order of magnitude -
-  // and say "about" either way, because the seek is not in the measurement.
-  const per = Mask.perFrame || ((Mask.state && Mask.state.ready) ? 2.2 : 0.15);
-  return { frames: n, seconds: n * per, measured: !!Mask.perFrame };
-}
-
-/** "4 min 10 s", "38 s" - a duration a person can act on. */
-function mmDur(sec) {
-  if (sec < 90) return Math.max(1, Math.round(sec)) + ' s';
-  const m = Math.floor(sec / 60);
-  return m + ' min ' + Math.round(sec - m * 60) + ' s';
-}
-
-/** The mask the panel paints into on this clip - the first one unless told otherwise. */
-function mmActive(clip) {
-  if (!MagicMask.hasMasks(clip)) return null;
-  const id = Mask.active.get(clip.id);
-  return MagicMask.maskById(clip, id) || clip.masks[0];
-}
-
-function mmAddMask(clip) {
   pushUndo();
   if (!Array.isArray(clip.masks)) clip.masks = [];
-  const m = MagicMask.makeMask('Mask ' + (clip.masks.length + 1));
+  const name = src.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+  const m = Matte.makeMask(name, src, { channel: info.hasAlpha ? 'auto' : 'luma' });
   clip.masks.push(m);
-  MagicMask.normalizeClip(clip);
-  Mask.active.set(clip.id, m.id);
-  Mask.on = true;
-  // A fresh mask always starts by ADDING. Leaving the brush in Subtract from the last mask
-  // means the first stroke on a new one paints background and selects nothing, which reads
-  // as the model failing rather than as the brush being in the other mode.
-  Mask.sign = 1;
+  Matte.normalizeClip(clip);
+  // Cutting with it is what anybody importing a matte came to do, so the effect goes on
+  // with it - unless the stack already carries one.
+  if (!(clip.fx || []).some((f) => f && f.type === 'matte')) {
+    if (!Array.isArray(clip.fx)) clip.fx = [];
+    const f = FX.create('matte');
+    f.params.mask = m.id;
+    clip.fx.push(f);
+    FX.normalizeClip(clip);
+  }
   markDirty();
   renderAll();
-  mmStatus('Brush armed, set to Add. Scrub to a frame and drag across the object. If it ' +
-    'picks up something you did not want, switch to Subtract and drag over that.');
+  renderInspector();
+  if (!info.hasAlpha) {
+    setStatus('No alpha channel in ' + name + ' (' + info.pixFmt + ') - reading it as a black-and-white ' +
+      'matte from its luma. If it is not one, re-export from Resolve with Export Alpha on.', 'err');
+  }
+  await rmLoad(m);
   return m;
 }
 
-function mmRemoveMask(clip, mask) {
+function rmRemove(clip, mask) {
   pushUndo();
-  Mask.mattes.delete(mmKey(clip, mask));
   clip.masks = (clip.masks || []).filter((m) => m !== mask);
-  MagicMask.normalizeClip(clip);
-  Mask.live = null;
-  Mask.plate = null;
+  Matte.normalizeClip(clip);
+  RM.plate = null;
   markDirty();
   renderAll();
+  renderInspector();
 }
 
-// ------------------------------------------------------------------ the brush
-//
-// Strokes are painted on the VIEWER, over the composited picture, and stored in SOURCE
-// fractions - the same conversion a dropped tracker makes, through `trkSourcePoint()`,
-// which is the one function that knows the clip's crop backwards. Painting in frame space
-// and STORING in frame space would bake today's framing into the prompts, and re-framing
-// the clip afterwards would move the object out from under them.
-
-canvas.addEventListener('pointerdown', (e) => {
-  if (!Mask.on || Mask.busy || Mouse.recording || Trk.drag) return;
-  const clip = selectedClips().map((x) => x.clip)
-    .filter((c) => c.kind === 'video' && MagicMask.hasMasks(c))
-    .find((c) => {
-      const l = state.playhead - c.start;
-      return l >= -1e-6 && l <= clipLen(c) + 1e-6;
-    });
-  if (!clip) return;
-  const mask = mmActive(clip);
-  if (!mask) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const p = mousePointAt(e);
-  const s = trkSourcePoint(clip, p.x, p.y);
-  // ALT is the negative brush, read ONCE at the press: a modifier that could change
-  // halfway through a drag would give one stroke two meanings.
-  Mask.stroke = {
-    // ALT INVERTS THE CURRENT MODE rather than hardwiring "subtract", which is what every
-    // painting tool that has both does: in Add it gives you Subtract, and in Subtract it
-    // gives you Add. A modifier that always meant the same thing would leave someone in
-    // Subtract mode with no momentary way back. Read ONCE, at the press: one that could
-    // change halfway through a drag would give a single stroke two meanings.
-    clip, mask, sign: e.altKey ? -Mask.sign : Mask.sign,
-    pts: [s.x, s.y],
-    t: clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out),
-  };
-  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
-}, true);
-
-canvas.addEventListener('pointermove', (e) => {
-  const st = Mask.stroke;
-  if (!st) return;
-  const p = mousePointAt(e);
-  const s = trkSourcePoint(st.clip, p.x, p.y);
-  const n = st.pts.length;
-  // Thin the polyline as it is drawn rather than afterwards: a 120 Hz pointer over two
-  // seconds is a thousand samples of a scribble whose shape is twenty, and all thousand
-  // would go into the .scut and into every undo snapshot.
-  if (n >= 2 && Math.hypot(s.x - st.pts[n - 2], s.y - st.pts[n - 1]) < 0.004) return;
-  st.pts.push(s.x, s.y);
-}, true);
-
-canvas.addEventListener('pointerup', (e) => {
-  const st = Mask.stroke;
-  if (!st) return;
-  Mask.stroke = null;
-  e.preventDefault();
-  e.stopPropagation();
-  if (st.pts.length < 2) return;
-  pushUndo();
-  MagicMask.addStroke(st.mask, st.t, st.sign, st.pts, Mask.brush);
-  MagicMask.normalizeClip(st.clip);
-  // A new stroke invalidates the mattes cut WITHOUT it, which is the whole point of a
-  // cache key built out of the prompts: they are not deleted, they simply stop being what
-  // this mask's key names, and the next solve misses and re-cuts.
-  Mask.mattes.delete(mmKey(st.clip, st.mask));
-  markDirty();
-  renderAll();
-  mmLive(st.clip, st.mask);
-}, true);
-
-/**
- * The strokes and the live matte, drawn OVER the viewer and never into it.
- *
- * Exactly the terms the track markers and the take's rubber band keep: an affordance, not
- * a layer. Painted after `drawPreview()`, never composited, never baked, never in a cache
- * key. What goes into the picture is the `matte` effect; what goes on top of it is this,
- * so you can see what you told the model.
- */
-function drawMaskOverlay(c, W, H) {
-  if (!Mask.on) return;
-  const sel = selectedClips().map((x) => x.clip)
-    .filter((x) => x.kind === 'video' && MagicMask.hasMasks(x));
-  for (const clip of sel) {
-    const local = state.playhead - clip.start;
-    if (local < -1e-6 || local > clipLen(clip) + 1e-6) continue;
-    const mask = mmActive(clip);
-    if (!mask) continue;
-    const tSrc = srcAt(clip, local);
-    const map = Tracker.frameMap(clip, W / Math.max(1, H));
-    const eps = 1 / (2 * (mask.rate || MagicMask.DEFAULTS.rate));
-
-    // The live matte as a tint, so "what the model thinks" is visible even before a
-    // `matte` effect exists on the clip. Without it the first stroke does nothing you can
-    // see, and there is no way to tell a bad prompt from a missing model.
-    const live = Mask.live;
-    if (live && live.clipId === clip.id && live.maskId === mask.id && Math.abs(live.t - tSrc) <= eps) {
-      const plate = mmPlate(clip, mask, tSrc, W, H, { feather: 0, grow: 0, invert: 0, mix: 1 });
-      if (plate) {
-        const tint = fxSurface('mmTint', W, H);
-        const tc = tint.getContext('2d');
-        tc.setTransform(1, 0, 0, 1, 0, 0);
-        tc.globalCompositeOperation = 'source-over';
-        tc.globalAlpha = 1;
-        tc.clearRect(0, 0, W, H);
-        tc.fillStyle = Cursor.ACCENT;
-        tc.fillRect(0, 0, W, H);
-        tc.globalCompositeOperation = 'destination-in';
-        tc.drawImage(plate, 0, 0);
-        tc.globalCompositeOperation = 'source-over';
-        c.save();
-        c.globalAlpha = 0.38;
-        c.drawImage(tint, 0, 0);
-        c.restore();
-      }
-    }
-
-    // The strokes on THIS frame solid, the ones on other frames faint - a mask is a stack
-    // of corrections at different times, and seeing where the other anchors are is how you
-    // know whether to correct one or to add another.
-    const all = (mask.strokes || []).concat(
-      Mask.stroke && Mask.stroke.mask === mask
-        ? [{ t: Mask.stroke.t, sign: Mask.stroke.sign, r: Mask.brush, pts: Mask.stroke.pts }]
-        : []);
-    for (const s of all) {
-      const here = Math.abs(s.t - tSrc) <= eps;
-      c.save();
-      c.globalAlpha = here ? 0.85 : 0.16;
-      c.strokeStyle = s.sign > 0 ? '#4cd07d' : '#e0533f';
-      c.lineWidth = Math.max(2, 2 * clamp(s.r, 0.004, 0.5) * Math.min(W, H));
-      c.lineCap = 'round';
-      c.lineJoin = 'round';
-      c.beginPath();
-      for (let i = 0; i + 1 < s.pts.length; i += 2) {
-        const q = map(s.pts[i], s.pts[i + 1]);
-        if (i === 0) c.moveTo(q.x * W, q.y * H); else c.lineTo(q.x * W, q.y * H);
-      }
-      c.stroke();
-      c.restore();
+/** What does not line up between a loaded matte and its clip, as sentences. */
+function rmWarnings(clip, mask, store) {
+  const out = [];
+  if (!store || store.status !== 'ready') return out;
+  const n = store.frames.length;
+  const cfps = Number(clip.fps) || 0;
+  if (cfps && Math.abs(cfps - store.fps) > 0.02) {
+    out.push('Frame rate differs: the matte is ' + store.fps + ' fps, the clip ' + cfps +
+      ' fps. Render the matte at the source clip’s frame rate.');
+  }
+  const mdur = n / store.fps;
+  const cdur = Number(clip.mediaDuration) || 0;
+  if (cdur && cdur < 3000 && Math.abs(mdur + mask.offset - cdur) > 0.1) {
+    out.push('Length differs: the matte is ' + mdur.toFixed(2) + ' s, the source ' + cdur.toFixed(2) +
+      ' s. Render the whole source clip from Resolve, or set Offset to where the matte starts.');
+  }
+  if (clip.srcW && clip.srcH) {
+    const a = clip.srcW / clip.srcH, b = store.w / store.h;
+    if (Math.abs(a - b) / a > 0.02) {
+      out.push('Aspect differs: the matte is ' + store.w + 'x' + store.h + ', the clip ' + clip.srcW +
+        'x' + clip.srcH + '. Render at the source resolution, or at least the same aspect ratio.');
     }
   }
+  return out;
 }
 
-// Ask main what it has the moment the renderer is up, and repaint the panel when the
-// answer arrives - "which engine is cutting this" is the first thing the panel says.
-mmRefresh().then(() => { try { renderInspector(); } catch (e) { /* nothing selected yet */ } });
-try {
-  window.api.onMaskProgress((d) => {
-    if (!d) return;
-    if (d.phase === 'done') { Mask.fetch = null; mmRefresh().then(() => renderInspector()); return; }
-    Mask.fetch = { got: d.got || 0, total: d.total || 0 };
-    setStatus('Downloading MobileSAM... ' +
-      Math.round(100 * (d.got || 0) / Math.max(1, d.total || 1)) + '%');
-    renderInspector();
-  });
-} catch (e) { /* no bridge in a bare load */ }
-
 /**
- * The Magic Mask section of the inspector.
- *
- * Only for a clip with moving media to mask - the same degradation the tracking panel
- * keeps: an image has one frame and a text card has none, and a row of dead buttons is
- * worse than no row.
+ * The Resolve Matte section of the inspector. Only for a clip with moving media - an
+ * image has one frame and a text card has none.
  */
 function maskPanel(clip) {
   if (!clip || clip.kind !== 'video' || !clip.src) return null;
@@ -10387,176 +9998,53 @@ function maskPanel(clip) {
   const box = el('div', 'fx-az mm-box');
 
   const head = el('div', 'fx-head');
-  head.appendChild(el('b', null, 'Magic Mask'));
+  head.appendChild(el('b', null, 'Resolve Matte'));
   const n = (clip.masks || []).length;
-  head.appendChild(el('span', 'tc-hint', n ? n + (n === 1 ? ' mask' : ' masks') : 'none'));
+  head.appendChild(el('span', 'tc-hint', n ? n + (n === 1 ? ' matte' : ' mattes') : 'none'));
   box.appendChild(head);
 
-  // WHICH ENGINE, said out loud. A matte cut by colour and one cut by MobileSAM are
-  // different pixels from the same strokes, and an author who cannot tell which they are
-  // looking at cannot tell a bad prompt from a missing model.
-  const st = Mask.state;
-  const engRow = el('div', 'tc-hint fx-note');
-  if (st && st.ready) {
-    engRow.textContent = 'Cutting with MobileSAM.';
-  } else if (Mask.fetch) {
-    engRow.textContent = 'Downloading MobileSAM... ' +
-      Math.round(100 * Mask.fetch.got / Math.max(1, Mask.fetch.total)) + '%';
-  } else if (st && !st.ort) {
-    engRow.textContent = 'onnxruntime-node is not installed, so Magic Mask is using its ' +
-      'built-in colour engine: it holds a logo, a button, a UI panel or a solid shape ' +
-      'well, and a patterned object poorly.';
-  } else {
-    engRow.textContent = 'Using the built-in colour engine. MobileSAM (' +
-      Math.round(((st && st.totalBytes) || 45e6) / 1e6) + ' MB) cuts far better on real ' +
-      'footage - it downloads once, into userData/models.';
-  }
-  box.appendChild(engRow);
-
-  if (st && st.ort && !st.ready) {
-    const r = el('div', 'fx-add');
-    const dl = el('button', 'mini', Mask.fetch ? 'Stop download' : 'Download MobileSAM');
-    dl.addEventListener('click', () => mmFetchModels());
-    r.appendChild(dl);
-    box.appendChild(r);
-  }
-
   box.appendChild(el('div', 'tc-hint fx-note',
-    'Add a mask, then drag across the object on the viewer. When the brush picks up ' +
-    'something you did not want, switch to Subtract and drag over that - it is how the gap ' +
-    'between an arm and a torso gets cut away, and a tool with only one brush cannot say ' +
-    'it. Solve propagates across the clip; when it drifts, scrub to that frame, paint a ' +
-    'correction and solve again - everything before the correction is kept.'));
+    'Cut the object with Magic Mask in DaVinci Resolve, render the matte over the WHOLE ' +
+    'source clip as QuickTime ProRes 4444 with Export Alpha on, and import it here. Matte ' +
+    'frame N lands on source frame N, so trimming, splitting and moving the clip keep it ' +
+    'in place.'));
 
   const row = el('div', 'fx-add');
-  const add = el('button', 'mini', 'Add a mask');
-  add.disabled = Mask.busy;
-  add.addEventListener('click', () => mmAddMask(clip));
+  const add = el('button', 'mini', 'Import matte from Resolve...');
+  add.addEventListener('click', () => rmImport(clip));
   row.appendChild(add);
-
-  if (MagicMask.hasMasks(clip)) {
-    const brush = el('button', 'mini', Mask.on ? 'Brush: ON' : 'Brush: off');
-    brush.classList.toggle('on', Mask.on);
-    brush.title = 'While the brush is armed the viewer paints strokes instead of dragging ' +
-      'the framing.';
-    brush.addEventListener('click', () => { Mask.on = !Mask.on; renderAll(); renderInspector(); });
-    row.appendChild(brush);
-  }
-  if (Mask.busy) {
-    const stop = el('button', 'mini', 'Stop');
-    stop.addEventListener('click', () => { Mask.cancel = true; });
-    row.appendChild(stop);
-  }
   box.appendChild(row);
-
-  /*
-   * ADD and SUBTRACT as two visible buttons, not a modifier anybody has to be told about.
-   *
-   * Both brushes existed from the start - Alt-drag has always painted background - and it
-   * may as well not have: the first person to use the feature hit exactly the problem
-   * subtraction solves, read the panel that described Alt-drag, and asked for the minus
-   * brush to be added. A capability nobody can find is not a capability, and a line of
-   * hint text in a four-sentence paragraph is not a control.
-   *
-   * So the MODE is a pair of buttons that show which one is live and colour-match the
-   * strokes on the viewer, and Alt stays as the momentary override for the other one.
-   */
-  if (MagicMask.hasMasks(clip)) {
-    const signRow = el('div', 'fx-add mm-sign');
-    for (const [val, label, hint] of [
-      [+1, '+  Add', 'Paint the object. Everything you drag across is kept.'],
-      [-1, '−  Subtract',
-        'Paint background. Drag over anything the brush picked up that you did not want - ' +
-        'the region under the stroke is cut back out.'],
-    ]) {
-      const b = el('button', 'mini', label);
-      const live = Mask.sign === val;
-      b.classList.toggle('on', live);
-      b.classList.add(val > 0 ? 'mm-add' : 'mm-sub');
-      b.title = hint + '  (hold Alt while dragging for the other one.)';
-      b.addEventListener('click', () => {
-        Mask.sign = val;
-        // Switching the brush arms it: reaching for Subtract is already the decision to
-        // paint, and making someone press Brush afterwards is a step with no question in it.
-        Mask.on = true;
-        renderAll();
-        renderInspector();
-      });
-      signRow.appendChild(b);
-    }
-    box.appendChild(signRow);
-    box.appendChild(el('div', 'tc-hint',
-      Mask.sign < 0
-        ? 'Subtracting: drag over what the mask should NOT include. Hold Alt to add instead.'
-        : 'Adding: drag over the object. Hold Alt to subtract instead.'));
-  }
 
   for (const mask of (clip.masks || [])) {
     const mrow = el('div', 'mm-row');
-    const on = mmActive(clip) === mask;
     const bar = el('div', 'fx-bar');
-    const name = el('b', null, mask.name + (on ? '  (painting)' : ''));
-    name.addEventListener('click', () => { Mask.active.set(clip.id, mask.id); renderInspector(); });
-    bar.appendChild(name);
-    const store = Mask.mattes.get(mmKey(clip, mask));
-    const anch = MagicMask.anchors(mask);
-    bar.appendChild(el('span', 'tc-hint',
-      (mask.strokes.length || 0) + ' stroke(s), ' + anch.length + ' anchor(s)' +
-      (store ? ', ' + store.frames.length + ' mattes' : ', not solved')));
+    bar.appendChild(el('b', null, mask.name));
+    const store = rmStore(mask);
+    let st = 'not loaded';
+    if (store && store.status === 'loading') {
+      st = 'decoding' + (store.total ? ' ' + Math.min(100, Math.round(100 * store.done / store.total)) + '%' : '...');
+    } else if (store && store.status === 'ready') {
+      st = store.frames.length + ' frames, ' + store.fps + ' fps, ' + store.channel + ', ' + store.w + 'x' + store.h;
+    } else if (store && store.status === 'error') {
+      st = 'failed';
+    }
+    bar.appendChild(el('span', 'tc-hint', st));
     mrow.appendChild(bar);
 
-    /*
-     * TEST ONE FRAME, THEN SOLVE THE CLIP - and the two are deliberately different buttons.
-     *
-     * A solve costs the encoder once per matte, which is minutes on a clip of any length.
-     * Every other control in this panel changes what a solve would produce, so committing
-     * to one before checking a single frame is committing to finding out slowly. The test
-     * is the same work on one frame with a NUMBER at the end, and Solve then prices itself
-     * from what that frame actually took on this machine.
-     */
+    const file = el('div', 'tc-hint mm-file', mask.src);
+    file.title = mask.src;
+    mrow.appendChild(file);
+    if (store && store.status === 'error') mrow.appendChild(el('div', 'tc-hint fx-warn', store.error));
+    for (const w of rmWarnings(clip, mask, store)) mrow.appendChild(el('div', 'tc-hint fx-warn', w));
+
     const b2 = el('div', 'fx-add');
-
-    const test = el('button', 'mini', 'Test this frame');
-    test.title = 'Cuts the frame at the playhead and nothing else, and says how much of ' +
-      'the picture the matte covers. Free to repeat - use it to dial in the settings ' +
-      'below before spending a whole solve.';
-    test.disabled = Mask.busy || !anch.length;
-    test.addEventListener('click', () => mmTestFrame(clip, mask));
-    b2.appendChild(test);
-
-    const est = mmEstimate(clip, mask);
-    const solve = el('button', 'mini', (store ? 'Re-solve' : 'Solve') + ' clip' +
-      (est ? '  (~' + mmDur(est.seconds) + ')' : ''));
-    solve.title = est
-      ? est.frames + ' mattes at ' + mask.rate + ' a second, about ' +
-        (Mask.perFrame || 0).toFixed(1) + 's each' +
-        (est.measured ? ' as measured on the last frame cut here.'
-          : ' - an estimate until a frame has actually been cut.') +
-        '  Cached on disk afterwards, so it comes back instantly next time.'
-      : 'Paint a stroke first.';
-    solve.disabled = Mask.busy || !anch.length;
-    solve.addEventListener('click', () => mmSolve(clip, mask));
-    b2.appendChild(solve);
-
-    const clr = el('button', 'mini', 'Clear this frame');
-    clr.title = 'Removes the strokes painted on the frame at the playhead, and nothing else.';
-    clr.disabled = Mask.busy;
-    clr.addEventListener('click', () => {
-      const tSrc = clamp(srcAt(clip, state.playhead - clip.start), clip.in, clip.out);
-      pushUndo();
-      const gone = MagicMask.clearStrokesAt(mask, tSrc);
-      MagicMask.normalizeClip(clip);
-      Mask.mattes.delete(mmKey(clip, mask));
-      Mask.live = null;
-      Mask.plate = null;
-      markDirty();
-      renderAll();
-      mmStatus(gone ? 'Removed ' + gone + ' stroke(s) from this frame.' : 'No strokes on this frame.');
-    });
-    b2.appendChild(clr);
+    const reload = el('button', 'mini', store ? 'Reload' : 'Load');
+    reload.title = 'Read the file again - use after re-rendering the matte from Resolve over the same path.';
+    reload.addEventListener('click', () => { rmLoad(mask, true); renderInspector(); });
+    b2.appendChild(reload);
 
     const use = el('button', 'mini', 'Use as a matte');
-    use.title = 'Adds a Magic Mask effect to this clip’s stack, pointed at this mask.';
+    use.title = 'Adds a Resolve Matte effect to this clip’s stack, pointed at this matte.';
     use.addEventListener('click', () => {
       pushUndo();
       if (!Array.isArray(clip.fx)) clip.fx = [];
@@ -10566,76 +10054,50 @@ function maskPanel(clip) {
       FX.normalizeClip(clip);
       markDirty();
       renderAll();
+      renderInspector();
     });
     b2.appendChild(use);
 
     const del = el('button', 'mini', '✕');
-    del.title = 'Delete this mask and its strokes.';
-    del.disabled = Mask.busy;
-    del.addEventListener('click', () => mmRemoveMask(clip, mask));
+    del.title = 'Remove this matte from the clip. The file on disk is left alone.';
+    del.addEventListener('click', () => rmRemove(clip, mask));
     b2.appendChild(del);
     mrow.appendChild(b2);
 
-    /*
-     * THE TWO THINGS THAT ACTUALLY CHANGE THE ANSWER, and nothing else.
-     *
-     * Both already live on the mask and both are already in the matte cache key, so
-     * exposing them is genuinely only UI - turning either one down and back up serves the
-     * old mattes straight back out of the disk cache.
-     *
-     *   Detail  the long side the segmenter runs at. This is the one that matters most and
-     *           the one that has already gone wrong once: MobileSAM is trained at 1024 and
-     *           degrades sharply below it - measured on a plate whose answer is known to
-     *           the pixel, 1024 came back exact, 512 a third too big, and the 128 the first
-     *           build shipped by accident returned 99.9% of the frame. So Fast is offered
-     *           with its cost stated rather than as a neutral choice.
-     *   Mattes   how often the object is re-cut. It is the whole cost of a solve and the
-     *   a second whole of how well a fast-moving object is followed, in one number.
-     *
-     * Changing either is a real edit to the clip - undo, dirty, repaint - and it drops the
-     * mattes that were cut under the old value, because they are no longer what this
-     * mask's key names.
-     */
+    // A real edit to the clip - undo, dirty, repaint. Channel and Detail name a different
+    // decode, so they load; Offset only moves the lookup, so it re-reads nothing.
     const settings = el('div', 'mm-set');
-    const reCut = () => {
-      MagicMask.normalizeClip(clip);
-      Mask.mattes.delete(mmKey(clip, mask));
-      Mask.live = null;
-      Mask.plate = null;
-      Mask.perFrame = 0;          // a different size is a different cost; re-measure it
+    const changed = () => {
+      Matte.normalizeClip(clip);
+      RM.plate = null;
       markDirty();
+      rmLoad(mask);
       renderAll();
       renderInspector();
     };
-    // The inspector's own once-per-gesture guard for the undo snapshot, and `onChanged`
-    // for the work - the same three hooks every other clip panel passes. Dragging the
-    // rate slider is ONE undo entry, not one per notch.
-    const setHooks = { onEdit: inspectorEdit, onEditEnd: inspectorEditEnd, onChanged: reCut };
+    const setHooks = { onEdit: inspectorEdit, onEditEnd: inspectorEditEnd, onChanged: changed };
+    settings.appendChild(TextUI.control({
+      path: 'channel', label: 'Channel', type: 'select',
+      options: [
+        { value: 'auto', label: 'Auto - alpha if the file has it, else luma' },
+        { value: 'alpha', label: 'Alpha (ProRes 4444 with Export Alpha)' },
+        { value: 'luma', label: 'Luma (black-and-white matte, white = keep)' },
+      ],
+    }, mask, { channel: Matte.DEFAULTS.channel }, setHooks));
     settings.appendChild(TextUI.control({
       path: 'res', label: 'Detail', type: 'select',
       options: [
-        { value: 512, label: 'Fast - 512 (coarser, misses fine edges)' },
-        { value: 1024, label: 'Standard - 1024 (the model’s own scale)' },
-        { value: 2048, label: 'Fine - 2048 (crisper edge, 4x the memory)' },
+        { value: 480, label: 'Fast - 480 (softer edge, least memory)' },
+        { value: 960, label: 'Standard - 960' },
+        { value: 1920, label: 'Fine - 1920 (sharpest edge, 4x the memory)' },
       ],
-    }, mask, { res: MagicMask.DEFAULTS.res }, setHooks));
+    }, mask, { res: Matte.DEFAULTS.res }, setHooks));
     settings.appendChild(TextUI.control({
-      path: 'rate', label: 'Mattes a second', type: 'range',
-      min: MagicMask.RATE_MIN, max: 30, step: 1, digits: 0,
-    }, mask, { rate: MagicMask.DEFAULTS.rate }, setHooks));
+      path: 'offset', label: 'Offset (s)', type: 'range', min: -10, max: 10, step: 0.001, digits: 3,
+    }, mask, { offset: 0 }, setHooks));
     mrow.appendChild(settings);
 
     box.appendChild(mrow);
-  }
-
-  if (MagicMask.hasMasks(clip)) {
-    // The brush is a TOOL, not project state: it takes no undo entry and does not dirty
-    // the file, which is why it passes empty begin/end hooks the way the Tighten panel's
-    // own settings do.
-    box.appendChild(TextUI.control(
-      { path: 'brush', label: 'Brush size', type: 'range', min: 0.004, max: 0.2, step: 0.002, digits: 3 },
-      Mask, { brush: MagicMask.DEFAULTS.brush },
-      { onEdit: () => {}, onEditEnd: () => {}, onChanged: () => renderAll() }));
   }
   return box;
 }

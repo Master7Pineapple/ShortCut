@@ -125,23 +125,16 @@ There are thirty suites:
   finish takes every covered span off the fast path and lands in the render key (a
   different cube at the *same path* included) without carrying a timeline position, and
   that one undo restores it exactly.
-- `tools/smoke-mask.js` — Magic Mask: prompt encoding (a scribble resampled along its own
-  length with both ends kept and the count capped, and the **sign** carried through as a
-  label), that a negative stroke genuinely cuts a same-coloured neighbour back out, the
-  propagation loop following a shape it was shown on one frame only, that seeds are
-  re-derived from the mask that moved and are taken from **inside** it even when its
-  centroid is not, that a correction cuts the range into segments and each one decodes
-  from its own anchor while an anchor named by two segments is decoded **once**, the matte
-  edge operations and the order they run in, the unit rule measured at two plane sizes,
-  the cache key (same on a moved, trimmed or re-framed clip; different on a changed
-  stroke, resolution or engine; blind to the mask's id and name and to the order the
-  strokes were painted), the render key (absent until something cuts with it, unchanged by
-  a move, lost on an edit, absent again when the effect is bypassed), that a matte whose
-  mask was deleted draws the clip **unmasked** rather than throwing, that the plate is
-  built as transparency rather than black-and-white, and — when the model happens to be
-  downloaded — MobileSAM itself: that it takes the square it was pointed at and not the
-  identical one three squares over, and that a second prompt on the same frame is far
-  cheaper than the first. It needs no fixture and no model.
+- `tools/smoke-mask.js` — Resolve Matte: the run-length planes (round trip, long runs),
+  that matte frame N is source frame N and the ends are held, an offset sliding it, plane
+  sizing, the edge operations and their order, the unit rule, the data model (an old
+  painted mask dropped, bad settings repaired), both keys, that the `matte` effect cuts at
+  two resolutions, inverts, fades to *no matte* and draws the clip unmasked before its
+  matte loads — and, with two tiny fixtures (its header gives the ffmpeg commands), a real
+  ProRes 4444 alpha decode read back frame by frame, a refused alpha request on a file with
+  none, a luma matte read full-range, the disk cache, the mismatch warnings, that trimming
+  keeps the matte on the picture, the render key across a move, an offset and a bypass,
+  and one undo entry per import.
 - `tools/smoke-graphics.js` — the graphics engine: that each of the nineteen types paints
   **inside the bounds the baker crops to** and that those bounds are tight enough to be
   worth having (the assertion that stops an object being chopped off in the export only,
@@ -521,10 +514,10 @@ Clip = {
   tracks,                // OPTIONAL - solved motion tracks, [{ id, name, points, anchor }]
                          //   in SOURCE time and SOURCE fractions; absent until one is
                          //   dropped. See "Motion tracking"
-  masks                  // OPTIONAL - Magic Mask PROMPTS, [{ id, name, res, rate, strokes }]
-                         //   in SOURCE time and SOURCE fractions; absent until something
-                         //   is painted. The MATTES are not here - they are tens of MB and
-                         //   live in the disk cache. See "Magic Mask"
+  masks                  // OPTIONAL - imported Resolve mattes, [{ id, name, src, channel,
+                         //   res, offset }]; absent until one is imported. The PIXELS are
+                         //   not here - they are decoded into the disk cache. See
+                         //   "Resolve Matte"
 }
 ```
 
@@ -766,7 +759,7 @@ Sixteen types ship so far, and each one is **one function**:
 | `background` | a gradient, a solid or a blurred copy of the clip, drawn behind it |
 | `spotlight` | darken and blur everything outside a rounded rect or an ellipse |
 | `cutout` | a region lifted out, scaled up and floated with its own shadow |
-| `matte` | the clip cut to a painted Magic Mask, with feather, grow/choke and invert |
+| `matte` | the clip cut to a matte imported from DaVinci Resolve, with feather, grow/choke and invert |
 | `lut` | a .cube LUT, trilinear, at any amount |
 | `bloom` | highlights above a threshold, blurred and added back |
 | `grain` | seeded film grain, built small and scaled |
@@ -785,12 +778,12 @@ The layer's `L.base()` is the only other way past an effect's own parameters, an
 one effect uses it: `background`'s blurred-copy mode. See "The framing four" below.
 
 There is a third and last one, and it is an injection rather than a reach: `matte` asks
-`FX.setMatteProvider()` for a plate. The pixels of a matte are a neural network's output
-over a decoded frame, so they are neither synchronous nor anything `fx.js` could get to —
-it would need the media element, a disk cache, the clip's framing and an IPC round trip.
-So `app.js` installs a provider, hands back a canvas whose alpha is the matte, and takes on
-the matching duty of putting the prompts into the render key. Exactly the arrangement
-`setBinder()` already had, for exactly the same reason. See "Magic Mask".
+`FX.setMatteProvider()` for a plate. The pixels of a matte are a decoded video held behind
+an IPC round trip, so they are not anything `fx.js` could get to — it would need a disk
+cache, the clip's framing and the decoder. So `app.js` installs a provider, hands back a
+canvas whose alpha is the matte, and takes on the matching duty of putting the matte file
+into the render key. Exactly the arrangement `setBinder()` already had, for exactly the
+same reason. See "Resolve Matte".
 
 #### Binding a position to a motion track
 
@@ -1172,7 +1165,7 @@ and it carries `luts` — a digest of what the cube AT each path currently holds
 and for the master. A path alone would not do: swapping the file at that path for a
 different grade is a different picture, and the cached render of the old one would come
 straight back. `FX.lutDigest()` is the size, the mtime and a cheap sum over the table,
-and like `Tracker.digest()` and `MagicMask.digest()` before it, it carries no timeline
+and like `Tracker.digest()` and `Matte.digest()` before it, it carries no timeline
 position — which is what lets a graded clip keep its cached render when it is dragged.
 
 ### The audio chain
@@ -2388,362 +2381,78 @@ waveform cache's rule) plus `Tracker.cacheKey()` — the range, the anchor and t
 settings. So the same file tracked from the same pixel opens already solved, in every
 project that holds it.
 
-### Magic Mask
+### Resolve Matte
 
-Paint over the object, get the object.
+Cut an object out with **DaVinci Resolve 19's Magic Mask**, render the matte out as a
+video, and import it onto the clip here. Resolve does the tracking, which is the hard
+part; ShortCut decodes the file once and cuts the clip with it through the `matte`
+effect. (This replaced the in-app painted Magic Mask and its MobileSAM download.)
 
-It is the last step of Phase C and it needed **no new plumbing at all**, which is exactly
-why it is here and not at the start. Step 5 gave the compositor alpha; step 6 made the
-bake the single draw path, so a visual feature is written once; step 7 made an effect a
-`DEFS` entry that arrives with keyframes, a shutter, a panel and serialisation. So an
-extracted object is one `destination-in`, a stack order, and the machinery below.
+- `src/renderer/matte.js` — the pure half, a plain `<script>` global `Matte` and a
+  CommonJS module (main requires it too): the data model, the frame lookup, the
+  run-length planes, the edge operations and the keys. No DOM, no canvas, no ffmpeg.
+- `src/mask.js` — the decode half, main process only: `matte:pick`, `matte:probe` and
+  `matte:decode`. ffmpeg pipes the matte out as `gray` rawvideo at the chosen detail
+  (`alphaextract` for an alpha matte, `format=gray` with `out_range=full` for a luma one),
+  each frame is run-length encoded as it arrives, and the result is cached in
+  `userData/cache/rmatte`, keyed by path + size + mtime + channel + detail.
+- `app.js` — the "Resolve Matte" inspector panel, the renderer store (`RM`), the
+  provider that hands `fx.js` a plate, and `rmPreload()`, which the baker and the cover
+  composer await so an unloaded matte is never baked into a file as "no matte".
 
-Two files, split the way `track.js` and its worker are:
+#### Exporting from DaVinci Resolve 19
 
-- `src/renderer/magicmask.js` — the pure half, a plain `<script>` global `MagicMask`
-  loaded before `fx.js`. The data model, the prompt encoding, the propagation loop, the
-  matte edge operations and the cache key. No DOM, no canvas, no onnxruntime, no
-  filesystem: frames arrive as RGBA arrays and mattes leave as 8-bit alpha planes.
-- `src/mask.js` — the model half, main process only. MobileSAM: downloading it, verifying
-  it, loading it, running it, and the matte disk cache.
+1. Put the **source clip** on a Resolve timeline whose resolution and frame rate match the
+   clip (right-click the clip in the Media Pool → *Create New Timeline Using Selected
+   Clips*). Use the **whole, untrimmed clip**.
+2. In the **Color** page, add a node, open **Magic Mask**, stroke the object, and track it
+   (forward and backward) until it holds for the whole clip.
+3. Right-click the node graph → **Add Alpha Output**, then connect the Magic Mask node's
+   blue key output to the alpha output (the blue circle on the right).
+4. In the **Deliver** page: Format **QuickTime**, Codec **Apple ProRes 4444** (or
+   **GoPro CineForm RGB 12-bit** / **Uncompressed RGB 8-bit**), and tick **Export Alpha**.
+   Render a single clip over the **entire timeline**.
+5. In ShortCut, select the clip → **Resolve Matte → Import matte from Resolve...** and pick
+   the `.mov`. A `matte` effect is added to the stack automatically.
 
-#### What lands on a clip, and what deliberately does not
+No alpha option? Render the matte as a plain black-and-white video instead — for example a
+Fusion comp that outputs the mask as white on black — in any codec.
+The panel's **Channel: Auto** reads alpha when the file has it and luma when it does not;
+white means keep.
+
+#### What lands on a clip
 
 ```js
-clip.masks = [ { id, name, res, rate,
-                 strokes: [ { t, sign, r, pts: [x,y,x,y,...] }, ... ] } ]  // absent until painted
+clip.masks = [ { id, name, src, channel, res, offset } ]
 ```
 
-- `t` is **source** seconds, the axis `clip.tracks`, `clip.screen` and `clip.mouse` all
-  use — the only one that survives trimming, splitting and dragging the clip afterwards.
-- `x`,`y` are fractions of the **source** frame, so a stroke painted at preview resolution
-  means the same thing to a 1080x1920 render, and re-framing the clip afterwards does not
-  move the object out from under the prompts.
-- `sign` is +1 for a positive stroke (this is the object) and -1 for a negative one.
-- `r` is the brush radius, a fraction of the frame's shorter side.
+A path and three settings, never pixels: `clip.masks` is plain JSON in every undo snapshot
+and in the `.scut`. `channel` is `auto | alpha | luma`, `res` the decoded long side
+(480 / **960** / 1920 — the 9:16 crop of a 16:9 source is only ~540 wide), and `offset` the
+SOURCE time at which the matte's first frame sits. A painted mask from the old build has no
+`src` and is dropped by `Matte.normalizeClip()`.
 
-The **mattes are not on the clip**, and that is the load-bearing decision in the feature.
-The strokes are a few hundred bytes; a minute of mattes is tens of megabytes. Undo is
-`JSON.stringify` of the track list and the same shape is the `.scut` file, so putting the
-pixels there would push fifty megabytes through a stringify on every timeline mutation.
-They live in `Mask.mattes` in the renderer, backed by the disk cache — **the strokes are
-the document, the mattes are a cache of what the strokes mean.**
+#### Matte frame N is source frame N
 
-For the same reason, **solving is not an undoable edit.** Painting a stroke is
-`pushUndo()`; running the propagation changes no timeline state at all, so it takes no
-undo entry — the same reasoning a waveform scan and a preview render already follow.
+The lookup is by **source** time (`clip.in` + clip-local time) — `floor((t - offset) * fps)`,
+held rather than blended, clamped to the matte's own ends. Trimming, splitting and dragging
+the clip never move it, which is why the export has to cover the whole source clip. When
+the matte's fps, length or aspect does not match the clip, the panel says which in a
+warning line rather than silently sliding.
 
-#### Negative strokes are not optional
+#### The plate, the edges and the keys
 
-A click-only UI cannot say "the bright gap between the arm and the torso is background".
-One positive scribble down the arm and one negative in that gap is the difference between
-a cut-out and a cut-out wearing a halo, and no amount of positive painting expresses it.
-So the brush carries a sign, the sign becomes the decoder's point label, and it is in the
-cache key.
+The provider draws the decoded plane through `Tracker.frameMap()`'s crop, so re-framing the
+clip moves the matte with the picture. Grow, then feather, then invert, in fractions of the
+plane's shorter side (the unit rule), all keyframeable because they are `matte` params.
+**The plate is built as alpha**, white at full alpha falling to zero, never black-and-white.
+A matte that has not loaded yet draws the clip unmasked and starts the load.
 
-There are **two brushes, as two buttons** — `+ Add` and `− Subtract` — and Alt held during
-a drag is a momentary **invert** of whichever is live, not a hardwired minus: in Add it
-gives Subtract and in Subtract it gives Add, so someone working in Subtract still has a
-momentary way to the other one. The buttons carry the same green and red the strokes are
-painted in on the viewer, so *which brush am I holding* and *which strokes did it make* are
-one question. A fresh mask always starts in Add, because a first stroke that painted
-background would select nothing and read as the model failing.
-
-That pair started life as Alt-drag alone, described in the panel's hint text, and it may as
-well not have existed: the first person to use the feature hit exactly the problem
-subtraction solves, read the paragraph describing Alt-drag, and asked for the minus brush
-to be added. **A capability nobody can find is not a capability, and a line in a
-four-sentence paragraph is not a control.**
-
-`smoke-mask.js` holds that down with the case that makes it unavoidable: two squares of
-**identical colour**, one of them wanted. Nothing about colour can separate them; only
-"not that" can.
-
-That test is also what found the first implementation's bug. The local engine originally
-treated a negative as a *colour to stay away from*, which throws both squares away,
-because they are the same colour. What the author means by scribbling on the second one is
-"not that **thing**" — a region. So a negative grows its own region and that region is
-subtracted. The arm-and-torso case is the same shape of problem seen from the other side:
-the positive fill escapes through the gap into the background, and a negative in the gap
-carves the escaped component back out.
-
-#### Two engines, and the degradation contract
-
-The segmenter is **injected** — `MagicMask.setEngine()` — for exactly the reason
-`FX.setBinder()` is. `app.js` installs one that runs MobileSAM through the main process;
-`smoke-mask.js` installs nothing and gets the built-in one. That split is what lets the
-whole propagation loop be tested without a 45 MB download.
-
-| | What it is | What it holds |
-| --- | --- | --- |
-| **MobileSAM** | a 28 MB encoder + a 16 MB decoder, ONNX, through `onnxruntime-node` | real objects: people, hands, windows, a card in a list |
-| **built-in** | a connected colour region-grow, in `magicmask.js`, no download, no network | a logo, a coloured button, a UI panel, a solid shape |
-
-The fall-back lives **inside** the engine rather than at the call sites, so the loop, the
-live preview and the suite all get it without knowing there are two — and a model that
-fails halfway through a solve falls through for **that frame** and the solve carries on.
-`Mask.engine` records which one actually answered, the panel says so on screen, and the
-engine is in the matte cache key: a machine that finishes its download mid-project must
-not be served mattes cut by colour.
-
-Every failure is a **value**, never an exception. No onnxruntime, no model, no network, a
-corrupt download, a session that will not load: all of them answer
-`{ ok: false, reason, error }`. A rejected `invoke` in the middle of a paint is the
-failure mode the whole design avoids — this is step 8's contract for telemetry, kept here
-for models.
-
-#### The models
-
-Downloaded on first use into `userData/models`, with progress in the panel:
-
-```
-mobilesam.encoder.onnx   28,195,125 bytes   sha256 4125037c…6918
-mobilesam.decoder.onnx   16,514,086 bytes   sha256 b0735abf…d279
-```
-
-From `PulpCut/mobilesam-onnx` on Hugging Face; set `SHORTCUT_SAM_BASE` to a mirror, or to
-a **local directory** holding the same two files, which is the only way this feature is
-testable on a machine that is never allowed out. Each file downloads to a `.part`, is
-checksummed, and is renamed only if it matches — a truncated 28 MB ONNX loads far enough
-to throw somewhere deep inside a graph optimiser, and "your model is corrupt,
-re-downloading" is a better message than that stack trace. `onnxruntime-node` is a native
-module, so it needs an `asarUnpack` entry alongside the ffmpeg ones.
-
-#### Why the encoder and the decoder are separate sessions
-
-Because they cost two different orders of magnitude, and that asymmetry **is** the
-interaction design.
-
-| | measured here, 1024x576 | depends on |
-| --- | --- | --- |
-| encoder | ~2.0 s | the picture only |
-| decoder | ~90 ms | the embedding plus the prompts |
-
-So the embedding is computed once per frame and held in a four-entry LRU in main, and
-every subsequent stroke re-runs the decoder alone. That is what makes "the mask previews
-live as you paint" true rather than aspirational, and it is why `mask:segment` takes a
-frame `key` — the key is what says *this is the same picture you encoded a moment ago*.
-`smoke-mask.js` measures the two and asserts the second prompt is the cheaper one.
-
-`MagicMask.DEFAULTS.res` is **1024**, which is SAM's own scale rather than an arbitrary
-number, and `res`/`rate` are repaired to the defaults rather than clamped when a stored
-value is out of band — see "The clamp that ate the mask" below. The encoder resizes whatever it is handed so its long side is 1024 and pads to a
-square, so feeding it 512 buys no speed at all — the graph does the same work — and it
-costs accuracy: measured on a synthetic plate whose answer is known to the pixel, a 1024
-frame comes back exact and a 512 one comes back with a region a third too big. Nothing
-downstream cares, because mattes are stored run-length encoded and a flat one is
-kilobytes whatever its nominal size.
-
-Prompt coordinates go into the graph scaled by that same `1024 / max(w, h)`, and
-`orig_im_size` is the untouched frame size. Getting that scale wrong does not throw — it
-segments confidently around the wrong pixel — which is why it is a named constant and why
-the suite checks the box lands on the square.
-
-#### The clamp that ate the mask
-
-Worth writing down, because it shipped and because the shape of it will recur.
-
-`clamp(v, lo, hi)` in this codebase answers `lo` for anything that is not a number. So
-`clamp(undefined, 128, 2048)` is `128`, and a `|| DEFAULTS.res` written after it **never
-fires**, because 128 is truthy. Four values in `magicmask.js` were written that way, and
-the visible one was `res`: every mask painted by the first build was cut at 128 px instead
-of 1024, where MobileSAM returns **99.9% of the frame**. The symptom was not an error — it
-was a wash of tint over the whole picture on the very first stroke, which reads as "this
-feature does not work" rather than as a number being wrong.
-
-The suite missed it because every mask it built passed explicit options, and the app never
-passes any: there is no control for `res` or `rate`. The fix is one helper, `fill(v, d, lo,
-hi)` — default **then** clamp — and `smoke-mask.js` now pins the no-argument case
-specifically, plus the end-to-end version of it, which is the one that would have caught it
-alone: *the analysis frame the app actually builds for a default mask on a 1920x1080 clip is
-1024 x 576.*
-
-`res` and `rate` are **repaired to the default** when a stored value is out of band, not
-clamped to the band's floor. Neither has a control, so the only value either has ever
-legitimately held is the default, which means anything out of band was written by the
-broken build — clamping would leave a mask cut at 512 that nobody asked for. A project
-saved by that build opens repaired. When a control for these arrives, it must offer values
-inside the bands (`res` 512–2048, `rate` 4–60) and this becomes an ordinary clamp.
-
-The other three instances were quieter and would have been reported as vague quality
-complaints: a stroke saved without a radius got the smallest brush allowed rather than the
-default one, and the built-in colour engine's reach was **4** instead of 42 — tight enough
-to refuse a faintly textured region, which is every real one.
-
-#### Propagation drifts, and the answer is a correction
-
-Each frame is decoded from the previous frame's matte: a box derived from it bounds the
-search, its low-resolution logits seed `mask_input`, and a handful of deep-interior points
-supply the prompt. Those seeds are **re-derived from the mask that moved**, never re-used
-from the anchor — re-using them would pin the matte to where the object *was*. And they
-are taken from inside the matte even when its centroid is not: a C-shaped matte has its
-centre of mass in the hole, and one seed there sends the next frame off following the
-background, which looks exactly like a tracking failure and is not one.
-
-`mask_input` takes **logits**, not probabilities. The conversion is one line in
-`src/mask.js` and it is the most load-bearing line in the loop: hand the decoder
-probabilities and you get a propagation that quietly ignores its own history.
-
-It will still drift. When it does, **scrub to that frame, paint a correction, and solve
-again**: `MagicMask.plan()` treats every painted frame as an anchor, cuts the range into
-segments at them, and runs each segment forward from its own anchor. The segment before a
-correction is untouched — the same contract `Tracker.reanchorAt()` keeps for a dragged
-tracker, and for the same reason: the solved past is work already accepted. Painting on
-the **middle** of a clip means the whole clip, not the second half of it, so the first
-anchor also owns everything before it and is solved backward.
-
-An anchor named by two segments — the frame a person painted in the middle, claimed by
-the backward run and the forward one — is **decoded once**. Every segment needs its own
-anchor entry to have anything to seed itself with, so `plan()` emits it twice; `propagate()`
-decodes it on first mention and re-uses it, which saves an inference and is the only
-self-consistent answer. Two records at one instant would be two answers to one question.
-
-Strokes painted within half a matte-step of each other are the **same** anchor: a person
-scrubbing one frame and painting four strokes on it is correcting one frame, and letting a
-3 ms scrub difference split that into two anchors would solve the clip twice and disagree
-with itself in the overlap.
-
-#### The matte edges, and the order they run in
-
-`MagicMask.edge()` does grow/choke, feather and invert, **in that order**, and the order
-is the feature rather than a detail of it. Growing after feathering would re-harden the
-edge that was just softened, so "feather 0.02, choke 0.01" would come back hard.
-Inverting first would grow the *background*, so a choke meant to pull a halo in would push
-it out instead. `smoke-mask.js` asserts each of the three against the other two.
-
-The feather is three separable box blurs — a gaussian to well within an 8-bit level — and
-its edges **clamp** rather than reading zero. A feather that faded towards nothing at the
-frame border would eat a matte that runs off the edge of the picture, which is what a
-matte of a person standing at the side of the shot does, and the symptom is a cut-out with
-a soft grey stripe down one side.
-
-**The unit rule, inherited from `fx.js`:** every length here is a fraction of the matte
-plane's **shorter side**, never a pixel count. The plane is built at the mask's resolution
-and drawn scaled to whatever is being painted — 540x960 in the viewer, 1080x1920 in the
-file — so a "4 px" feather would be twice as soft in one as in the other. `smoke-mask.js`
-states it as a measurement: the same fraction at 64 and at 256 agrees to within 20 levels
-of 255, sampled across the steepest part of the ramp.
-
-**Masks composite on the ALPHA channel.** This codebase has now hit that four times. The
-plate `fx.js` masks with is built as transparency — white at full alpha falling to white
-at zero — never as black-and-white, because an opaque black-and-white plate is opaque
-everywhere, `destination-in` keeps everything, and the symptom is not an error but a matte
-that masks nothing.
-
-#### The provider, and where the framing is applied
-
-`fx.js` never sees a matte plane. `app.js` installs `FX.setMatteProvider()`, which hands
-back a W x H canvas whose **alpha** is the matte, and does two things on the way:
-
-1. **The edge operations**, on the plane, at the mask's own resolution — so the parameters
-   on the effect keyframe through `Anim` like any others, and a matte can open up over two
-   seconds or a choke ride in as a face turns.
-2. **The framing.** The matte is in source fractions and the layer is the framed picture,
-   so the plane is drawn through the same crop `drawClipTo()` uses — `Cursor.mapper()`,
-   reached through `Tracker.frameMap()`, which is the single place that knows it. Pan, zoom
-   or re-frame the clip and the matte moves with the picture because it is read through the
-   same map, not because anything re-solved.
-
-The provider converts clip-local time to source time, because the clip is the only thing
-that knows its own `in` — the same division of labour `Tracker.bindPos()` keeps. With no
-provider installed the `matte` type draws the clip **untouched**, which is the honest
-answer: "there is no matte yet" must never mean "there is no clip". A matte whose mask has
-been deleted takes that same path, and the suite asserts it.
-
-Mattes are **held** between samples, never blended. Two mattes a twelfth of a second apart
-are two different cut-outs of a moving object, and averaging them gives a ghost of the
-object in both places — a worse picture than the object being one frame late.
-
-#### Two caches, and the one rule they both keep
-
-Mattes are cached in `userData/cache/matte`, keyed by path + size + mtime — the waveform
-cache's rule — plus `MagicMask.cacheKey()`: the source range, the resolution, the rate,
-the engine, and the strokes. **Nothing about the clip is in it.** Move it, trim it,
-duplicate it, re-frame it, put it on another track: the same mattes come back in a file
-read instead of a minute of inference. The mask's own `id` and `name` are out too, so a
-duplicated clip shares the original's mattes, and the strokes are sorted by time so the
-key does not depend on the order of the person's hand.
-
-They are stored **run-length encoded**. A matte is mostly a flat 0 and a flat 255 with a
-thin ramp between, so a 1024-side plane that costs 590 KB raw lands in a couple of
-kilobytes.
-
-The **render** cache key is separate and answers a different question. `maskDigests()` puts
-a checksum of the prompts into the job for every **enabled** `matte` effect and nothing
-otherwise — so a clip that merely carries a mask keys exactly as one that never had one,
-and a bypassed matte keys as no matte at all. Painting is authoring; a mask nothing cuts
-with changes no pixels. The mattes themselves are *not* in it: they are the deterministic
-output of those prompts over that file at that resolution, so hashing them as well would
-be hashing the same fact twice — and it would drag fifty megabytes through a function the
-timeline calls on every repaint.
-
-#### Test one frame, then commit to the clip
-
-A solve runs the encoder once per matte, so it is minutes on a clip of any length — and
-everything else in the panel changes what a solve would *produce*. Committing to one before
-checking a single frame is committing to finding out slowly, three solves later.
-
-So the panel has two buttons, not one:
-
-- **Test this frame** cuts the frame at the playhead and nothing else, and reports what
-  came back: *"the matte covers 9.4% of the picture, cut by MobileSAM in 2.1 s."* Free to
-  repeat, so the settings below it can be dialled in against one frame.
-- **Solve clip (~2 min 41 s)** prices itself *before* it runs, from what a frame actually
-  took on **this** machine with **this** engine on **this** clip — the only number that
-  would ever be right. Until a frame has been cut it says so: an estimate and a measurement
-  must not look the same.
-
-Coverage is the honest read, and it exists to name a specific failure. A matte over 92% of
-the frame has selected the *picture*, not the object — which is exactly what the 128 px bug
-produced, and it presented as an unexplained wash of tint. The panel now says it in a
-sentence. Under 0.4% gets the opposite advice.
-
-Two settings, and deliberately only the two that change the answer:
-
-| | what it does | cost |
-| --- | --- | --- |
-| **Detail** | the long side the segmenter runs at — Fast 512, Standard 1024, Fine 2048 | memory, and accuracy below 1024 |
-| **Mattes a second** | how often the object is re-cut, 4–30 | linear: it *is* the solve time |
-
-Both already lived on the mask and both were already in the matte cache key, so exposing
-them is genuinely only UI — turn Detail down and back up and the old mattes come straight
-back out of the disk cache, because a key is content and not a timestamp. Changing either
-is a real edit: one undo entry for a slider drag, and the mattes cut under the old value
-are dropped because they are no longer what this mask's key names.
-
-`Fast — 512` is offered with its cost stated rather than as a neutral choice, because it is
-not one: MobileSAM is trained at 1024 and degrades sharply below it.
-
-#### The panel and the brush
-
-**Magic Mask** sits above the effect stack in the clip inspector, for the same reason
-motion tracking does: the stack reads it, so the mask has to exist before a row pointing at
-one is worth offering. Only on a video clip — an image has one frame and a text card has
-none, and a row of dead buttons is worse than no row.
-
-- **Add a mask** arms the brush. While it is armed the viewer paints strokes instead of
-  dragging the framing, which is the same capture-phase arrangement the tracker's markers
-  and the mouse take use.
-- **Drag** paints the object; **Alt-drag** paints background. The modifier is read once, at
-  the press: one that could change halfway through a drag would give one stroke two
-  meanings.
-- The stroke previews **live** — one decoder run on the frame under the brush — and is
-  drawn back over the viewer as a tint, so the first stroke does something you can see even
-  before a `matte` effect exists. Strokes on the current frame are solid and strokes on
-  other frames are faint, because a mask is a stack of corrections at different times and
-  knowing where the other anchors are is how you decide whether to correct one or add one.
-- **Solve** propagates across the clip; **Clear this frame** removes the strokes painted at
-  the playhead and nothing else; **Use as a matte** adds the effect.
-
-`matte` carries `needs: 'mask'`, so it is offered in the "add an effect" menu but
-**disabled with a reason** on a clip with nothing painted, and an effect already on such a
-clip carries a warning line — including the second one, that the mask exists but has not
-been solved yet. That is the gap which made the two pointer effects addable to any clip and
-then silently draw nothing, closed on arrival this time.
-
-Painting a stroke is one `pushUndo()`, one `markDirty()` and one `renderAll()`. Solving
-yields the thread between frames, so the viewer keeps painting, the window keeps answering
-and **Stop** keeps working — `loop()` re-arms in a `finally` for exactly the same reason.
+Two keys. The decode key (`Matte.cacheKey`) is the file's stamp, channel and detail — not
+the offset, which is applied at lookup. The render key (`maskDigests()` →
+`Matte.digest()`) is path, channel, detail, offset and the file stamp, only for an enabled
+`matte`, with no timeline position — so a moved clip keeps its render, and re-exporting over
+the same path from Resolve drops it. After re-exporting, press **Reload** in the panel.
 
 ### Transcription and captions
 
@@ -4632,14 +4341,11 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
   reorders them for you — see "The framing four, and why order is the whole feature".
 - An effect does not apply inside a transition window, in the preview or in the render —
   see "The effect stack".
-- Magic Mask ships with a built-in colour region-grow and downloads MobileSAM on first
-  use. Without the model it holds a logo, a coloured button, a UI panel or a solid shape
-  well and a patterned object poorly, and the panel says which engine cut the matte — see
-  "Magic Mask". Mattes are held between samples rather than interpolated, so a fast-moving
-  object at a low mask rate is up to half a step late.
-- Masking is per clip and per source frame. There is no tracking of a matte across a cut,
-  and a mask painted on one clip is not shared with another cut of the same file — though
-  both of them hit the same disk cache, so the second one is a file read.
+- Resolve Matte does no tracking of its own: the matte is only as good as the Magic Mask
+  track in Resolve, and it has to be rendered over the whole source clip at the source's
+  frame rate (or placed with Offset). A matte is per clip; two cuts of the same file each
+  import it, though both hit the same disk cache. A long matte at Fine detail holds its
+  run-length planes in memory — a few KB a frame for a clean key, more for a noisy one.
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The
   numbers are in "The fast path, and exactly what leaves it".
 - A project **master finish** takes *every* span it covers off the fast path, so turning
@@ -4766,8 +4472,7 @@ already rewrites `app.asar` → `app.asar.unpacked` in the binary paths):
 ```json
 "build": {
   "appId": "com.local.shortcut",
-  "asarUnpack": ["**/ffmpeg-static/**", "**/ffprobe-static/**",
-                 "**/onnxruntime-node/**"]
+  "asarUnpack": ["**/ffmpeg-static/**", "**/ffprobe-static/**"]
 }
 ```
 
