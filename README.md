@@ -2415,7 +2415,20 @@ effect. (This replaced the in-app painted Magic Mask and its MobileSAM download.
 5. In ShortCut, select the clip → **Resolve Matte → Import matte from Resolve...** and pick
    the `.mov`. A `matte` effect is added to the stack automatically.
 
-No alpha option? Render the matte as a plain black-and-white video instead — for example a
+**DNxHR 444 with Export Alpha works too, including a vertical 1080x1920 timeline.** ffmpeg
+cannot decode DNxHR's alpha channel — it sees only the premultiplied picture, the object
+over black — so **Channel: Auto** detects that and keys it as a *cut-out over black*
+(`Matte.keyBlack()`): black connected to the frame border is background, everything else is
+kept, so a dark shirt inside the figure is not punched out. Pure-black areas that touch the
+edge of the frame inside the object would be lost; ProRes 4444 has no such limit.
+
+**Space.** A matte the shape of its source (16:9 of a 16:9 clip) is *source space*: looked
+up by source time and drawn through the clip's crop, so it follows trims. Any other shape —
+a vertical timeline export — is *frame space*: drawn over the whole output frame with frame
+0 on the clip's first frame, so frame the clip in ShortCut exactly as it was framed in
+Resolve and trim it to the rendered range. Override with the panel's **Space** control.
+
+No alpha option at all? Render the matte as a plain black-and-white video instead — for example a
 Fusion comp that outputs the mask as white on black — in any codec.
 The panel's **Channel: Auto** reads alpha when the file has it and luma when it does not;
 white means keep.
@@ -2423,11 +2436,11 @@ white means keep.
 #### What lands on a clip
 
 ```js
-clip.masks = [ { id, name, src, channel, res, offset } ]
+clip.masks = [ { id, name, src, channel, res, offset, space } ]
 ```
 
 A path and three settings, never pixels: `clip.masks` is plain JSON in every undo snapshot
-and in the `.scut`. `channel` is `auto | alpha | luma`, `res` the decoded long side
+and in the `.scut`. `channel` is `auto | alpha | luma | black`, `space` is `auto | source | frame`, `res` the decoded long side
 (480 / **960** / 1920 — the 9:16 crop of a 16:9 source is only ~540 wide), and `offset` the
 SOURCE time at which the matte's first frame sits. A painted mask from the old build has no
 `src` and is dropped by `Matte.normalizeClip()`.

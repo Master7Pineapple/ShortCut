@@ -43,7 +43,8 @@
     offset: 0,
   };
   const RES_CHOICES = [480, 960, 1920];
-  const CHANNELS = ['auto', 'alpha', 'luma'];
+  const CHANNELS = ['auto', 'alpha', 'luma', 'black'];
+  const SPACES = ['auto', 'source', 'frame'];
 
   let seq = 0;
   const uid = () => 'mk' + Date.now().toString(36) + (seq++).toString(36);
@@ -52,7 +53,7 @@
     const o = opts || {};
     return normalizeMask({
       id: uid(), name: name || 'Matte 1', src: String(src || ''),
-      channel: o.channel, res: o.res, offset: o.offset,
+      channel: o.channel, res: o.res, offset: o.offset, space: o.space,
     });
   }
 
@@ -83,6 +84,7 @@
     const res = Math.round(num(m.res, DEFAULTS.res));
     m.res = RES_CHOICES.includes(res) ? res : DEFAULTS.res;
     m.offset = r4(clamp(num(m.offset, 0), -3600, 3600));
+    m.space = SPACES.includes(m.space) ? m.space : 'auto';
     delete m.strokes; delete m.rate;
     return m;
   }
@@ -103,6 +105,46 @@
     if (!(count > 0) || !(fps > 0)) return -1;
     const x = (num(t, 0) - num(mask && mask.offset, 0)) * fps;
     return clamp(Math.floor(x + 1e-3), 0, count - 1);
+  }
+
+  /**
+   * Which space a matte is in. 'source': the matte is the untouched source clip, looked up
+   * by SOURCE time and drawn through the clip's crop. 'frame': the matte is a finished
+   * frame from a Resolve timeline - a vertical 1080x1920 export of a 16:9 clip - drawn
+   * straight over the output frame and looked up by CLIP time. Auto picks by aspect: a
+   * matte the shape of its source is source-space, anything else is frame-space.
+   */
+  function resolveSpace(mask, matteW, matteH, srcW, srcH) {
+    if (mask && (mask.space === 'source' || mask.space === 'frame')) return mask.space;
+    if (!(matteW > 0 && matteH > 0 && srcW > 0 && srcH > 0)) return 'source';
+    const a = srcW / srcH, b = matteW / matteH;
+    return Math.abs(a - b) / a <= 0.02 ? 'source' : 'frame';
+  }
+
+  /**
+   * A cut-out over black as a matte: everything black CONNECTED TO THE BORDER is
+   * background, everything else is kept - so a dark shirt or a pupil inside the figure is
+   * not punched out the way a plain luma threshold would. This is what a DNxHR 444 export
+   * with alpha gives ffmpeg, which cannot decode DNxHR's alpha and sees only the
+   * premultiplied picture. `gray` is a full-range luma plane; the answer is 0 / 255.
+   */
+  function keyBlack(gray, w, h, thresh) {
+    const th = num(thresh, 14);
+    const out = new Uint8Array(w * h).fill(255);
+    const stack = new Int32Array(w * h);
+    let sp = 0;
+    const push = (i) => { if (out[i] === 255 && gray[i] <= th) { out[i] = 0; stack[sp++] = i; } };
+    for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (sp) {
+      const i = stack[--sp];
+      const x = i % w;
+      if (x > 0) push(i - 1);
+      if (x < w - 1) push(i + 1);
+      if (i >= w) push(i - w);
+      if (i < w * (h - 1)) push(i + w);
+    }
+    return out;
   }
 
   /** The decoded plane size for a source of w x h at a long side of `res`. Even, >= 2. */
@@ -258,7 +300,7 @@
    */
   function cacheKey(src, stamp, channel, res) {
     const s = stamp || {};
-    return hash(['rm1', String(src), s.size | 0, Math.round(num(s.mtime, 0)),
+    return hash(['rm2', String(src), s.size | 0, Math.round(num(s.mtime, 0)),
       String(channel || 'auto'), Math.round(num(res, DEFAULTS.res))].join('|'));
   }
 
@@ -271,11 +313,11 @@
   function digest(mask, stamp) {
     if (!mask) return null;
     const s = stamp || {};
-    return hash([mask.src, mask.channel, mask.res, mask.offset, s.size | 0, Math.round(num(s.mtime, 0))].join('|'));
+    return hash([mask.src, mask.channel, mask.res, mask.offset, mask.space, s.size | 0, Math.round(num(s.mtime, 0))].join('|'));
   }
 
   const API = {
-    DEFAULTS, RES_CHOICES, CHANNELS,
+    DEFAULTS, RES_CHOICES, CHANNELS, SPACES, resolveSpace, keyBlack,
     makeMask, normalizeMask, normalizeClip, hasMasks, maskById, maskFor,
     frameIndex, planeSize, rleEncode, rleDecode,
     edge, growPlane, blurPlane, radiusPx,

@@ -11,6 +11,7 @@
  *          -c:v prores_ks -profile:v 4444 -pix_fmt yuva444p10le matte_alpha.mov
  *   ffmpeg -y -f lavfi -i "color=c=black:s=320x180:r=30:d=2,format=gray,geq=lum='if(lt(X,160),255,0)'" \
  *          -c:v libx264 -pix_fmt yuv420p matte_luma.mp4
+ *   ffmpeg -y -f lavfi -i "color=c=black:s=1080x1920:r=24:d=1,format=yuv444p,geq=lum='if(between(X\,300\,780)*between(Y\,500\,1400)\,if(between(X\,480\,600)*between(Y\,800\,900)\,4\,160)\,0)':cb=128:cr=128"  *          -c:v dnxhd -profile:v dnxhr_444 -pix_fmt yuv444p10le matte_dnxhr.mov
  *
  * `matte_alpha.mov` is what Resolve delivers with Export Alpha on: ProRes 4444 whose
  * alpha on frame N keeps the leftmost (N+1)*5 pixels, so a frame's coverage SAYS which
@@ -101,6 +102,23 @@
       ok('the render digest changes with the offset and with a re-exported file',
         Matte.digest(m, st) !== Matte.digest(Object.assign({}, m, { offset: 0.5 }), st) &&
         Matte.digest(m, st) !== Matte.digest(m, { size: 11, mtime: 5 }));
+    }
+
+    // ================================================== 4b. cut-out over black, and space
+    {
+      const W = 40, H = 40;
+      const g = new Uint8Array(W * H);
+      for (let y = 10; y < 30; y++) for (let x = 10; x < 30; x++) g[y * W + x] = 150;
+      for (let y = 17; y < 23; y++) for (let x = 17; x < 23; x++) g[y * W + x] = 3;   // a dark shirt
+      const k = Matte.keyBlack(g, W, H);
+      ok('a cut-out over black keys the border-connected black out and keeps the figure',
+        k[0] === 0 && k[15 * W + 15] === 255);
+      ok('...and a black patch ENCLOSED by the figure is kept, not punched out',
+        k[20 * W + 20] === 255);
+      ok('space auto: a matte the shape of its source is source-space, a vertical one is frame-space',
+        Matte.resolveSpace({ space: 'auto' }, 960, 540, 1920, 1080) === 'source' &&
+        Matte.resolveSpace({ space: 'auto' }, 540, 960, 1920, 1080) === 'frame' &&
+        Matte.resolveSpace({ space: 'source' }, 540, 960, 1920, 1080) === 'source');
     }
 
     // ================================================== 5. the matte in the picture
@@ -269,6 +287,33 @@
           (() => { const p = Matte.rleDecode(ls.frames[10], ls.w * ls.h); return p[90 * ls.w + 20] >= 250 && p[90 * ls.w + 300] <= 5; })(),
           ls && (ls.status + ' ' + (ls.error || ls.channel)));
         ok('importing a second matte does not stack a second `matte` effect', live().fx.length === 1);
+
+        const dnx = D + 'matte_dnxhr.mov';
+        if ((await window.api.matteProbe(dnx)).ok) {
+          // DNxHR 444 with Export Alpha: ffmpeg cannot decode DNx alpha and sees the
+          // premultiplied picture - a figure over black. Auto must read that as a cut-out.
+          const vc = live();
+          const saveClip = { srcW: vc.srcW, srcH: vc.srcH, out: vc.out };
+          vc.srcW = 1920; vc.srcH = 1080; vc.out = 1;
+          const dm = await rmAttach(vc, dnx);
+          const ds = rmStore(dm);
+          ok('a DNxHR 444 export with no decodable alpha imports on Auto as a cut-out over black',
+            ds && ds.status === 'ready' && ds.channel === 'black', ds && (ds.status + ' ' + (ds.error || ds.channel)));
+          const pl = ds && ds.status === 'ready' ? Matte.rleDecode(ds.frames[5], ds.w * ds.h) : null;
+          const at = (fx, fy) => pl[Math.round(fy * (ds.h - 1)) * ds.w + Math.round(fx * (ds.w - 1))];
+          ok('...the figure is kept, the black around it is cut, and the dark patch inside it is kept',
+            !!pl && at(0.5, 0.35) === 255 && at(0.05, 0.05) === 0 && at(0.5, 0.44) === 255);
+          ok('...and a vertical matte on a 16:9 clip resolves to frame space', ds && rmSpace(vc, dm, ds) === 'frame');
+          const plate = rmPlate(vc, dm, (vc.in || 0) + 0.2, 108, 192, { feather: 0, grow: 0, invert: 0, mix: 1 });
+          const pc = document.createElement('canvas'); pc.width = 108; pc.height = 192;
+          const px = plate ? (pc.getContext('2d').drawImage(plate, 0, 0), pc.getContext('2d').getImageData(0, 0, 108, 192).data) : null;
+          ok('...drawn over the whole output frame with no crop: the figure sits where it sits in the export',
+            !!px && px[(Math.round(0.35 * 191) * 108 + 54) * 4 + 3] > 240 && px[(10 * 108 + 5) * 4 + 3] < 12);
+          undo();
+          Object.assign(live(), saveClip);
+        } else {
+          note('SKIPPED the DNxHR cut-out case: no ' + dnx);
+        }
 
         const saved = JSON.parse(JSON.stringify(live()));
         ok('the clip saves as plain JSON: paths and settings only, no pixels',

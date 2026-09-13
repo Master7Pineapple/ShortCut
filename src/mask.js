@@ -69,6 +69,33 @@ function probe(p) {
   });
 }
 
+/**
+ * No alpha channel: is this a black-and-white matte, or a cut-out over black? One small
+ * frame from a third of the way in decides. A B/W matte is almost all 0 and 255; a cut-out
+ * has a black border region AND a lot of midtones (the picture).
+ */
+function detectKind(src, info) {
+  return new Promise((resolve) => {
+    const at = Math.max(0, (info.duration || 0) / 3);
+    const ff = spawn(ffmpegPath, ['-v', 'error', '-ss', String(at), '-i', src, '-map', '0:v:0', '-frames:v', '1',
+      '-vf', 'scale=64:64:out_range=full,format=gray', '-f', 'rawvideo', '-pix_fmt', 'gray', 'pipe:1'],
+    { windowsHide: true });
+    const bufs = [];
+    ff.stdout.on('data', (d) => bufs.push(d));
+    ff.on('error', () => resolve('luma'));
+    ff.on('close', () => {
+      const b = Buffer.concat(bufs);
+      if (b.length < 64 * 64) return resolve('luma');
+      let dark = 0, mid = 0;
+      for (let i = 0; i < 64 * 64; i++) {
+        if (b[i] <= 14) dark++;
+        else if (b[i] >= 40 && b[i] <= 215) mid++;
+      }
+      resolve(dark > 64 * 64 * 0.08 && mid > 64 * 64 * 0.15 ? 'black' : 'luma');
+    });
+  });
+}
+
 const cacheFile = (key) => {
   fs.mkdirSync(cacheRoot, { recursive: true });
   return path.join(cacheRoot, key + '.rmatte');
@@ -127,9 +154,11 @@ async function decode(req, onProgress) {
   const run = (async () => {
     const info = await probe(src);
     if (!info.ok) return info;
-    let channel = req.channel === 'alpha' || req.channel === 'luma' ? req.channel : (info.hasAlpha ? 'alpha' : 'luma');
+    let channel = ['alpha', 'luma', 'black'].includes(req.channel) ? req.channel
+      : (info.hasAlpha ? 'alpha' : await detectKind(src, info));
     if (channel === 'alpha' && !info.hasAlpha) {
-      return { ok: false, error: 'this file has no alpha channel (' + info.pixFmt + '). Export with "Export Alpha" on, or set Channel to Luma.' };
+      return { ok: false, error: 'ffmpeg sees no alpha channel in this file (' + info.codec + ', ' + info.pixFmt + ')' +
+        (info.codec === 'dnxhd' ? ' - DNxHR alpha cannot be decoded outside Resolve. Set Channel to "Cut-out over black" (or Auto).' : '. Set Channel to Luma or Cut-out over black.') };
     }
     const { w, h } = Matte.planeSize(info.width, info.height, res);
     const vf = channel === 'alpha'
@@ -148,7 +177,8 @@ async function decode(req, onProgress) {
         pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
         let o = 0;
         while (pending.length - o >= size) {
-          out.push(Matte.rleEncode(pending.subarray(o, o + size)));
+          const plane = pending.subarray(o, o + size);
+          out.push(Matte.rleEncode(channel === 'black' ? Matte.keyBlack(plane, w, h) : plane));
           o += size;
         }
         pending = pending.subarray(o);

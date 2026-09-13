@@ -9831,6 +9831,11 @@ try {
   });
 } catch (e) { /* no bridge in a bare load */ }
 
+/** 'source' or 'frame' for a loaded matte on this clip. See `Matte.resolveSpace()`. */
+function rmSpace(clip, mask, store) {
+  return Matte.resolveSpace(mask, store && store.w, store && store.h, clip.srcW, clip.srcH);
+}
+
 /** One decoded plane, from a small LRU - a paused viewer decodes one frame, not sixty. */
 function rmPlane(mask, store, idx) {
   const pk = rmKey(mask) + '#' + idx;
@@ -9855,11 +9860,15 @@ function rmPlane(mask, store, idx) {
 function rmPlate(clip, mask, tSrc, W, H, p) {
   const store = rmStore(mask);
   if (!store || store.status !== 'ready' || !store.frames.length) return null;
-  const idx = Matte.frameIndex(mask, store.fps, store.frames.length, tSrc);
+  // A frame-space matte (a vertical export of a Resolve timeline) is the finished frame:
+  // looked up by CLIP time and drawn over the whole layer, with no crop.
+  const space = rmSpace(clip, mask, store);
+  const t = space === 'frame' ? tSrc - (Number(clip.in) || 0) : tSrc;
+  const idx = Matte.frameIndex(mask, store.fps, store.frames.length, t);
   if (idx < 0) return null;
   const { w, h } = store;
 
-  const crop = Tracker.frameMap(clip, W / Math.max(1, H)).crop;
+  const crop = space === 'frame' ? { x: 0, y: 0, w: 1, h: 1 } : Tracker.frameMap(clip, W / Math.max(1, H)).crop;
   const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
   const sig = [rmKey(mask), idx, W, H,
     r4(p.feather), r4(p.grow), p.invert ? 1 : 0, r4(p.mix),
@@ -9929,7 +9938,7 @@ async function rmAttach(clip, src) {
   pushUndo();
   if (!Array.isArray(clip.masks)) clip.masks = [];
   const name = src.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
-  const m = Matte.makeMask(name, src, { channel: info.hasAlpha ? 'auto' : 'luma' });
+  const m = Matte.makeMask(name, src, { channel: 'auto' });
   clip.masks.push(m);
   Matte.normalizeClip(clip);
   // Cutting with it is what anybody importing a matte came to do, so the effect goes on
@@ -9944,10 +9953,6 @@ async function rmAttach(clip, src) {
   markDirty();
   renderAll();
   renderInspector();
-  if (!info.hasAlpha) {
-    setStatus('No alpha channel in ' + name + ' (' + info.pixFmt + ') - reading it as a black-and-white ' +
-      'matte from its luma. If it is not one, re-export from Resolve with Export Alpha on.', 'err');
-  }
   await rmLoad(m);
   return m;
 }
@@ -9973,17 +9978,21 @@ function rmWarnings(clip, mask, store) {
       ' fps. Render the matte at the source clip’s frame rate.');
   }
   const mdur = n / store.fps;
+  if (rmSpace(clip, mask, store) === 'frame') {
+    const clen = (Number(clip.out) || 0) - (Number(clip.in) || 0);
+    out.push('Frame-space matte (' + store.w + 'x' + store.h + ', not the source’s shape): it is ' +
+      'drawn over the whole output frame and frame 0 lands on this clip’s first frame. ' +
+      'Frame the clip here exactly as it was framed in Resolve.');
+    if (clen > 0 && Math.abs(mdur + mask.offset - clen) > 0.1) {
+      out.push('Length differs: the matte is ' + mdur.toFixed(2) + ' s, this clip ' + clen.toFixed(2) +
+        ' s. Trim the clip to the range you rendered, or set Offset.');
+    }
+    return out;
+  }
   const cdur = Number(clip.mediaDuration) || 0;
   if (cdur && cdur < 3000 && Math.abs(mdur + mask.offset - cdur) > 0.1) {
     out.push('Length differs: the matte is ' + mdur.toFixed(2) + ' s, the source ' + cdur.toFixed(2) +
       ' s. Render the whole source clip from Resolve, or set Offset to where the matte starts.');
-  }
-  if (clip.srcW && clip.srcH) {
-    const a = clip.srcW / clip.srcH, b = store.w / store.h;
-    if (Math.abs(a - b) / a > 0.02) {
-      out.push('Aspect differs: the matte is ' + store.w + 'x' + store.h + ', the clip ' + clip.srcW +
-        'x' + clip.srcH + '. Render at the source resolution, or at least the same aspect ratio.');
-    }
   }
   return out;
 }
@@ -10004,10 +10013,10 @@ function maskPanel(clip) {
   box.appendChild(head);
 
   box.appendChild(el('div', 'tc-hint fx-note',
-    'Cut the object with Magic Mask in DaVinci Resolve, render the matte over the WHOLE ' +
-    'source clip as QuickTime ProRes 4444 with Export Alpha on, and import it here. Matte ' +
-    'frame N lands on source frame N, so trimming, splitting and moving the clip keep it ' +
-    'in place.'));
+    'Cut the object with Magic Mask in DaVinci Resolve and render it with Export Alpha ' +
+    '(ProRes 4444, or DNxHR 444 - read as a cut-out over black). A 16:9 matte of the whole ' +
+    'source follows trims; a vertical timeline export is drawn over the output frame from ' +
+    'this clip’s first frame.'));
 
   const row = el('div', 'fx-add');
   const add = el('button', 'mini', 'Import matte from Resolve...');
@@ -10079,9 +10088,10 @@ function maskPanel(clip) {
     settings.appendChild(TextUI.control({
       path: 'channel', label: 'Channel', type: 'select',
       options: [
-        { value: 'auto', label: 'Auto - alpha if the file has it, else luma' },
+        { value: 'auto', label: 'Auto - alpha, else cut-out over black, else luma' },
         { value: 'alpha', label: 'Alpha (ProRes 4444 with Export Alpha)' },
         { value: 'luma', label: 'Luma (black-and-white matte, white = keep)' },
+        { value: 'black', label: 'Cut-out over black (DNxHR 444 / premultiplied export)' },
       ],
     }, mask, { channel: Matte.DEFAULTS.channel }, setHooks));
     settings.appendChild(TextUI.control({
@@ -10092,6 +10102,14 @@ function maskPanel(clip) {
         { value: 1920, label: 'Fine - 1920 (sharpest edge, 4x the memory)' },
       ],
     }, mask, { res: Matte.DEFAULTS.res }, setHooks));
+    settings.appendChild(TextUI.control({
+      path: 'space', label: 'Space', type: 'select',
+      options: [
+        { value: 'auto', label: 'Auto - by aspect ratio' },
+        { value: 'source', label: 'Source clip (16:9 matte of the whole source)' },
+        { value: 'frame', label: 'Output frame (vertical timeline export)' },
+      ],
+    }, mask, { space: 'auto' }, setHooks));
     settings.appendChild(TextUI.control({
       path: 'offset', label: 'Offset (s)', type: 'range', min: -10, max: 10, step: 0.001, digits: 3,
     }, mask, { offset: 0 }, setHooks));
