@@ -139,6 +139,15 @@ const fmtTc = (t, fps) => {
   return p(h) + ':' + p(m) + ':' + p(s) + '.' + p(f);
 };
 
+/**
+ * True while nothing is there to answer a modal: a headless agent run, or an agent batch
+ * driving the live editor. A blocking `alert()`/`confirm()` would stall the whole batch -
+ * the same hang `confirmDiscard()` already dodges on a smoke run. See src/renderer/agent.js.
+ */
+function quietUI() {
+  return !!(window.api.agentHeadless || (window.Agent && window.Agent.busy));
+}
+
 function log(msg) {
   const el = document.createElement('div');
   el.textContent = new Date().toLocaleTimeString() + '  ' + msg;
@@ -6147,7 +6156,7 @@ function syncLoudnessControl() {
  * not cover. A smoke run has nothing worth keeping, always.
  */
 function confirmDiscard() {
-  if (window.api.smoke) return true;
+  if (window.api.smoke || quietUI()) return true;
   return confirm('Discard unsaved changes?');
 }
 
@@ -7058,12 +7067,14 @@ function serialize() {
   };
 }
 
-async function saveProject(asNew) {
-  const r = await window.api.saveProject(serialize(), asNew ? null : state.filePath);
-  if (r.canceled) return;
+async function saveProject(asNew, toPath) {
+  const target = typeof toPath === 'string' && toPath ? toPath : (asNew ? null : state.filePath);
+  const r = await window.api.saveProject(serialize(), target);
+  if (r.canceled) return null;
   state.filePath = r.filePath;
   markClean();
   log('Saved ' + r.filePath);
+  return r.filePath;
 }
 
 /**
@@ -7094,8 +7105,8 @@ function projectPathArg(v) {
 async function openProject(filePath) {
   if (state.dirty && !confirmDiscard()) return;
   const r = await window.api.openProject(projectPathArg(filePath));
-  if (r.canceled) return;
-  if (r.error) { log(r.error); alert(r.error); return; }
+  if (r.canceled) return { canceled: true };
+  if (r.error) { log(r.error); if (!quietUI()) alert(r.error); return { error: r.error }; }
   for (const id of [...mediaEls.keys()]) dropMedia(id);
   const d = r.data;
   state.tracks = d.tracks || [];
@@ -7154,8 +7165,9 @@ async function openProject(filePath) {
   log('Opened ' + r.filePath);
   if (r.missing && r.missing.length) {
     log('WARNING: ' + r.missing.length + ' media file(s) missing.');
-    alert('These media files are missing:\n\n' + r.missing.slice(0, 10).join('\n'));
+    if (!quietUI()) alert('These media files are missing:\n\n' + r.missing.slice(0, 10).join('\n'));
   }
+  return { ok: true, filePath: r.filePath, missing: r.missing || [] };
 }
 
 // ========================================== 9. render
@@ -8095,16 +8107,25 @@ refreshAudioPresets(false);
 }
 
 async function doRender(opts) {
-  if (rendering) return;
+  // `opts.outPath` and `opts.range` skip the save dialog and the in/out-marks select, and
+  // `opts.quiet` skips revealing the file - the agent API renders through here rather than
+  // through a second copy of the pipeline. The result is returned.
+  if (rendering) return { ok: false, error: 'A render is already running.' };
   const force = !!(opts && opts.force);
   const dur = projectDuration();
-  if (dur <= 0) { setStatus('Nothing to render - the timeline is empty.', 'err'); return; }
+  if (dur <= 0) {
+    setStatus('Nothing to render - the timeline is empty.', 'err');
+    return { ok: false, error: 'The timeline is empty.' };
+  }
 
-  const useMarks = $('#renderRange').value === 'marks';
-  const range = useMarks ? renderRange() : { from: 0, to: dur };
+  const given = opts && opts.range;
+  const useMarks = !given && $('#renderRange').value === 'marks';
+  const range = given
+    ? { from: clamp(Number(given.from) || 0, 0, dur), to: clamp(given.to == null ? dur : Number(given.to), 0, dur) }
+    : (useMarks ? renderRange() : { from: 0, to: dur });
   if (range.to - range.from <= 0.01) {
     setStatus('That range is empty - move the in/out marks.', 'err');
-    return;
+    return { ok: false, error: 'The render range is empty.' };
   }
 
   const base = (state.filePath ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'output');
@@ -8112,8 +8133,8 @@ async function doRender(opts) {
     ? '_' + Math.round(range.from * 1000) + '-' + Math.round(range.to * 1000) + 'ms'
     : '';
   const name = base + suffix + '_' + state.out.w + 'x' + state.out.h + '.mp4';
-  const outPath = await window.api.pickOutput(name);
-  if (!outPath) return;
+  const outPath = (opts && typeof opts.outPath === 'string' && opts.outPath) || await window.api.pickOutput(name);
+  if (!outPath) return { ok: false, canceled: true };
 
   // Same reason as the preview render above: the baker borrows the viewer's own elements
   // and cannot borrow what is still playing.
@@ -8159,12 +8180,13 @@ async function doRender(opts) {
     }
     refreshCacheInfo();
     refreshCacheBands(true);
-    window.api.showItem(res.outPath);
+    if (!(opts && opts.quiet)) window.api.showItem(res.outPath);
   } else {
     $('#renderBar').style.width = '0%';
     setStatus(res.error, res.cancelled ? '' : 'err');
     log('Render failed: ' + String(res.error).split('\n').slice(-3).join(' '));
   }
+  return res;
 }
 
 function setStatus(msg, cls) {
@@ -8536,16 +8558,21 @@ async function composeCover(time, W, H) {
   return cv;
 }
 
-async function exportCovers() {
-  if (rendering) { setStatus('A render is already running.', 'err'); return; }
+async function exportCovers(opts) {
+  // `opts.dir` skips the folder dialog, `opts.time` covers that timecode instead of the
+  // playhead, `opts.name` is the base file name and `opts.quiet` skips Explorer. Returns the
+  // paths written - the agent API's `covers` op is this function. A click handler passes
+  // an Event, which is not options.
+  const o = opts && typeof opts === 'object' && !(opts instanceof Event) ? opts : {};
+  if (rendering) { setStatus('A render is already running.', 'err'); return []; }
   const fmts = state.delivery.formats.map(Delivery.formatById).filter(Boolean);
-  if (!fmts.length) { setStatus('Tick a format first.', 'err'); return; }
+  if (!fmts.length) { setStatus('Tick a format first.', 'err'); return []; }
   const base = state.filePath
     ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'cover';
-  const dir = await window.api.pickDeliveryDir();
-  if (!dir) return;
+  const dir = (typeof o.dir === 'string' && o.dir) || await window.api.pickDeliveryDir();
+  if (!dir) return [];
   pause();
-  const t = state.playhead;
+  const t = o.time == null ? state.playhead : clamp(Number(o.time) || 0, 0, projectDuration());
   const written = [];
   for (const f of fmts) {
     // Through withFormat, so the frame is composed with THIS format's framing overrides.
@@ -8554,7 +8581,7 @@ async function exportCovers() {
       const cv = await composeCover(t, f.w, f.h);
       return cv.toDataURL('image/png');
     });
-    const r = await window.api.writeCover(dir, Delivery.outputName(base + '_cover', f, 'png'), png);
+    const r = await window.api.writeCover(dir, Delivery.outputName((o.name || base) + '_cover', f, 'png'), png);
     if (r && r.ok) written.push(r.path);
     else log('Cover failed for ' + f.label + ': ' + ((r && r.error) || 'unknown'));
   }
@@ -8563,8 +8590,9 @@ async function exportCovers() {
   if (written.length) {
     setStatus('Wrote ' + written.length + ' cover frame(s) at ' + fmtTc(t) + '.', 'ok');
     log('Cover frames at ' + fmtTc(t) + ': ' + written.join(', '));
-    window.api.showItem(written[0]);
+    if (!o.quiet) window.api.showItem(written[0]);
   } else setStatus('No cover frame was written.', 'err');
+  return written;
 }
 
 // --------------------------------------------------------------------- the export
@@ -8587,19 +8615,23 @@ async function renderSpanTo(outPath, range) {
   }
 }
 
-async function doDeliver() {
-  if (rendering) { setStatus('A render is already running.', 'err'); return; }
+async function doDeliver(opts) {
+  // `opts.dir` skips the folder dialog, `opts.name` is the base file name and `opts.quiet`
+  // skips Explorer. Returns `{ ok, written, reusedTails }`, or `{ ok: false, error }`.
+  const o = opts && typeof opts === 'object' && !(opts instanceof Event) ? opts : {};
+  const fail = (error) => ({ ok: false, error });
+  if (rendering) { setStatus('A render is already running.', 'err'); return fail('A render is already running.'); }
   const dur = projectDuration();
-  if (dur <= 0) { setStatus('Nothing to render - the timeline is empty.', 'err'); return; }
+  if (dur <= 0) { setStatus('Nothing to render - the timeline is empty.', 'err'); return fail('The timeline is empty.'); }
   const fmts = state.delivery.formats.map(Delivery.formatById).filter(Boolean);
-  if (!fmts.length) { setStatus('Tick at least one format.', 'err'); return; }
+  if (!fmts.length) { setStatus('Tick at least one format.', 'err'); return fail('No format is ticked.'); }
 
   const h = state.hooks;
   const variants = h.enabled && h.variants.length ? h.variants : [null];
-  const base = state.filePath
-    ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'output';
-  const dir = await window.api.pickDeliveryDir();
-  if (!dir) return;
+  const base = o.name || (state.filePath
+    ? state.filePath.split(/[\\/]/).pop().replace(/\.scut$/i, '') : 'output');
+  const dir = (typeof o.dir === 'string' && o.dir) || await window.api.pickDeliveryDir();
+  if (!dir) return { ok: false, canceled: true };
 
   pause();
   rendering = true;
@@ -8683,7 +8715,7 @@ async function doDeliver() {
   if (failed) {
     setStatus(failed.error || 'Delivery failed.', failed.cancelled ? '' : 'err');
     log('Delivery failed: ' + String(failed.error).split('\n').slice(-3).join(' '));
-    return;
+    return { ok: false, error: failed.error || 'Delivery failed.', cancelled: !!failed.cancelled };
   }
   const secs = ((Date.now() - t0) / 1000).toFixed(1);
   setStatus('Delivered ' + written.length + ' file(s) in ' + secs + 's' +
@@ -8691,7 +8723,8 @@ async function doDeliver() {
   log('Delivered: ' + written.join(', '));
   refreshCacheInfo();
   refreshCacheBands(true);
-  if (written.length) window.api.showItem(written[0]);
+  if (written.length && !o.quiet) window.api.showItem(written[0]);
+  return { ok: true, written, reusedTails, seconds: Number(secs) };
 }
 
 function setDeliveryBusy(busy) {

@@ -125,6 +125,9 @@ contextBridge.exposeInMainWorld('api', {
   // Is this a smoke run? The renderer needs to know because a blocking `confirm()` has
   // nobody to answer it - see `confirmDiscard()` in app.js.
   smoke: !!process.env.SHORTCUT_SMOKE,
+  // A headless agent run (SHORTCUT_AGENT) has nobody to answer a modal either - see
+  // `quietUI()` in app.js and src/agentserver.js.
+  agentHeadless: !!process.env.SHORTCUT_AGENT,
   buildArgs: (job, opts) => ipcRenderer.invoke('debug:buildArgs', { job, opts }), // test-only
   ffmpegRun: (args) => ipcRenderer.invoke('debug:ffmpegRun', { args }),               // test-only
   fileExists: (file) => ipcRenderer.invoke('debug:exists', { file }),                 // test-only

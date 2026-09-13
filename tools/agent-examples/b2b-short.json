@@ -1,0 +1,59 @@
+{
+  "spec": {
+    "output": { "w": 1080, "h": 1920, "fps": 30, "quality": "medium" },
+    "brand": { "bg": "#0b1020", "bg2": "#1d2b5c", "accent": "#4f8cff", "ink": "#ffffff", "font": "Segoe UI" },
+
+    "sounds": {
+      "riser":  "C:/Sounds/riser.wav",
+      "whoosh": "C:/Sounds/whoosh.wav",
+      "click":  "C:/Sounds/click.wav",
+      "impact": "C:/Sounds/impact.wav",
+      "pop":    "C:/Sounds/pop.wav"
+    },
+    "music": { "src": "C:/Media/bed.mp3", "gainDb": -16, "duck": true },
+
+    "captions": { "transcribe": true, "settings": { "keywords": "demo, pipeline, minutes", "wordEmphasis": true } },
+
+    "beats": [
+      { "type": "hook", "from": 0, "to": 3,
+        "source": { "src": "C:/Media/talking_head.mp4", "in": 12.4 },
+        "punchIn": { "at": 1.5, "scale": 1.15, "y": 0.4 },
+        "sfx": "riser" },
+
+      { "type": "stakes", "from": 3, "to": 8,
+        "source": { "src": "C:/Media/talking_head.mp4", "in": 15.4 },
+        "graphic": { "type": "counter", "at": 0.5, "params": { "to": 62, "suffix": "%", "caption": "of demos lose the room" } } },
+
+      { "type": "product", "from": 8, "to": 30,
+        "source": { "src": "C:/Users/me/AppData/Roaming/shortcut-editor/recordings/screen-2026-09-12.webm", "in": 3 },
+        "reframeEvery": 2.5,
+        "mockup": "browser",
+        "autoZoom": { "minHold": 0.6, "maxZoom": 2 },
+        "ripples": true,
+        "spotlights": [ { "from": 12, "to": 15, "rect": { "x": 0.08, "y": 0.3, "w": 0.84, "h": 0.22 } } ],
+        "cutouts":    [ { "from": 20, "to": 23, "src": { "x": 0.62, "y": 0.12, "w": 0.3, "h": 0.08 }, "at": { "x": 0.5, "y": 0.72 }, "scale": 2.2 } ],
+        "callouts":   [ { "from": 25, "to": 28, "text": "One click", "point": { "x": 0.7, "y": 0.45 } } ] },
+
+      { "type": "proof", "from": 30, "to": 42,
+        "graphics": [
+          { "type": "counter", "params": { "from": 0, "to": 1240, "caption": "teams shipped" } },
+          { "type": "ring",    "params": { "value": 0.87, "caption": "win rate" } },
+          { "type": "bars",    "params": { "values": [12, 31, 58], "labels": ["Q1", "Q2", "Q3"] } }
+        ] },
+
+      { "type": "mechanism", "from": 42, "to": 52, "title": "How it works",
+        "graphic": { "type": "flow", "params": { "spec": { "before": ["Record", "Edit for hours", "Export"], "after": ["Record", "ShortCut"] } } } },
+
+      { "type": "cta", "from": 52, "to": 60, "text": "Book a demo", "sub": "shortcut.app/demo" }
+    ],
+
+    "hookVariants": [
+      { "source": { "src": "C:/Media/talking_head.mp4", "in": 40.2 }, "text": "Your demo is too long" },
+      { "source": { "src": "C:/Media/talking_head.mp4", "in": 71.0 }, "sfx": "impact" }
+    ],
+
+    "lint": { "fix": true, "maxGap": 3 },
+    "save": "C:/Projects/acme_short.scut",
+    "deliver": { "dir": "C:/Projects/acme_delivery", "formats": ["9x16", "1x1", "16x9"], "cover": 1.2, "name": "acme" }
+  }
+}

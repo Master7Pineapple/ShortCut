@@ -20,6 +20,9 @@ const SFX = require('./sfx.js');
 // Magic Mask: MobileSAM through onnxruntime-node, the model downloads, and the matte
 // cache. It registers its own handlers in install() below, next to the window.
 const Mask = require('./mask.js');
+// The agent API's outside door: a headless runner and a localhost server, both calling
+// Agent.dispatch() in the renderer. See src/agentserver.js and src/renderer/agent.js.
+const AgentServer = require('./agentserver.js');
 
 const VIDEO_EXT = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.ts']);
 const AUDIO_EXT = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus', '.wma']);
@@ -62,7 +65,7 @@ function createWindow() {
   // `npx electron . some.scut`. Saves walking the file dialog every time the same project
   // is being worked on or tested. Never during a smoke run - those suites all start from
   // an empty timeline and would fail against someone's loaded project.
-  if (!process.env.SHORTCUT_SMOKE) {
+  if (!process.env.SHORTCUT_SMOKE && !process.env.SHORTCUT_AGENT) {
     const arg = process.argv.slice(1).find((a) => /\.scut$/i.test(a));
     if (arg) {
       const target = path.resolve(arg);
@@ -111,6 +114,22 @@ function createWindow() {
     });
   }
 
+  // Set SHORTCUT_AGENT=<ops-or-spec.json> to run one agent batch headless, print the
+  // result and exit - the smoke path's shape, for edits rather than tests. Never raises
+  // a modal: `window.api.agentHeadless` tells the renderer nobody is there to answer one.
+  if (process.env.SHORTCUT_AGENT) {
+    win.webContents.once('did-finish-load', async () => {
+      const code = await AgentServer.runHeadless(win, process.env.SHORTCUT_AGENT);
+      process.exitCode = code;
+      allowClose = true;
+      app.quit();
+    });
+  } else if (!process.env.SHORTCUT_SMOKE) {
+    // `--agent` / `--agent-port=N` / SHORTCUT_AGENT_PORT: drive the live editor over HTTP.
+    const port = AgentServer.portFromEnv(process.env, process.argv);
+    if (port != null) AgentServer.start(() => win, port, app.getPath('userData'));
+  }
+
   // Closing with unsaved work asks first. This MUST live in the main process: a
   // renderer `beforeunload` handler that calls preventDefault just blocks the close
   // silently in Electron, which is why the window used to ignore the quit button until
@@ -133,7 +152,7 @@ function createWindow() {
     // unsaved-changes dialog and sits on it forever, holding a window nobody can get rid
     // of without answering. There is never a person behind a smoke run to answer it, so
     // the honest rule is that this instance has nothing worth saving, always.
-    if (process.env.SHORTCUT_SMOKE) return;
+    if (process.env.SHORTCUT_SMOKE || process.env.SHORTCUT_AGENT) return;
     if (allowClose || !projectDirty) return;
     e.preventDefault();
     if (askingClose) return;

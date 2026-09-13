@@ -35,17 +35,23 @@ directly by a `<script>` tag. Edit a file, press `F5` in the app window to reloa
 renderer (`Ctrl+Shift+I` opens DevTools — note `Ctrl+R` is bound to *render*, not
 reload). Changes to `src/main.js` or `src/preload.js` need a full restart.
 
+**Driving the editor from an AI agent** — everything above is also available as JSON ops
+over a localhost server, a headless runner and `node tools/agent.js`; see
+"Driving ShortCut from an AI agent" below.
+
 ### Testing and debugging
 
-Three environment variables hook into the main process (all in `createWindow()`):
+Five environment variables hook into the main process (all in `createWindow()`):
 
 | Variable | Effect |
 | --- | --- |
 | `SHORTCUT_DEBUG=1` | Mirrors the renderer console into the terminal and opens DevTools |
 | `SHORTCUT_SMOKE=<file.js>` | Evaluates that file in the live renderer, prints its return value, exits |
 | `SHORTCUT_SHOT=<file.png>` | Used with `SHORTCUT_SMOKE`: also captures the window to a PNG |
+| `SHORTCUT_AGENT=<file.json>` | Runs one agent batch or short spec headless, prints the JSON result, exits (see "Driving ShortCut from an AI agent") |
+| `SHORTCUT_AGENT_PORT=<port>` | Starts the agent's localhost server with the editor - the same as `--agent` |
 
-There are twenty-nine suites:
+There are thirty suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -260,6 +266,14 @@ There are twenty-nine suites:
   after Record was pressed, and that the recording imports with its telemetry attached. It
   reuses `clip1.mp4` from `smoke.js`, copying it rather than writing a sidecar next to the
   shared fixture, and *skips* the live capture on a machine that offers no display.
+- `tools/smoke-agent.js` — the agent API: the catalog built from the live tables, a
+  batch being ONE undo entry and undoing to nothing, a failing op rolling the whole batch
+  back with the undo stack and `pushUndo()` exactly as they were, `$ref` and `$ref.field`
+  resolution and a reference to nothing refused, the punch-in holding its focus point
+  still, transitions refused where there is no cut, `expand()` deterministic with every
+  `$ref` naming an earlier op, a media-free spec built end to end - and, with
+  `flat_blue.mp4`, `reframe` cutting contiguous pieces in both time domains and `lint fix`
+  leaving nothing flat. See "Driving ShortCut from an AI agent".
 - `tools/smoke-longargs.js` — the command-line length ceiling: that a filtergraph too
   long for a Windows command line still **renders** rather than failing with
   `spawn ENAMETOOLONG`, that a short one is left inline so every other suite's assertions
@@ -365,6 +379,9 @@ tools/smoke-graphics.js   the graphics engine: painted bounds, the unit rule at 
                           resolutions, stagger timing, the one chart scale, deterministic
                           diagram layout, and a real render matching the preview
 tools/smoke-longargs.js   the command-line ceiling and the filtergraph script file
+tools/smoke-agent.js      the agent API: batches, rollback, refs, catalog, the template
+tools/agent.js            the agent CLI: catalog / describe / run / build / expand
+tools/agent-examples/     a complete B2B short spec for Agent.build()
 ShortCut.bat              launcher (installs deps on first run, then starts electron)
 src/main.js               Electron main: media probing, folder scan, project IO, ffmpeg render
 src/preload.js            contextBridge surface — the ONLY channel between main and renderer
@@ -399,6 +416,9 @@ src/captions.js           transcripts and captions: parsing, phrasing, placement
                           (loaded twice, like audiofx.js - see "Transcription and captions")
 src/sfx.js                sound design: the triggers and the Sonify planner
                           (loaded twice, like audiofx.js - see "Sound design")
+src/renderer/agent.js     the agent API: ops over app.js's own functions, one undo entry
+                          per batch, describe/catalog, the B2B template compiler
+src/agentserver.js        its outside door: the headless runner and the localhost server
 ```
 
 The text editor renders into `#textPanel` inside the inspector column. The three `text/`
@@ -4390,6 +4410,160 @@ Each row is a button: it says the timecodes and what the last thing to happen wa
 clicking it seeks there. The panel head carries the count, so a collapsed panel still says
 `2 formats · 3 flat`.
 
+### Driving ShortCut from an AI agent
+
+Everything the UI does is also reachable as JSON, so an agent can cut, frame, animate,
+caption, sonify, lint and deliver a short without a mouse. It is **a door, not a second
+editor**: `src/renderer/agent.js` (a `<script>` global `Agent`, loaded after `app.js`)
+calls the same functions the panels call - `addTransition()`, `applyAutoZoom()`,
+`generateCaptions()`, `sonify()`, `runLint()`, `doDeliver()` - so an agent's edit is
+exactly an edit, and preview, render, undo and the `.scut` file need to know nothing about
+where it came from.
+
+#### Three ways in
+
+| Way | Command | For |
+| --- | --- | --- |
+| **Headless** | `SHORTCUT_AGENT=plan.json node_modules/.bin/electron .` | one batch or one spec, JSON result on stdout, exit 1 on failure. `SHORTCUT_AGENT_OUT=<file>` also writes it to a file |
+| **Live server** | `npx electron . --agent` (or `--agent-port=N`, or `SHORTCUT_AGENT_PORT`) | drive the window a person is watching |
+| **CLI** | `node tools/agent.js <catalog\|describe\|run\|build\|expand> [file]` | uses the live server when one is running, otherwise launches a headless editor |
+
+The server binds **127.0.0.1 only** (default port 47810, the next free one if taken) and
+writes `{port, token, pid}` to `%APPDATA%\shortcut-editor\agent-server.json`. Every route
+but `/health` needs that token as `x-shortcut-token` (or `Authorization: Bearer`). The
+token is what stops a web page from driving the editor: a browser can reach localhost, but
+it cannot read that file, and a custom header needs a CORS preflight this server never
+answers.
+
+| Route | Method | Body | Answers |
+| --- | --- | --- | --- |
+| `/catalog` | GET | - | the vocabulary (below) |
+| `/describe` | GET/POST | `{full?}` | the project as data, lint included |
+| `/run` | POST | `{ops:[...], atomic?, describe?}` | per-op results |
+| `/expand` | POST | `{spec}` | the op list a short spec compiles to |
+| `/build` | POST | `{spec, describe?}` | expand + run |
+
+Requests are serialised - the renderer runs one batch at a time and a second request waits
+rather than being refused.
+
+#### The loop an agent should run
+
+1. `catalog` once. It is **built from the live tables** - `FX.DEFS`, `Graphics.DEFS`,
+   `Trans.TYPES`, `AudioFX.DEFS`, `SFX.TRIGGERS`, `Delivery.FORMATS`, the easing presets - so
+   every effect, graphic, transition, parameter, range and select option is published the
+   moment it exists, and nothing here has to be kept in step by hand.
+2. `media` each file it means to use: duration, size, `hasAudio`, and whether it carries
+   cursor telemetry (which decides whether `autoZoom`/`ripples` have anything to work on).
+3. `run` a batch. Then `describe` and `still` - **look** at the frames it made; a PNG of a
+   timecode is the cheapest honest check there is, and it goes through `compositeLayers()`,
+   so it is exactly what the export will show.
+4. `lint`, fix, `deliver`.
+
+#### Ops, batches and references
+
+A batch is an array of `{op, ...args}`. Conventions, the same across every op:
+
+- `start`, `at`, `from`, `to` are **timeline** seconds; `in`/`out` on media are **source**
+  seconds; `len` is timeline seconds. A key's `t` is seconds **into the clip** (as everywhere
+  in the app) unless the op takes `timeline: true`.
+- Positions and sizes are **fractions of the frame**; a text `fontSize` is px against a
+  1920-tall frame (the text model's own unit). The unit rule, unchanged.
+- `as: "name"` keeps an op's result; a later string argument `"$name"` is its `id` (or its
+  `ids` for `reframe`), and `"$name.field"` reaches into it.
+- Easing is a preset name from `catalog.easings` or a 4-number bezier.
+
+**A batch is ONE undo entry.** `run()` swaps `pushUndo()` for a no-op marker while it runs,
+takes one snapshot before the first op and pushes it once at the end - so the author can
+undo an agent's whole pass with one Ctrl+Z, exactly as Sonify or Generate captions are one
+entry. The marker rather than a bare no-op matters: `splitAtPlayhead()` pops its own entry
+when it split nothing, and with a no-op it would have popped somebody else's.
+
+**A failing op rolls the whole batch back** (`atomic`, the default), and the answer names
+the op index and a sentence to act on - an unknown type lists the valid ones. The timeline,
+the settings the batch touched and the undo stack come back exactly as they were;
+`atomic: false` keeps what succeeded. A batch also answers with the lint, so an agent sees
+flat stretches without asking.
+
+**Nothing may raise a modal.** `quietUI()` in `app.js` is true on a headless run and while
+a batch runs; `confirmDiscard()` answers itself and `openProject()`'s two `alert()`s become
+log lines. A blocking dialog would stall the batch with nobody to answer it - the same hang
+`smoke.js` guards against. For the same reason `doRender()`, `exportCovers()` and
+`doDeliver()` take an options object (`outPath`/`range`, `dir`/`time`, `dir`/`name`, and
+`quiet` to skip Explorer) and **return** their result; the buttons call them with nothing,
+exactly as before. A click handler passes an `Event`, which the functions ignore.
+
+| Group | Ops |
+| --- | --- |
+| project | `new` (refuses over unsaved work without `force`), `open`, `save`, `output`, `seek`, `select`, `undo`, `redo`, `describe`, `eval` |
+| timeline | `media`, `clip` (with its linked audio), `addTrack`, `set` (move / trim / reframe / restyle / track flags), `split`, `delete`, `closeGaps`, `link`, `trimTo` |
+| canvas | `text` (`anims: "pop" \| "type" \| "none" \| [layers]`), `graphic` (series and diagram specs accept arrays / objects) |
+| effects | `effect` (clip or `master`, with `keys`, `bind`, `mblur`), `effectSet`, `keys` (on an effect, a card, a graphic or a speed curve), `master` |
+| motion | `punchIn`, `drift`, `reframe`, `speed`, `autoZoom` (+ a whoosh per zoom), `ripples`, `mouseTake`, `mockup`, `spotlight`, `cutout`, `tracker`, `callout`, `transition` |
+| sound | `sounds`, `sfx`, `sonify`, `audioFx` (a duck's `voiceTrack` may be a name like `A1`) |
+| captions | `captions` (`words` in source seconds, or `transcribe: true`) |
+| delivery | `delivery`, `frame` (per-format override), `hooks`, `lint` (`fix: true`), `still`, `covers`, `render`, `deliver` |
+
+`catalog().ops` carries the argument list of each one.
+
+#### The recipes, and the decisions inside them
+
+- **`punchIn`** is a keyframed transform, never a cut. It holds the focus point still: with
+  the anchor in the middle, a point `p` lands at `0.5 + (p - 0.5)·s + offset`, so the offset
+  is `(p - 0.5)(1 - s)`. `smoke-agent.js` asserts the point does not move.
+- **`reframe`** cuts a recording every N seconds and gives each piece its own zoom, panned
+  towards where the cursor spent that piece when there is telemetry - "reframe, don't just
+  hold". It splits the whole link group and re-pairs the right halves, the rule
+  `relinkAfterSplit()` keeps.
+- **`ripples`** puts a `ripple` on a recording's **real** mouse-downs by writing them as a
+  frame-space take through the clip's framing. It draws **no cursor** unless asked: the
+  capture already has one in its pixels, and two pointers is the bug "Two recordings, and
+  which one draws a cursor" exists for.
+- **`mockup`** adds `chrome` **then** `background` - the order is the picture. For a capture
+  wider than the frame it widens the crop past the source (`zoom < 1`), centres it, and
+  gives the device the picture's aspect, so the device's screen crops exactly the picture.
+  It deliberately stays a **crop**, not `fit: 'contain'`: `Cursor.mapper()` and
+  `Tracker.frameMap()` speak crop only, so auto-zoom targets, ripples and tracks still land
+  on the right pixel. The clip carries effects, so it is baked, and `drawImage` clips an
+  oversized source rect - the ffmpeg fast path, which could not, never sees it.
+- **`spotlight`** and **`cutout`** are timed: the dim (or the float's opacity) is keyed up
+  and back down over `[from, to]`, and with `clips` the op picks the piece under `from`.
+  Their rects are in the **finished frame's** coordinates - what a `still` shows.
+- **`callout`** with a graphic binds a `transform` to a solved track across clips (the
+  existing cross-clip binding). A text card takes no effect stack, so a text callout samples
+  the track into card `x`/`y` keys instead.
+- **`lint fix`** walks each flat stretch and writes gentle push/settle keys on the topmost
+  picture or graphic under it, spaced under the threshold, on a transform tagged
+  `agent-lint` - a keyframe is a change the lint counts, which is the whole of why auto-zoom
+  registers too.
+
+Generated effects are tagged (`agent-punch`, `agent-drift`, `agent-lint`) the way
+auto-zoom's are, so a re-run finds its own transform instead of stacking another.
+
+#### The B2B template
+
+`Agent.expand(spec)` compiles a short into ops; `build` runs them. It is **pure** - it reads
+nothing off the timeline - so the same spec always compiles to the same list, and an agent
+can expand, edit the ops and run those. `tools/agent-examples/b2b-short.json` is a complete
+spec in the house structure:
+
+| Beat | What it compiles to |
+| --- | --- |
+| `hook` 0-3 s | the talking head on V1, a punch-in at ~1.5 s, a riser (or impact) on frame one, optional claim text |
+| `stakes` 3-8 s | the talking head with a slow drift, a speed ramp in out of the hook (length kept), a staggered `counter`/`lowerThird`/`bracket` on V2 |
+| `product` 8-30 s | the recording `reframe`d every ~2.5 s, ripples on real clicks, auto-zoom with `minHold` 0.6 and a whoosh per zoom, a browser mockup on the brand gradient, timed spotlights, cutouts and callouts |
+| `proof` 30-42 s | a brand plate and data graphics staggered in, an impact where each lands |
+| `mechanism` 42-52 s | a plate and one `flow`/`funnel`/`nodemap` clip with staggered entry |
+| `cta` 52-60 s | the head or an end card, one line of typewriter type in brand colours |
+
+Then: word-level captions over the speech beats (from `transcripts` or `transcribe`), a
+music bed ducked under A1, Sonify for clicks / graphic pops / counter ticks,
+`hookVariants` as real hook variants over the shared tail, `trimTo` the last beat, `lint`
+with fix, `save`, and - with `deliver.dir` - the formats, a cover frame and the delivery run.
+
+Measured end to end on this machine with the suite fixtures (a 47-op spec: six beats, two
+hook variants, captions, Sonify, two formats, covers): about four minutes, nearly all of it
+the four encodes.
+
 ### Adding a feature — the usual places
 
 | Want to add | Touch |
@@ -4422,6 +4596,7 @@ clicking it seeks there. The panel head carries the count, so a collapsed panel 
 | Anything that blurs by sampling across time | `Anim.temporalAverage()` — never a hand-rolled `lighter` at `1/samples` accumulator, see "The shutter" |
 | An effect that should offer motion blur | nothing — every effect does. Flag the type `timeVarying: true` only if its `draw()` reads the clock without needing keyframes |
 | A swipe parameter | `defaults('swipe')` in `transitions.js` (normalize fills it into old projects for free) + one `C({...})` row in `renderTransitionPanel()` |
+| An **agent op** | one `op(name, doc, fn)` in `src/renderer/agent.js` - call the app.js function the panel calls rather than re-implementing it, throw `AgentError` with a sentence an agent can act on, return plain JSON. The catalog, the server routes and the CLI pick it up with no other change. A new effect, graphic or transition type needs **no** op: `effect`/`graphic`/`transition` and the catalog read the live tables |
 | A **delivery format** | one entry in `Delivery.FORMATS` (`src/delivery.js`) — its id, size and safe zone. The format list, the safe guide, the per-format framing overrides, the file names and the delivery run all build themselves from it. Ids are stable strings, never indices: reordering the table must not re-point every override in every saved project |
 | Something the **retention lint** should count as a change | one `put(t, 'kind')` in `lintEvents()` (`app.js` §9b) + a label in `Delivery.EVENT_KINDS` |
 | A QuickBin column or action | `quickbin.js` (`itemRow`/`folderRow`) + a button in `#binBar` wired in section 10 |
