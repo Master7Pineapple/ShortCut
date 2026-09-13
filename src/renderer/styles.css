@@ -816,3 +816,50 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
   color: #fff; text-shadow: 0 1px 3px #000; opacity: .8;
 }
 .badge.viewing { background: #c2884a; }
+
+/* ============================================================ dark native menus
+   Without a dark colour-scheme Chromium draws every <select> popup in the OS light theme,
+   which is the white list under "+ Graphic..." and every other dropdown. */
+:root { color-scheme: dark; }
+option, optgroup { background: var(--panel2); color: var(--text); }
+optgroup { color: var(--dim); font-weight: 600; }
+
+/* ============================================================ inspector breathing room
+   The column packs a lot of controls; spacing, not fewer controls, is what de-crams it. */
+#inspectorCol { --insp-pad: 14px; }
+#inspectorCol > .panel-head { margin-top: 12px; padding: 8px var(--insp-pad); }
+#inspectorCol .pad,
+#capPanel, #sfxPanel, #masterPanel, #delPanel { padding: 14px var(--insp-pad) 18px; }
+#inspectorResize { background: transparent; }
+#inspectorResize:hover { background: var(--accent-soft); }
+
+#inspector .kv { gap: 8px 12px; margin-bottom: 6px; }
+#inspector .kv b { color: var(--faint); }
+#inspector .kv span { color: var(--text); }
+#framing .row { margin-bottom: 12px; }
+
+/* Each sub-block (audio effects, visual effects, tighten, auto-zoom, tracking...) is a
+   clearly separated group with its own header line. */
+.afx-box, .fx-box, .fx-az, .trk-box, .mm-box {
+  margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line);
+}
+.afx-head, .fx-head { margin-bottom: 8px; }
+.afx-head b, .fx-head b { font-size: 13px; }
+.afx-note, .fx-note, .tc-hint { line-height: 1.5; }
+.afx-note, .fx-note { margin-bottom: 12px; }
+.tc-hint { margin: 4px 0 10px; }
+.afx-add, .fx-add { margin-top: 8px; }
+
+.tc-row { gap: 10px; margin-bottom: 10px; }
+.tc-btns { gap: 4px; }
+.tc-body { padding: 12px var(--insp-pad, 12px); }
+.tc-section > summary { padding: 8px 12px; }
+
+.afx-fx, .fx-fx, .sfx-trig, .tc-anim, .tc-kf { border-radius: var(--radius); margin-bottom: 8px; }
+.afx-fx-head, .fx-fx-head, .sfx-trig-head { padding: 6px 8px; border-radius: var(--radius) var(--radius) 0 0; }
+.afx-fx-body, .fx-fx-body, .sfx-trig-body { padding: 10px; }
+
+.tc-preset-box { padding: 10px 12px; margin: 10px 0; border-radius: var(--radius); }
+.tc-preset-head { margin-bottom: 8px; }
+.tc-preset-sel, .tc-preset-save { margin-bottom: 8px; }
+.tc-preset-acts { gap: 6px; }
