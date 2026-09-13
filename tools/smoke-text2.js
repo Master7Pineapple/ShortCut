@@ -294,6 +294,8 @@
       (areaSel.webkitUserSelect || areaSel.userSelect) === 'text');
 
     // Nothing must be sitting on top of the box, and it must not be disabled.
+    // Panels above it (the PresetList among them) can push it below the fold.
+    anyNum.scrollIntoView({ block: "center" });
     const r2 = anyNum.getBoundingClientRect();
     const hit = document.elementFromPoint(r2.x + r2.width / 2, r2.y + r2.height / 2);
     ok('the number box is the top element at its own centre', hit === anyNum,

@@ -72,7 +72,7 @@ const Agent = (() => {
   function clipsOf(v, what) {
     if (v == null) return [];
     if (isObj(v) && Array.isArray(v.ids)) v = v.ids;
-    return (Array.isArray(v) ? v : [v]).map((x) => clipOf(x, what));
+    return (Array.isArray(v) ? v.flat() : [v]).map((x) => clipOf(x, what));
   }
   function trackOfClip(clip) {
     const f = findClip(clip.id);

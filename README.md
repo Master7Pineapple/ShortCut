@@ -1530,6 +1530,30 @@ shows what the next pass **would** place before committing, and the count of wha
 already there stays on the panel head so a collapsed panel still reports. Only Sonify,
 Clear and the library's `+` touch the timeline, and each is one undo entry.
 
+### The PresetList
+
+`src/renderer/presetlist.js`, opened with the toolbar's **Presets** button as a floating window
+(draggable, resizable; its position is remembered; Esc closes it). Presets are listed on the left and each preset's sections are tabs, so nothing needs scrolling to. It is the B2B short-form preset rack, numbered 01-14 in build
+order. It is **not** the text-card preset save/load: that stores one card's look, while a
+PresetList entry is a whole pass with its own parameters. Each entry works through the
+engines the app already has. Parameters are saved as `state.presetList` in the .scut. Like
+the Captions settings, editing them adds no undo entry.
+
+**01 Caption engine** is built. Its six sections:
+
+| Preset | What it drives |
+| --- | --- |
+| `CAP_word-pop` | Caption settings: face, size, tracking, leading, line height, soft shadow with no stroke, hard cut in, and the spoken word scaled 105% over 3f with `emphasisEase: 'backOut'` |
+| `CAP_blowup` | `card.blowup`: the word sits on its own line at 1.45-1.7x, in caps, and settles from 112% over 4f. The panel warns when there is more than one blowup per 8 s |
+| `CAP_marker` | `card.marker`: a rounded block wiped in left to right with a soft edge, either tint or solid (solid flips the text colour) |
+| `CAP_metric-chip` | `Captions.metricChips()` / `chipCard()`: a mono pill (`bg.padX`, `bg.border`) rising out of `card.mask.in`, on a `chips: true` CHIP track, made in the same undo entry as the captions |
+| `CAP_role` | **Add role tag**: `card.eyebrow` over a name, left-aligned, exiting on `card.mask.out`, on a `roleTags: true` TAG track |
+| `CAP_guides` | `#rackGuides`: a DOM overlay (top, bottom and right-rail masks) that is never exported |
+
+**Apply to captions** only writes the Captions settings. **Apply + generate** also runs
+`generateCaptions()`. The new card fields are all drawn in `TextDraw`, so the preview and
+the export match.
+
 ### Tighten (silence removal)
 
 Detect the silences in a clip's audio, throw them away, and close the gaps — the single

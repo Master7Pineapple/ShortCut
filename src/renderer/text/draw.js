@@ -107,8 +107,73 @@ const TextDraw = (() => {
       hold: Math.max(0.05, num(wf.hold, 0.6)),
       minHold: Math.max(0.02, num(wf.minHold, 0.14)),
       pop: num(wf.pop, 1),
+      // The curve the emphasis rises on. '' keeps the original smoothstep; 'backOut' is
+      // the rack's "ease-out-back" - the word overshoots its size a touch, then settles.
+      ease: wf.ease || '',
     };
   }
+
+  /**
+   * Keyword blowup - the one word per 8-12 s that carries the claim.
+   *
+   *   card.blowup = { words: [i], scale, color, from, dur }
+   *
+   * A blown word sits on a line of its own (the generator puts it there with newlines),
+   * so the LINE grows, not just the glyph: it is measured and spaced at `scale` and the
+   * lines around it make room. `from -> 1` is the impact: the word lands slightly too big
+   * and snaps down to size on an expo curve, timed from when the word is spoken.
+   */
+  function blowupOf(card) {
+    const b = card && card.blowup;
+    if (!b || !Array.isArray(b.words) || !b.words.length) return null;
+    const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
+    return {
+      words: new Set(b.words.map(Number)),
+      scale: Math.max(1, num(b.scale, 1.55)),
+      color: b.color || null,
+      from: Math.max(0.2, num(b.from, 1.12)),
+      dur: Math.max(0.001, num(b.dur, 4 / 30)),
+    };
+  }
+
+  /**
+   * Highlighter block - a marker stroke behind a word.
+   *
+   *   card.marker = { words: [i], color, mode: 'tint'|'solid', opacity, textColor,
+   *                   radius, padX, padY, dur, soft, angle }
+   *
+   * `tint` lays the colour at `opacity` under unchanged text (the quieter option);
+   * `solid` lays it at full strength and flips the word to `textColor` once the wipe is
+   * half way over it. The wipe runs left to right over `dur` with a soft leading edge
+   * `soft` wide, so it reads as a marker stroke rather than a rectangle appearing.
+   */
+  function markerOf(card) {
+    const k = card && card.marker;
+    if (!k || !Array.isArray(k.words) || !k.words.length) return null;
+    const num = (v, d) => (isFinite(Number(v)) ? Number(v) : d);
+    const solid = k.mode === 'solid';
+    return {
+      words: new Set(k.words.map(Number)),
+      color: k.color || '#ffd166',
+      solid,
+      opacity: solid ? 1 : Math.max(0, Math.min(1, num(k.opacity, 0.22))),
+      textColor: k.textColor || '#111111',
+      radius: Math.max(0, num(k.radius, 8)),
+      padX: Math.max(0, num(k.padX, 14)),
+      padY: Math.max(0, num(k.padY, 4)),
+      dur: Math.max(0.001, num(k.dur, 3 / 30)),
+      soft: Math.max(0, Math.min(0.5, num(k.soft, 0.12))),
+      angle: num(k.angle, 0),
+    };
+  }
+
+  /** When word `i` starts on the card's clock - its spoken time, or the card's start. */
+  function wordStart(card, i, lead) {
+    const w = Array.isArray(card.words) ? card.words[i] : null;
+    return w ? Math.max(0, Number(w.start) - (lead || 0)) : 0;
+  }
+
+  const expoOut = (x) => (x >= 1 ? 1 : x <= 0 ? 0 : 1 - Math.pow(2, -10 * x));
 
   const smooth = (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 
@@ -153,7 +218,11 @@ const TextDraw = (() => {
     const span = Math.min(Math.max(fx.hold, 2 * a), Math.max(fx.minHold, 2 * a, w.end - w.start));
     const end = start + span;
     const half = Math.min(a, span / 2);
-    const hot = Math.min(smooth((t - start) / half), smooth((end - t) / half));
+    const u = (t - start) / half;
+    const rise = fx.ease === 'backOut'
+      ? (u >= 1 ? 1 : u <= 0 ? 0 : TextModel.ease({ kind: 'named', name: 'backOut' }, u))
+      : smooth(u);
+    const hot = Math.min(rise, smooth((end - t) / half));
     return { on, hot: Math.max(0, hot), enter };
   }
 
@@ -293,9 +362,24 @@ const TextDraw = (() => {
     const maxWidth = st.maxWidth * W;
     const lines = layoutLines(ctx, text, maxWidth);
     const lineH = st.fontSize * scale * st.lineHeight;
-    const widths = lines.map((l) => ctx.measureText(l).width);
+    const blow = blowupOf(card);
+    const mk = markerOf(card);
+    // A line that is exactly one blown-up word is measured, spaced and drawn at the
+    // blowup's scale. Every other line is 1, so a card without a blowup lays out exactly
+    // as it always did.
+    const lineScale = [];
+    {
+      let n = 0;
+      for (const l of lines) {
+        const c = l.split(/\s+/).filter(Boolean).length;
+        lineScale.push(blow && c === 1 && blow.words.has(n) ? blow.scale : 1);
+        n += c;
+      }
+    }
+    const widths = lines.map((l, i) => ctx.measureText(l).width * lineScale[i]);
+    const lineHs = lines.map((l, i) => lineH * lineScale[i]);
     const blockW = Math.max(1, ...widths);
-    const blockH = Math.max(lineH, lines.length * lineH);
+    const blockH = Math.max(lineH, lineHs.reduce((a, b) => a + b, 0));
 
     const cx = (st.x + tr.dx) * W;
     const cy = (st.y + tr.dy) * H;
@@ -306,15 +390,26 @@ const TextDraw = (() => {
       if (st.align === 'right') return block.x + block.w - widths[i];
       return block.x + (block.w - widths[i]) / 2;
     };
-    const lineY = (i) => block.y + lineH * i + lineH / 2;
+    const lineTops = [];
+    { let acc = 0; for (const h of lineHs) { lineTops.push(acc); acc += h; } }
+    const lineY = (i) => block.y + lineTops[i] + lineHs[i] / 2;
 
     const tws = typewriterStates(card, t, dur);
     const hi = highlightOf(card);
     const fx = wordFxOf(card);
     // A line is one fillText unless something needs the words apart. Splitting places
     // each word at its own measured offset and loses the kerning between them, so only a
-    // card that actually highlights, reveals or emphasises words pays for it.
-    const perWord = !!hi || !!fx;
+    // card that actually highlights, reveals, emphasises, blows up or marks words pays.
+    const perWord = !!hi || !!fx || !!blow || !!mk;
+    // The blowup's impact: the extra scale a blown word is at right now.
+    const blowAt = (wi) => {
+      if (!blow || wi < 0 || !blow.words.has(wi)) return 1;
+      const k = expoOut((t - wordStart(card, wi, fx ? fx.lead : 0)) / blow.dur);
+      return blow.from + (1 - blow.from) * k;
+    };
+    // An item on a scaled line: `prefixW`/`w` are measured at the base font, the line is
+    // laid out at `s`, and the item is drawn at the base font scaled about its own centre.
+    const placeX = (x0, prefixW, w, s) => x0 + (prefixW + w / 2) * s - w / 2;
     const baseColor = st.fill.type === 'solid' ? st.fill.color : null;
     const items = [];
 
@@ -335,7 +430,11 @@ const TextDraw = (() => {
      * settles back to being a keyword.
      */
     const wordLook = (wi) => {
-      const keyed = hi && wi >= 0 && hi.words.has(wi) ? hi.color : null;
+      let keyed = hi && wi >= 0 && hi.words.has(wi) ? hi.color : null;
+      if (blow && blow.color && wi >= 0 && blow.words.has(wi)) keyed = blow.color;
+      // A solid marker flips its word to the ground colour once the wipe is half over it.
+      if (mk && mk.solid && wi >= 0 && mk.words.has(wi) &&
+          (t - wordStart(card, wi, fx ? fx.lead : 0)) / mk.dur >= 0.5) keyed = mk.textColor;
       if (!fx || wi < 0) return { alpha: 1, scale: 1, dy: 0, paint: keyed };
       const ws = wordState(fx, wi, t);
       const rest = keyed || baseColor;
@@ -367,18 +466,19 @@ const TextDraw = (() => {
           items.push({ text: l, x: lineX(i), y: lineY(i), w: widths[i], alpha: 1, dx: 0, dy: 0, scale: 1 });
           return;
         }
-        const x0 = lineX(i), y = lineY(i);
+        const x0 = lineX(i), y = lineY(i), ls = lineScale[i];
         let prefix = '';
         for (const u of splitUnits(l, 'word')) {
-          const ux = x0 + ctx.measureText(prefix).width;
+          const pw = ctx.measureText(prefix).width;
           prefix += u;
           const wi = nextWord(u, true);
           if (wi < 0) continue;
           const lk = wordLook(wi);
           if (lk.alpha <= 0.001) continue;      // not spoken yet
+          const uw = ctx.measureText(u).width;
           items.push({
-            text: u, x: ux, y, w: ctx.measureText(u).width,
-            alpha: lk.alpha, dx: 0, dy: lk.dy, scale: lk.scale,
+            text: u, x: placeX(x0, pw, uw, ls), y, w: uw,
+            alpha: lk.alpha, dx: 0, dy: lk.dy, scale: lk.scale * ls * blowAt(wi),
             wordIndex: wi, paint: lk.paint,
           });
         }
@@ -399,9 +499,10 @@ const TextDraw = (() => {
       perLine.forEach((us, i) => {
         const x0 = lineX(i);
         const y = lineY(i);
+        const ls = lineScale[i];
         let prefix = '';
         for (const u of us) {
-          const ux = x0 + ctx.measureText(prefix).width;
+          const pw = ctx.measureText(prefix).width;
           prefix += u;
           // A word index is taken for EVERY unit, including the invisible ones: an
           // out-of-window unit still occupies its place in the word order, so skipping
@@ -415,19 +516,71 @@ const TextDraw = (() => {
           const lk = wordLook(wi);
           const alpha = t2.alpha * lk.alpha;
           if (alpha <= 0.001) continue;
+          const uw = ctx.measureText(u).width;
           items.push({
-            text: u, x: ux, y, w: ctx.measureText(u).width,
-            alpha, dx: t2.dx, dy: t2.dy + lk.dy, scale: t2.scale * lk.scale,
+            text: u, x: placeX(x0, pw, uw, ls), y, w: uw,
+            alpha, dx: t2.dx, dy: t2.dy + lk.dy, scale: t2.scale * lk.scale * ls * blowAt(wi),
             wordIndex: wi, paint: lk.paint,
           });
         }
         inWord = false;
       });
     }
+    // The eyebrow: a small label line above the block (a speaker's role, a section name),
+    // in its own face and size. It moves with the card and shares its shadow.
+    let eyebrow = null;
+    const eb = card.eyebrow;
+    if (eb && String(eb.text || '').trim()) {
+      const es = Object.assign({}, st, {
+        fontFamily: eb.fontFamily || 'Consolas', fontSize: Math.max(4, Number(eb.fontSize) || 34),
+        bold: eb.bold != null ? !!eb.bold : true, italic: false,
+      });
+      const efont = fontString(es, scale);
+      ctx.font = efont;
+      const els = (Number(eb.letterSpacing) || 0) * scale;
+      try { ctx.letterSpacing = els + 'px'; } catch (e) { /* older engines */ }
+      const etext = eb.uppercase === false ? String(eb.text) : String(eb.text).toUpperCase();
+      const ew = ctx.measureText(etext).width;
+      const eh = es.fontSize * scale * 1.2;
+      const gap = (eb.gap != null ? Number(eb.gap) : 14) * scale;
+      const ex = st.align === 'left' ? block.x
+        : st.align === 'right' ? block.x + block.w - ew : block.x + (block.w - ew) / 2;
+      eyebrow = {
+        text: etext, font: efont, letterSpacing: els, x: ex, y: block.y - gap - eh / 2, w: ew, h: eh,
+        color: eb.color || baseColor || '#ffffff',
+        alpha: Math.max(0, Math.min(1, isFinite(Number(eb.opacity)) ? Number(eb.opacity) : 0.55)),
+      };
+    }
+
+    // Marker rects, one per marked word. `p` is how far the wipe has travelled across it.
+    const marks = [];
+    if (mk) {
+      const byWord = new Map();
+      for (const it of items) {
+        if (it.wordIndex == null || !mk.words.has(it.wordIndex)) continue;
+        const icx = it.x + it.w / 2 + it.dx, icy = it.y + it.dy;
+        const hw = (it.w / 2) * it.scale, hh = (st.fontSize * scale / 2) * it.scale * 0.82;
+        const r = byWord.get(it.wordIndex);
+        if (!r) byWord.set(it.wordIndex, { x0: icx - hw, x1: icx + hw, y0: icy - hh, y1: icy + hh, a: it.alpha });
+        else {
+          r.x0 = Math.min(r.x0, icx - hw); r.x1 = Math.max(r.x1, icx + hw);
+          r.y0 = Math.min(r.y0, icy - hh); r.y1 = Math.max(r.y1, icy + hh);
+        }
+      }
+      for (const [wi, r] of byWord) {
+        const p = Math.max(0, Math.min(1, (t - wordStart(card, wi, fx ? fx.lead : 0)) / mk.dur));
+        if (p <= 0) continue;
+        const px = mk.padX * scale, py = mk.padY * scale;
+        marks.push({ x: r.x0 - px, y: r.y0 - py, w: (r.x1 - r.x0) + px * 2, h: (r.y1 - r.y0) + py * 2, p, a: r.a });
+      }
+    }
     ctx.restore();
 
     // Everything that paints outside the glyph boxes.
     let pad = st.fontSize * scale * 0.4;
+    if (mk) pad += (mk.padX + mk.padY) * scale;
+    if (blow) pad += lineH * Math.max(0, blow.scale * blow.from - 1);
+    if (st.bg.on && st.bg.padX != null) pad += Math.max(0, Number(st.bg.padX) || 0) * scale;
     if (st.stroke.on) pad += st.stroke.width * scale;
     if (st.shadow.on) pad += (st.shadow.blur + Math.abs(st.shadow.distance)) * scale;
     if (st.glow.on) pad += st.glow.size * (1 + st.glow.spread) * scale * 1.6 * Math.max(1, tr.glow);
@@ -449,9 +602,18 @@ const TextDraw = (() => {
       y0 = Math.min(y0, icy - hh); y1 = Math.max(y1, icy + hh);
     }
     if (!items.length) { x0 = block.x; y0 = block.y; x1 = block.x + block.w; y1 = block.y + block.h; }
+    // The box the background (and a mask) covers: the block, grown to take the eyebrow.
+    const box = Object.assign({}, block);
+    if (eyebrow) {
+      const bx0 = Math.min(box.x, eyebrow.x), by0 = Math.min(box.y, eyebrow.y - eyebrow.h / 2);
+      box.w = Math.max(box.x + box.w, eyebrow.x + eyebrow.w) - bx0;
+      box.h = box.y + box.h - by0;
+      box.x = bx0; box.y = by0;
+      x0 = Math.min(x0, box.x); y0 = Math.min(y0, box.y); x1 = Math.max(x1, box.x + box.w);
+    }
 
     return {
-      tr, scale, lines, widths, lineH, block, text, items,
+      tr, scale, lines, widths, lineH, block, box, eyebrow, marks, marker: mk, t, text, items,
       bounds: { x: x0 - pad, y: y0 - pad, w: (x1 - x0) + pad * 2, h: (y1 - y0) + pad * 2 },
     };
   }
@@ -536,11 +698,69 @@ const TextDraw = (() => {
 
     if (st.bg.on) {
       const p = st.bg.padding * scale;
+      const bx = m.box || block;
+      // `padX` widens a pill sideways without making it taller - a chip is wider than tall.
+      const px = (st.bg.padX != null ? Number(st.bg.padX) : st.bg.padding) * scale;
       ctx.save();
       ctx.globalAlpha = alpha * st.bg.opacity;
       ctx.fillStyle = st.bg.color;
-      roundRect(ctx, block.x - p, block.y - p, block.w + p * 2, block.h + p * 2, st.bg.radius * scale);
+      roundRect(ctx, bx.x - px, bx.y - p, bx.w + px * 2, bx.h + p * 2, st.bg.radius * scale);
       ctx.fill();
+      // An optional hairline border - what turns a tinted box into a chip.
+      const bd = st.bg.border;
+      if (bd && bd.on && bd.width > 0) {
+        ctx.globalAlpha = alpha * (bd.opacity == null ? 1 : bd.opacity);
+        ctx.strokeStyle = bd.color || '#ffffff';
+        ctx.lineWidth = Math.max(1, bd.width * scale);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // Highlighter blocks, under every glyph pass. The wipe's leading edge is a gradient so
+    // the stroke has a soft front rather than a hard vertical cut.
+    if (m.marks && m.marks.length && m.marker) {
+      const mk = m.marker;
+      for (const r of m.marks) {
+        ctx.save();
+        ctx.globalAlpha = alpha * r.a * mk.opacity;
+        if (mk.angle) {
+          ctx.translate(r.x + r.w / 2, r.y + r.h / 2);
+          ctx.rotate(mk.angle * Math.PI / 180);
+          ctx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2));
+        }
+        if (r.p >= 1) ctx.fillStyle = mk.color;
+        else {
+          const edge = r.p * (1 + mk.soft);
+          const solidTo = Math.max(0, Math.min(1, edge - mk.soft));
+          const g = ctx.createLinearGradient(r.x, 0, r.x + r.w, 0);
+          g.addColorStop(0, mk.color);
+          g.addColorStop(solidTo, mk.color);
+          g.addColorStop(Math.max(solidTo, Math.min(1, edge)), hexToRgba(mk.color, 0));
+          g.addColorStop(1, hexToRgba(mk.color, 0));
+          ctx.fillStyle = g;
+        }
+        roundRect(ctx, r.x, r.y, r.w, r.h, mk.radius * scale);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    if (m.eyebrow) {
+      const e = m.eyebrow;
+      ctx.save();
+      ctx.font = e.font;
+      try { ctx.letterSpacing = e.letterSpacing + 'px'; } catch (er) { /* older engines */ }
+      ctx.globalAlpha = alpha * e.alpha;
+      if (st.shadow.on) {
+        const rad = st.shadow.angle * Math.PI / 180;
+        ctx.shadowColor = hexToRgba(st.shadow.color, st.shadow.opacity);
+        ctx.shadowBlur = st.shadow.blur * scale;
+        ctx.shadowOffsetX = Math.cos(rad) * st.shadow.distance * scale;
+        ctx.shadowOffsetY = Math.sin(rad) * st.shadow.distance * scale;
+      }
+      ctx.fillStyle = e.color;
+      ctx.fillText(e.text, e.x, e.y);
       ctx.restore();
     }
 
@@ -646,6 +866,54 @@ const TextDraw = (() => {
 
   /** Paint the card, routing through a layer when the glow has to cover the glyphs. */
   function paint(ctx, clip, W, H, m) {
+    const mask = maskState(clip, m);
+    if (!mask) { paintLayer(ctx, clip, W, H, m); return; }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(-W, mask.top, W * 3, mask.bottom - mask.top);
+    ctx.clip();
+    if (mask.dy) ctx.translate(0, mask.dy);
+    paintLayer(ctx, clip, W, H, m);
+    ctx.restore();
+  }
+
+  /**
+   * Mask reveals, for chips and tags.
+   *
+   *   card.mask = { in: { dur, dy }, out: { dur } }
+   *
+   * `in` slides the card up by `dy` (px at 1080x1920) into place while everything below
+   * its settled bottom edge is hidden, so it rises out of a slot rather than fading. `out`
+   * is a wipe down: the hidden region's top edge travels from the card's top to its
+   * bottom. Only the edge that moves is clipped; the other side stays open so the shadow
+   * is not cut off.
+   */
+  function maskState(clip, m) {
+    const mk = clip.card.mask;
+    if (!mk) return null;
+    const dur = Math.max(0.001, clip.out - clip.in);
+    const t = m.t;
+    const bx = m.box || m.block;
+    const st = clip.card.style;
+    const pad = st.bg && st.bg.on ? st.bg.padding * m.scale : 0;
+    const top = bx.y - pad, bottom = bx.y + bx.h + pad;
+    const BIG = 1e5;
+    const ins = mk.in && Number(mk.in.dur) > 0 ? mk.in : null;
+    const outs = mk.out && Number(mk.out.dur) > 0 ? mk.out : null;
+    let r = null;
+    if (ins && t < ins.dur) {
+      const k = expoOut(Math.max(0, t) / ins.dur);
+      r = { top: -BIG, bottom: bottom + 1, dy: (1 - k) * (Number(ins.dy) || 16) * m.scale };
+    }
+    if (outs && t > dur - outs.dur) {
+      const k = Math.max(0, Math.min(1, (t - (dur - outs.dur)) / outs.dur));
+      const line = top + (bottom - top + 1) * k * k * (3 - 2 * k);
+      r = r ? Object.assign(r, { top: line }) : { top: line, bottom: BIG, dy: 0 };
+    }
+    return r;
+  }
+
+  function paintLayer(ctx, clip, W, H, m) {
     const st = clip.card.style;
     const needsLayer = st.glow.on && (st.glow.over || 0) > 0 && m.tr.glow > 0;
     if (!needsLayer) { paintInto(ctx, clip, W, H, m, m.tr.opacity); return; }

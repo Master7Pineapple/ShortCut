@@ -6,7 +6,35 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+
   <div id="app">
+    <!-- ===================== APP BAR: project, media, history, export ===================== -->
+    <header id="appbar">
+      <div class="brand"><span class="logo">&#9986;</span><span class="name">ShortCut</span></div>
+      <div class="group" data-label="Project">
+        <button id="btnNew" class="ghost" title="New project (Ctrl+N)">New</button>
+        <button id="btnOpen" class="ghost" title="Open project (Ctrl+O)">Open</button>
+        <button id="btnSave" class="ghost" title="Save project (Ctrl+S)">Save</button>
+        <button id="btnSaveAs" class="ghost" title="Save as (Ctrl+Shift+S)">Save as</button>
+      </div>
+      <div class="group" data-label="Media">
+        <button id="btnImport" class="ghost" title="Import media (Ctrl+I)">&#8613; Import</button>
+        <button id="btnImportFolder" class="ghost" title="Import folder (Ctrl+Shift+I)">Folder</button>
+        <button id="btnRecord" class="ghost" title="Record the screen, with cursor telemetry. Ctrl+Shift+F9 starts and stops one from any app.">&#9679; Record</button>
+        <button id="btnMouse" class="ghost" title="Perform a mouse take over the rendered picture: pointer, clicks and Shift-drag selections, recorded onto the clips under the range.">Mouse</button>
+      </div>
+      <div class="group">
+        <button id="btnUndo" class="ghost icon" title="Undo (Ctrl+Z)">&#8630;</button>
+        <button id="btnRedo" class="ghost icon" title="Redo (Ctrl+Y)">&#8631;</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="group">
+        <button id="btnPresetListCollapse" class="ghost" title="Open the preset list - the B2B preset rack">&#9733; Presets</button>
+        <button id="btnShortcuts" class="ghost" title="Keyboard shortcuts">&#9000;</button>
+        <button id="btnRender" class="primary" title="Write a finished file to disk (Ctrl+Shift+R)">Export&hellip;</button>
+      </div>
+    </header>
+
     <!-- ================= LEFT THIRD: the short itself, nothing else ================= -->
     <aside id="left">
       <div class="panel-head">
@@ -21,6 +49,11 @@
              it could one day reach a baked frame. Positioned onto the canvas's own box
              by renderSafeOverlay(), because the picture is letterboxed inside the stage. -->
         <div id="safeOverlay" hidden><div class="safe-in"></div><div class="safe-lbl"></div></div>
+        <!-- The PresetList's caption guides (CAP_guides). DOM, never the canvas, for the
+             same reason as the safe-zone guide: it must be impossible for it to export. -->
+        <div id="rackGuides" hidden>
+          <div class="rg-top"></div><div class="rg-bottom"></div><div class="rg-rail"></div>
+        </div>
         <div id="frameHint" class="hint">Drag on the preview to reposition the frame</div>
       </div>
 
@@ -37,42 +70,29 @@
 
     <!-- ====================== RIGHT TWO THIRDS: work area ====================== -->
     <main id="right">
-      <header id="toolbar">
-        <div class="group">
-          <button id="btnImport" title="Import media (Ctrl+I)">Import</button>
-          <button id="btnImportFolder" title="Import folder (Ctrl+Shift+I)">Import folder</button>
-          <button id="btnRecord" title="Record the screen, with cursor telemetry. Ctrl+Shift+F9 starts and stops one from any app.">Record</button>
-          <button id="btnMouse" title="Perform a mouse take over the rendered picture: pointer, clicks and Shift-drag selections, recorded onto the clips under the range.">Mouse</button>
-        </div>
-        <div class="sep"></div>
-        <div class="group">
-          <button id="btnNew" title="New project (Ctrl+N)">New</button>
-          <button id="btnOpen" title="Open project (Ctrl+O)">Open</button>
-          <button id="btnSave" title="Save project (Ctrl+S)">Save</button>
-          <button id="btnSaveAs" title="Save as (Ctrl+Shift+S)">Save as</button>
-        </div>
-        <div class="sep"></div>
+      <div id="toolbar">
         <div class="group">
           <button id="btnSplit" title="Split at playhead (S)">Split</button>
           <button id="btnDelete" title="Delete selected (Del)">Delete</button>
-          <button id="btnRipple" title="Ripple delete: close the gap (Shift+Del)">Ripple del</button>
+          <button id="btnRipple" title="Ripple delete: close the gap (Shift+Del)">Ripple</button>
           <button id="btnCloseGaps" title="Close the gaps between the selected clips (G). Nothing outside the selection moves.">Close gaps</button>
-          <button id="btnLink" title="Link A/V (Ctrl+L)">Link</button>
-          <button id="btnUnlink" title="Unlink A/V (Ctrl+Shift+L)">Unlink</button>
           <button id="btnDuplicate" title="Duplicate selected (Ctrl+D)">Duplicate</button>
         </div>
-        <div class="sep"></div>
         <div class="group">
-          <button id="btnUndo" title="Undo (Ctrl+Z)">Undo</button>
-          <button id="btnRedo" title="Redo (Ctrl+Y)">Redo</button>
+          <button id="btnLink" title="Link A/V (Ctrl+L)">Link</button>
+          <button id="btnUnlink" title="Unlink A/V (Ctrl+Shift+L)">Unlink</button>
         </div>
-        <div class="spacer"></div>
         <div class="group">
-          <button id="btnAddText" class="primary" title="Add a text card at the playhead (Ctrl+T)">+ Text</button>
+          <button id="btnAddText" class="accent" title="Add a text card at the playhead (Ctrl+T)">+ Text</button>
           <select id="addGraphic" title="Add a graphic at the playhead (Ctrl+G adds the last one again)"></select>
           <button id="btnAddTransition" title="Drop a transition on the nearest cut (T). Double-clicking a cut does the same.">+ Transition</button>
-          <button id="btnAddVideoTrack" title="Add video track">+ V track</button>
-          <button id="btnAddAudioTrack" title="Add audio track">+ A track</button>
+        </div>
+        <div class="group">
+          <button id="btnAddVideoTrack" title="Add video track">+ V</button>
+          <button id="btnAddAudioTrack" title="Add audio track">+ A</button>
+        </div>
+        <div class="spacer"></div>
+        <div class="group toggles">
           <label class="snap" title="Toggle snapping (N)"><input id="snapToggle" type="checkbox" checked /> Snap</label>
           <label class="snap" title="Play rendered spans from the render cache instead of compositing them live (P)"><input id="usePreviewRender" type="checkbox" checked /> Use render</label>
           <label class="snap" title="Resolution the viewer works at. Lower is faster to draw AND faster to render.">Preview
@@ -83,9 +103,7 @@
             </select>
           </label>
         </div>
-        <div class="sep"></div>
-        <button id="btnShortcuts" class="mini">Shortcuts</button>
-      </header>
+      </div>
 
       <section id="timelineWrap">
         <div id="rulerRow">
@@ -148,9 +166,10 @@
                 <option value="marks">In to Out marks</option>
               </select>
             </label>
+          </div>
+          <div class="render-actions">
             <button id="btnRenderPreview" class="primary" title="Render this range into the viewer (Ctrl+R). Nothing is written to your folders.">Render preview</button>
             <button id="btnRenderFull" title="Render the preview again, ignoring the cache">Re-render</button>
-            <button id="btnRender" title="Write a finished file to disk (Ctrl+Shift+R)">Export...</button>
             <button id="btnCancelRender" disabled>Cancel</button>
             <button id="btnClearCache" title="Delete cached bakes and renders">Clear cache</button>
             <span id="rangeInfo" class="range-info"></span>
@@ -287,6 +306,20 @@
     </aside>
   </div>
 
+  <!-- The PresetList: a floating, draggable window rather than one more panel in the
+       inspector column, so a preset is one click away instead of a scroll away. Named
+       B2B presets, each a bundle of parameters driving the app's own engines - NOT the
+       text-card preset save/load. Non-modal: the editor stays usable behind it. -->
+  <div id="presetDrawer" hidden>
+    <div class="pd-head">
+      <span class="title">Preset list</span>
+      <span id="presetListMeta" class="tc-meta"></span>
+      <span class="grow"></span>
+      <button id="btnPresetListClose" class="mini" title="Close (Esc)">&times;</button>
+    </div>
+    <div id="presetListPanel"></div>
+  </div>
+
   <div id="dropOverlay"><div>Drop files or a folder to import</div></div>
 
   <div id="recModal" hidden>
@@ -334,6 +367,7 @@
   <script src="quickbin.js"></script>
   <script src="text/draw.js"></script>
   <script src="text/ui.js"></script>
+  <script src="presetlist.js"></script>
   <script src="app.js"></script>
   <script src="agent.js"></script>
 </body>

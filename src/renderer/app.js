@@ -52,6 +52,10 @@ const state = {
    *  Tighten's: changing one snapshots no undo entry, it only changes what the next
    *  Generate would produce. Saved in the .scut so a project keeps its caption style. */
   captions: Object.assign({}, Captions.DEFAULTS),
+  /** The PresetList - named B2B presets built out of the app's own engines, each with its
+   *  own parameters. Settings like Captions': editing one snapshots no undo entry; only
+   *  a preset's Apply/Generate buttons touch the timeline. See presetlist.js. */
+  presetList: PresetList.defaults(),
   /** Sound design settings - the triggers, the levels and the duck. Settings like
    *  Tighten's and Captions': changing one snapshots no undo entry, it only changes what
    *  the next Sonify would place. Saved in the .scut, so a project keeps its sound. */
@@ -1979,6 +1983,7 @@ function renderInspector() {
   const sel = selectedClips();
   renderTransitionPanel();
   renderCaptionsPanel();
+  PresetList.renderPanel();
   renderSfxPanel();
   renderMasterPanel();
 
@@ -5700,6 +5705,34 @@ function captionPhrasesFor(clip, opts) {
   return out;
 }
 
+/**
+ * The metric-chip track: like the caption track, one flagged video track, kept directly
+ * above it so a chip can sit on screen at the same time as the caption it belongs to.
+ */
+function chipTrack(create) {
+  let t = state.tracks.find((x) => x.type === 'video' && x.chips);
+  if (t || create === false) return t || null;
+  t = makeTrack('video', state.tracks.filter((x) => x.type === 'video').length + 1);
+  t.name = 'CHIP';
+  t.chips = true;
+  state.tracks.unshift(t);
+  return t;
+}
+
+/** Metric chips for one audio clip, in timeline time, clipped to the part the clip uses. */
+function chipPlanFor(clip, opts) {
+  const words = transcriptFor(clip.src);
+  if (!words || !words.length) return [];
+  const out = [];
+  for (const c of Captions.metricChips(words, opts)) {
+    if (c.start < clip.in - 1e-6 || c.start >= clip.out - 1e-6) continue;
+    const e = Math.min(c.end, clip.out);
+    if (e - c.start < 0.1) continue;
+    out.push({ text: c.text, start: clip.start + (c.start - clip.in), end: clip.start + (e - clip.in) });
+  }
+  return out;
+}
+
 /** Caption clips this app generated, optionally only those from a given set of sources. */
 function generatedCaptionClips(srcs) {
   const out = [];
@@ -5767,13 +5800,34 @@ function generateCaptions() {
     track.clips.push(clip);
   }
 
+  // Metric chips ride the same pass - same undo entry, same `captions.gen` tag - so a
+  // regenerate or a Clear sweeps them with the captions they were made alongside.
+  let chips = 0;
+  if (o.chipOn) {
+    const ct = chipTrack(true);
+    for (const u of units) {
+      for (const c of chipPlanFor(u.audio, o)) {
+        ct.clips.push({
+          id: nextId(), src: null, name: 'Chip', kind: 'text',
+          start: c.start, in: 0, out: Math.max(0.1, c.end - c.start),
+          mediaDuration: 3600, srcW: 0, srcH: 0, fps: 0,
+          panX: 0.5, panY: 0.5, zoom: 1, volume: 1, linkId: null,
+          card: Captions.chipCard(TextModel.defaultCard(''), c.text, o),
+          captions: { gen: true, src: u.audio.src, chip: true },
+        });
+        chips++;
+      }
+    }
+  }
+
   sortTracks();
   markDirty();
   renderAll();
   log('Captions: ' + made.length + ' card(s) from ' + srcs.size + ' source(s)' +
       (fromPreset ? ' using preset "' + state.captions.preset + '"' : '') +
+      (chips ? ', ' + chips + ' metric chip(s)' : '') +
       (old.length ? ', replacing ' + old.length + ' previous card(s).' : '.'));
-  return { made: made.length, replaced: old.length, clips: made };
+  return { made: made.length, replaced: old.length, clips: made, chips };
 }
 
 /** Remove this generator's caption cards. One undo entry, or none if there are none. */
@@ -6169,6 +6223,7 @@ function newProject() {
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
   state.captions = Object.assign({}, Captions.DEFAULTS);
+  state.presetList = PresetList.defaults();
   state.sfx = SFX.defaultOpts();
   state.master = [];
   state.delivery = normalizeDelivery(null);
@@ -7052,6 +7107,7 @@ function serialize() {
     outPoint: state.outPoint,
     tighten: state.tighten,
     captions: state.captions,
+    presetList: state.presetList,
     sfx: state.sfx,
     // The master finish is part of the project, not a setting: it decides pixels.
     master: masterStack(),
@@ -7116,6 +7172,7 @@ async function openProject(filePath) {
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
   state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
+  state.presetList = PresetList.normalize(d.presetList);
   state.sfx = SFX.normalizeOpts(d.sfx);
   // Fill in a master stack saved by an older build, and drop a type this one does not
   // know - the job Trans.normalize() and FX.normalizeClip() do for everything else.
@@ -8250,6 +8307,7 @@ function normalizeDelivery(d) {
 // DOM makes that impossible by construction rather than by care.
 
 function renderSafeOverlay() {
+  PresetList.renderGuides();
   const box = $('#safeOverlay');
   if (!box) return;
   const fmt = Delivery.formatById(activeFormatId());
@@ -10700,6 +10758,7 @@ $('#btnBinRemove').addEventListener('click', () => QuickBin.removeSelection());
 $('#btnBinCollapse').addEventListener('click', () => toggleBin());
 
 $('#btnCapCollapse').addEventListener('click', () => toggleCaptions());
+$('#btnPresetListCollapse').addEventListener('click', () => PresetList.toggle());
 $('#btnSfxCollapse').addEventListener('click', () => toggleSfx());
 $('#btnMasterCollapse').addEventListener('click', () => toggleMaster());
 $('#btnDelCollapse').addEventListener('click', () => toggleDelivery());

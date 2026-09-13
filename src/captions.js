@@ -70,6 +70,47 @@
     wordLead: 0.06,       // start this much early, so the highlight lands on the beat
     wordHold: 0.60,       // longest a word stays lit; past this it is a pause, not a word
     wordMinHold: 0.14,    // shortest, so a 40ms DTW blip still reads as a highlight
+    // Type details. The defaults are the look captions always had (an 8px black stroke,
+    // a 6/22 shadow at 75%), so a project captioned before these existed is unchanged.
+    tracking: 0,          // letter spacing, % of the font size
+    lineHeight: 1.15,
+    strokeOn: true,
+    strokeWidth: 8,
+    shadowDistance: 6,
+    shadowAngle: 135,
+    shadowBlur: 22,
+    shadowOpacity: 0.75,
+    emphasisEase: '',     // '' = smoothstep, 'backOut' = overshoot and settle
+    // Keyword blowup: these words get a line of their own, bigger, in caps, with an impact.
+    blowWords: '',
+    blowScale: 1.55,
+    blowFrom: 1.12,
+    blowDur: 4 / 30,
+    blowColor: '#ffd166',
+    blowUpper: true,
+    // Highlighter block: a marker stroke wiped in behind these words.
+    markWords: '',
+    markMode: 'tint',     // tint | solid
+    markColor: '#ffd166',
+    markOpacity: 0.22,
+    markTextColor: '#111111',
+    markRadius: 8,
+    markPadX: 14,
+    markPadY: 4,
+    markDur: 3 / 30,
+    markSoft: 0.12,
+    markAngle: 0,
+    // Metric chips: a spoken acronym (and the figure said with it) gets a mono pill above
+    // the caption. Off by default; they go on their own track.
+    chipOn: false,
+    chipWords: 'ARR, MRR, NRR, GRR, CAC, LTV, ACV, ARPU, PLG, ICP, ROI, KPI, GTM, SaaS, B2B, CRM, SLA, MQL, SQL',
+    chipFont: 'Consolas',
+    chipSize: 0.6,        // fraction of the caption size
+    chipTracking: 8,      // % of the chip's size
+    chipHold: 1.6,
+    chipReveal: 5 / 30,
+    chipRise: 16,
+    chipGap: 0.075,       // how far above the caption, fraction of frame height
     // filler words fed back into Tighten
     cutFillers: false,
     fillers: 'um, uh, erm, ah, like, you know, i mean, sort of, kind of, basically',
@@ -88,8 +129,8 @@
       .replace(/[^\p{L}\p{N}']+/gu, '');
   }
 
-  const keywordList = (opts) =>
-    String((opts && opts.keywords) || '').split(/[,\s]+/).map(normWord).filter(Boolean);
+  const wordsList = (v) => String(v || '').split(/[,\s]+/).map(normWord).filter(Boolean);
+  const keywordList = (opts) => wordsList(opts && opts.keywords);
 
   // ------------------------------------------------------------- parsing
 
@@ -346,6 +387,74 @@
     return phrase;
   }
 
+  /** Indices of a phrase's words that appear in a comma/space separated list. */
+  function matchWords(phrase, list) {
+    const keys = wordsList(list);
+    const out = [];
+    if (!keys.length) return out;
+    (phrase.words || []).forEach((w, i) => { if (keys.includes(normWord(w.w))) out.push(i); });
+    return out;
+  }
+
+  /**
+   * Metric chips out of a transcript: every spoken acronym in `chipWords`, plus the figure
+   * said right after it ("NRR one eighteen" will not match, "NRR 118%" will). Source
+   * time, like the words. A chip holds `chipHold` and never overlaps the next one.
+   */
+  function metricChips(words, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const keys = wordsList(o.chipWords);
+    const list = cleanWords(words);
+    const out = [];
+    if (!keys.length) return out;
+    const figure = /\d/;
+    list.forEach((w, i) => {
+      if (!keys.includes(normWord(w.w))) return;
+      const label = String(w.w).replace(/[^\p{L}\p{N}]+/gu, '').toUpperCase();
+      const next = list[i + 1];
+      const val = next && figure.test(next.w) && next.start - w.end < 0.6
+        ? ' ' + String(next.w).replace(/[.,;:!?]+$/, '') : '';
+      out.push({ start: w.start, end: w.start + Math.max(0.3, Number(o.chipHold) || 1.6), text: label + val });
+    });
+    for (let i = 0; i < out.length - 1; i++) {
+      if (out[i].end > out[i + 1].start) out[i].end = Math.max(out[i].start + 0.2, out[i + 1].start);
+    }
+    return out.map((c) => ({ start: r3(c.start), end: r3(c.end), text: c.text }));
+  }
+
+  /**
+   * A metric chip as an ordinary text card: mono, uppercase, tracked out, in a hairline
+   * pill with a 6% fill, rising out of a mask. `base` is a pristine default card.
+   */
+  function chipCard(base, text, opts) {
+    const o = Object.assign({}, DEFAULTS, opts || {});
+    const card = JSON.parse(JSON.stringify(base));
+    const zone = safeZone(o);
+    const size = Math.max(8, (Number(o.fontSize) || DEFAULTS.fontSize) * clamp(o.chipSize, 0.2, 2));
+    card.text = text;
+    const st = card.style;
+    st.fontFamily = o.chipFont || 'Consolas';
+    st.fontSize = size;
+    st.bold = true;
+    st.uppercase = true;
+    st.letterSpacing = size * (Number(o.chipTracking) || 0) / 100;
+    st.lineHeight = 1.1;
+    st.align = 'center';
+    st.x = 0.5;
+    st.y = clamp(zone.y - (Number(o.chipGap) || 0), 0.02, 0.98);
+    st.maxWidth = 1;
+    st.fill = { type: 'solid', color: o.color, gradient: st.fill.gradient };
+    st.stroke = Object.assign({}, st.stroke, { on: false });
+    st.shadow = Object.assign({}, st.shadow, { on: true, distance: 4, angle: 90, blur: 14, opacity: 0.35 });
+    st.bg = { on: true, color: '#ffffff', opacity: 0.06, padding: Math.round(size * 0.22),
+      padX: Math.round(size * 0.5), radius: 100,
+      border: { on: true, width: 2, color: '#ffffff', opacity: 0.45 } };
+    card.animEnabled = true;
+    card.anims = [];
+    card.mask = { in: { dur: Math.max(0.01, Number(o.chipReveal) || 5 / 30), dy: Number(o.chipRise) || 16 } };
+    return card;
+  }
+
   // ------------------------------------------------------------- placement
 
   /**
@@ -385,7 +494,20 @@
     // and a preset authored for a title card knows nothing about that.
     const preset = !!o.fromPreset;
 
-    card.text = phrase.text;
+    // A blown-up word gets a line of its own - that is what lets it be bigger than its
+    // neighbours without colliding with them - and is written in caps if asked. The word
+    // ORDER is unchanged, so every per-word index below still lines up.
+    const blowIdx = matchWords(phrase, o.blowWords);
+    if (blowIdx.length) {
+      const set = new Set(blowIdx);
+      const parts = phrase.words.map((w, i) => (set.has(i) && o.blowUpper ? String(w.w).toUpperCase() : w.w));
+      let text = '';
+      parts.forEach((w, i) => {
+        const brk = set.has(i) || set.has(i - 1);
+        text += i === 0 ? w : (brk ? '\n' : ' ') + w;
+      });
+      card.text = text;
+    } else card.text = phrase.text;
     const st = card.style;
     if (!preset) {
       st.fontFamily = o.fontFamily;
@@ -394,9 +516,20 @@
       st.align = 'center';
       st.x = 0.5;
       st.maxWidth = clamp(o.maxWidth, 0.1, 1);
+      st.letterSpacing = st.fontSize * (Number(o.tracking) || 0) / 100;
+      st.lineHeight = clamp(o.lineHeight == null ? DEFAULTS.lineHeight : o.lineHeight, 0.6, 3);
       st.fill = { type: 'solid', color: o.color, gradient: st.fill.gradient };
-      st.stroke = Object.assign({}, st.stroke, { on: true, color: '#000000', width: 8 });
-      st.shadow = Object.assign({}, st.shadow, { on: true, opacity: 0.75, blur: 22, distance: 6 });
+      st.stroke = Object.assign({}, st.stroke, {
+        on: o.strokeOn !== false && Number(o.strokeWidth) > 0, color: '#000000',
+        width: Number(o.strokeWidth) >= 0 ? Number(o.strokeWidth) : 8,
+      });
+      st.shadow = Object.assign({}, st.shadow, {
+        on: true,
+        opacity: clamp(o.shadowOpacity == null ? 0.75 : o.shadowOpacity, 0, 1),
+        blur: Math.max(0, Number(o.shadowBlur == null ? 22 : o.shadowBlur)),
+        distance: Number(o.shadowDistance == null ? 6 : o.shadowDistance),
+        angle: Number(o.shadowAngle == null ? 135 : o.shadowAngle),
+      });
     }
     if (!preset || !o.presetPlacement) st.y = zone.y;
 
@@ -455,7 +588,24 @@
       // The typewriter's `scaleFrom` becomes the word's own pop, so "Pop each word in"
       // keeps meaning what it says once the words have real times of their own.
       pop: revealing && o.popIn ? 0.55 : 1,
+      ease: o.emphasisEase || '',
     };
+
+    // Blowup and marker are per-word overrides, like the keyword highlight: they belong
+    // to the words, so they apply over a preset's look as well.
+    card.blowup = blowIdx.length ? {
+      words: blowIdx, scale: Number(o.blowScale) || 1.55, color: o.blowColor || null,
+      from: Number(o.blowFrom) || 1.12, dur: Math.max(0.001, Number(o.blowDur) || 4 / 30),
+    } : null;
+    const markIdx = matchWords(phrase, o.markWords);
+    card.marker = markIdx.length ? {
+      words: markIdx, mode: o.markMode === 'solid' ? 'solid' : 'tint', color: o.markColor,
+      opacity: Number(o.markOpacity), textColor: o.markTextColor, radius: Number(o.markRadius),
+      padX: Number(o.markPadX), padY: Number(o.markPadY), dur: Number(o.markDur),
+      soft: Number(o.markSoft), angle: Number(o.markAngle) || 0,
+    } : null;
+    if (!card.blowup) delete card.blowup;
+    if (!card.marker) delete card.marker;
     return card;
   }
 
@@ -495,7 +645,7 @@
   const API = {
     DEFAULTS,
     parseWhisper, parseSrt, parseTranscript, cleanWords,
-    groupPhrases, markKeywords, safeZone, phraseCard,
+    groupPhrases, markKeywords, matchWords, safeZone, phraseCard, metricChips, chipCard,
     fillerSpans, fillerList, normWord, keywordList,
   };
 
