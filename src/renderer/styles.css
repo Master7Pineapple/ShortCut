@@ -863,3 +863,31 @@ optgroup { color: var(--dim); font-weight: 600; }
 .tc-preset-head { margin-bottom: 8px; }
 .tc-preset-sel, .tc-preset-save { margin-bottom: 8px; }
 .tc-preset-acts { gap: 6px; }
+
+/* ============================================================ inspector tabs */
+#inspectorTabs {
+  position: sticky; top: 0; z-index: 5; display: grid; grid-template-columns: repeat(6, 1fr);
+  gap: 2px; margin: 0 -8px; padding: 8px 8px; background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+#inspectorTabs button {
+  padding: 6px 2px; font-size: 11.5px; background: transparent; border-color: transparent;
+  color: var(--dim); border-radius: var(--radius-sm); white-space: nowrap;
+}
+#inspectorTabs button:hover:not(:disabled) { background: var(--panel2); color: var(--text); border-color: transparent; }
+#inspectorTabs button.on { background: var(--accent-soft); color: var(--accent-hi); font-weight: 600; }
+#inspectorCol[data-tab] > [data-itab] { display: none !important; }
+#inspectorCol[data-tab="clip"]     > [data-itab="clip"]:not([hidden]),
+#inspectorCol[data-tab="media"]    > [data-itab="media"]:not([hidden]),
+#inspectorCol[data-tab="captions"] > [data-itab="captions"]:not([hidden]),
+#inspectorCol[data-tab="sound"]    > [data-itab="sound"]:not([hidden]),
+#inspectorCol[data-tab="finish"]   > [data-itab="finish"]:not([hidden]),
+#inspectorCol[data-tab="deliver"]  > [data-itab="deliver"]:not([hidden]) { display: revert !important; }
+#inspectorCol[data-tab="clip"] > .panel-head[data-itab="clip"]:not([hidden]),
+#inspectorCol[data-tab="media"] > .panel-head[data-itab="media"]:not([hidden]),
+#inspectorCol[data-tab="captions"] > .panel-head[data-itab="captions"]:not([hidden]),
+#inspectorCol[data-tab="sound"] > .panel-head[data-itab="sound"]:not([hidden]),
+#inspectorCol[data-tab="finish"] > .panel-head[data-itab="finish"]:not([hidden]),
+#inspectorCol[data-tab="deliver"] > .panel-head[data-itab="deliver"]:not([hidden]) { display: flex !important; }
+#inspectorCol > #binBar:not([hidden]) { display: flex; }
+#inspectorCol[data-tab="media"] #quickBin { max-height: none; }

@@ -105,7 +105,7 @@ const PresetList = (() => {
     roleHold: 1.6,
     roleExit: F(4),
     // CAP_guides
-    guidesOn: true,
+    guidesOn: false,
     guideTop: 0.12,
     guideBottom: 0.20,
     guideRail: 0.18,
