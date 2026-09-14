@@ -477,7 +477,9 @@ const Graphics = (() => {
   const def = (o) => ({
     label: o.label,
     group: o.group,
-    params: Object.assign({}, COMMON, REVEAL, o.params),
+    // Every type that sets type carries a font family, chosen in the panel like any other
+    // text in the app. Primitives draw no text, so they do not get one.
+    params: Object.assign({}, COMMON, o.group === 'Primitives' ? {} : { font: 'Segoe UI' }, REVEAL, o.params),
     schema: COMMON_SCHEMA.concat(o.schema || [], REVEAL_SCHEMA),
     bounds: o.bounds,
     draw: o.draw,

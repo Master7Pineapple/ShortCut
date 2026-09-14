@@ -984,7 +984,11 @@ says what it costs.
 #### What does not get a stack, and where effects do not apply
 
 Effects are offered on `kind:'video'`, `kind:'image'` and `kind:'graphic'` — everything
-except a **text card**. A card already owns a transform, an opacity, a rotation, a glow and
+except a **text card**. The text card's own looks exist as effects too, so a PNG or a
+photo can have them: `animate` (in/out fade, slide, zoom, pop, flicker with easing - it is
+`timeVarying`, so per-effect motion blur works on it), `glow`, `shadow` and `stroke`. All
+three looks follow the picture's **alpha** (`silhouette()`), so they hug a transparent PNG
+rather than its rectangle. A card already owns a transform, an opacity, a rotation, a glow and
 a drop shadow in its own model, with its own keyframes and its own presets, so a second
 competing `transform` beside all of that would be a coin toss for the author every time;
 and `#textPanel` shares a scrolling column with `#inspector`, so a stack panel above it
@@ -2856,7 +2860,9 @@ Nineteen types ship, in four groups, and each one is **one function**:
 | Diagrams | `funnel` `flow` `nodemap` |
 
 Adding a type is one entry in `Graphics.DEFS` — its label, its group, its default
-parameters, its inspector schema, its `bounds()` and its `draw()`. The panel, the keyframe
+parameters, its inspector schema, its `bounds()` and its `draw()`. Every type outside
+`Primitives` also gets a `font` parameter (default `Segoe UI`), picked in the panel from the
+same installed-font list the text cards use (`graphicFontRow()`); `setFont()` reads it. The panel, the keyframe
 strips, the "+ Graphic" menu, the serialisation and the normalisation all build themselves
 from that entry, and `smoke-graphics.js` walks `DEFS` rather than a list, so a new type is
 tested the moment it exists.
@@ -3880,6 +3886,31 @@ picture and sound drift apart.
 `webSecurity` is disabled in `main.js` so `file:///` media loads in the renderer. That is
 acceptable for a local tool with no remote content; if you ever load remote pages, move
 media through a custom protocol handler instead.
+
+#### Playback waits for the decoders, and a jump cut keeps its decoder
+
+Four more rules, from a 40-cut talking-head project that froze for 2-4 s at the start of
+clips and made the whole interface crawl while stopped:
+
+1. **Jump cuts hand the element on.** `adoptRunningElement()` gives the arriving clip the
+   element of the clip that just ended when both play the same file on the same track and
+   that element is already within 0.35 s of where the new clip starts. No new decoder, no
+   cold resume of a suspended player - the element keeps playing under a new owner, and
+   its WebAudio gain node moves with it (`createMediaElementSource` is once per element).
+2. **The clock holds while a live element is seeking** (`playWaiting`, capped at
+   `PLAY_WAIT_MAX_MS`). A slow decode becomes slower playback with every frame and its
+   sound, instead of a frozen picture while the playhead runs away and a jump after.
+3. **Small drift is steered with `playbackRate`**, not corrected with a seek; an element
+   about to start is seeked exactly (0.15 s) first, which removed a ~0.25 s lag at every cut.
+4. **A paused viewer does not recomposite.** `stillFrameReusable()` compares a signature
+   (playhead, size, `editVersion`, decode state of the layers under the playhead) and
+   re-blits `frameCache` when nothing changed, with a 1.5 s refresh for async loads. A
+   master finish with a LUT is a full `getImageData` pass; redoing it 60 times a second
+   with nothing moving was the idle lag. `markDirty()` and `renderAll()` bump `editVersion`.
+
+`pause()` must survive an `<img>` in `mediaEls` - it has no `pause()`. It used to throw
+halfway through the loop, which left every later element playing after Stop and after the
+end of the timeline, and made `doPreviewRender()` (which pauses first) never start.
 
 ### Selecting
 

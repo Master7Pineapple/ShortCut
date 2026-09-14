@@ -1571,7 +1571,7 @@ ipcMain.handle('project:open', async (_e, filePath) => {
   }
   const missing = [];
   for (const t of data.tracks || []) {
-    for (const c of t.clips || []) if (!fs.existsSync(c.src)) missing.push(c.src);
+    for (const c of t.clips || []) if (c.src && !fs.existsSync(c.src)) missing.push(c.src);
   }
   return { canceled: false, filePath: target, data, missing };
 });

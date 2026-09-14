@@ -223,7 +223,10 @@ function refreshCacheBands(immediate) {
   if (immediate) run(); else cacheBandTimer = setTimeout(run, 250);
 }
 
+/** Bumped by every edit and every rebuild, so a paused viewer knows its frame went stale. */
+var editVersion = 0;
 function markDirty() {
+  editVersion++;
   state.dirty = true;
   const name = state.filePath ? state.filePath.split(/[\\/]/).pop() : 'Untitled';
   window.api.setTitle('ShortCut - ' + name + ' *');
@@ -1176,6 +1179,7 @@ function deleteTransition(id) {
 // ========================================== 4. timeline rendering
 
 function renderAll() {
+  editVersion++;
   pruneLayerSurfaces();
   renderHeads();
   renderLanes();
@@ -2384,6 +2388,45 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
  * themselves: a graphic is MOVED by a `transform` effect on the same clip, which is the
  * one thing in this codebase that knows how to follow a motion track. See `FX_KINDS`.
  */
+/** A font family picker with a filter box, writing `g.params.font`. */
+function graphicFontRow(g, hooks) {
+  const el = TextUI.el;
+  const wrap = el('div');
+  const row = el('div', 'tc-row');
+  row.appendChild(el('label', 'tc-label', 'Font'));
+  const sel = el('select');
+  const fill = (filter) => {
+    sel.innerHTML = '';
+    const cur = g.params.font || 'Segoe UI';
+    const list = (TextUI.fonts || []).filter((f) => !filter || f.toLowerCase().includes(filter.toLowerCase()));
+    if (!list.includes(cur)) list.unshift(cur);
+    for (const f of list.slice(0, 800)) {
+      const o = el('option'); o.value = f; o.textContent = f;
+      o.style.fontFamily = '"' + f + '"';
+      sel.appendChild(o);
+    }
+    sel.value = cur;
+  };
+  fill('');
+  sel.addEventListener('change', () => {
+    hooks.onEdit();
+    g.params.font = sel.value;
+    hooks.onEditEnd();
+    hooks.onChanged();
+  });
+  row.appendChild(sel);
+  wrap.appendChild(row);
+  const frow = el('div', 'tc-row');
+  frow.appendChild(el('label', 'tc-label', 'Filter'));
+  const filt = el('input');
+  filt.type = 'text';
+  filt.placeholder = 'type to filter fonts';
+  filt.addEventListener('input', () => fill(filt.value));
+  frow.appendChild(filt);
+  wrap.appendChild(frow);
+  return wrap;
+}
+
 function graphicPanel(clip) {
   if (!clip || clip.kind !== 'graphic' || !clip.graphic) return null;
   const el = TextUI.el;
@@ -2453,6 +2496,8 @@ function graphicPanel(clip) {
   box.appendChild(prow);
 
   const body = el('div', 'fx-fx-body');
+  // The font family, from the same installed-font list the text cards pick from.
+  if (typeof d.params.font === 'string') body.appendChild(graphicFontRow(g, rowHooks));
   for (const spec of d.schema) body.appendChild(TextUI.control(spec, g, { params: d.params }, rowHooks));
 
   // An imported icon is PATH DATA on the clip, not the bytes of a file - `clip.graphic`
@@ -4734,9 +4779,9 @@ function drawCanvasLayer(clips) {
 }
 
 /** How far ahead of the playhead to start decoding clips, in seconds. */
-const PRELOAD_AHEAD = 8;
+const PRELOAD_AHEAD = 3;
 /** Release a clip's decoder once the playhead is this far away (hysteresis vs. preload). */
-const EVICT_BEYOND = 60;
+const EVICT_BEYOND = 20;
 
 /**
  * The clips a transition needs decoded right now, with the source time each should be
@@ -4778,7 +4823,7 @@ function syncMedia() {
     // far less forgiving of a 300 ms hole than the eye is of one stale frame.
     for (const { clip } of allClips()) {
       const el = mediaEls.get(clip.id);
-      if (clip.kind !== 'audio') { if (el && !el.paused) el.pause(); continue; }
+      if (clip.kind !== 'audio') { if (el && el.pause && !el.paused) el.pause(); continue; }
       const live = state.playhead >= clip.start && state.playhead < clipEnd(clip);
       if (!live) { if (el && !el.paused) el.pause(); continue; }
       const m = mediaFor(clip);
@@ -4793,6 +4838,8 @@ function syncMedia() {
         if (!m.seeking && Math.abs(m.currentTime - target) > 0.06) m.currentTime = target;
       }
     }
+    playWaiting = false;
+    playWaitSince = 0;
     return;
   }
 
@@ -4819,6 +4866,7 @@ function syncMedia() {
     }
   }
 
+  const live = [];   // elements that should be playing right now
   for (const { clip, track } of allClips()) {
     if (isCanvasClip(clip)) continue; // drawn from canvas, nothing to decode
     if (clip.kind === 'image') {
@@ -4857,17 +4905,87 @@ function syncMedia() {
     }
 
     const target = srcAt(clip, state.playhead - clip.start);
+    if (state.playing) adoptRunningElement(clip, track, target, transIds);
     const m = mediaFor(clip);
     applyPlaybackRate(clip, m);
     if (clip.kind === 'audio') applyPreviewMix(clip, m, track.muted);
     // Never stack a seek on top of one still in flight - that kept readyState pinned low.
     if (state.playing) {
-      if (!m.seeking && Math.abs(m.currentTime - target) > 0.3) m.currentTime = target;
-      if (m.paused) m.play().catch(() => {});
+      // An element that is about to START playing gets put exactly where it belongs first.
+      // Starting it from wherever it was parked left every cut ~0.25 s behind - under the
+      // 0.3 s correction threshold, so it stayed out of sync for the whole clip.
+      const drift = m.currentTime - target;
+      const tol = m.paused ? 0.15 : 0.3;
+      if (!m.seeking && Math.abs(drift) > tol) m.currentTime = target;
+      else if (!m.paused && !m.seeking && !Speed.has(clip) && Math.abs(drift) > 0.03) {
+        // A small drift is steered out by running a touch fast or slow rather than by a
+        // seek, which would cost a decode hole every time.
+        m.playbackRate = 1 - clamp(drift * 0.6, -0.12, 0.12);
+      }
+      live.push(m);
     } else {
       if (!m.paused) m.pause();
       if (!m.seeking && Math.abs(m.currentTime - target) > 0.06) m.currentTime = target;
     }
+  }
+
+  // Playback waits for the decoders rather than running away from them. A clip whose
+  // element is still seeking has no picture and no sound, and letting the clock run on
+  // meant the viewer froze on the last frame for seconds and then jumped - with the audio
+  // out of step on the far side. Holding the playhead instead turns a slow decode into
+  // slower playback: every frame still shows, with its sound. Capped, so a file that never
+  // becomes ready cannot hang playback for good.
+  if (state.playing) {
+    const stalled = live.some((m) => m.seeking || m.readyState < 2);
+    const now = performance.now();
+    if (stalled && !playWaitSince) playWaitSince = now;
+    if (!stalled) playWaitSince = 0;
+    playWaiting = stalled && now - playWaitSince < PLAY_WAIT_MAX_MS;
+    for (const m of live) {
+      if (playWaiting) { if (!m.paused && !m.seeking && m.readyState >= 2) m.pause(); }
+      else if (m.paused) m.play().catch(() => {});
+    }
+  } else {
+    playWaiting = false;
+    playWaitSince = 0;
+  }
+}
+
+/** Longest the playhead will wait for a decoder before running on regardless. */
+const PLAY_WAIT_MAX_MS = 4000;
+var playWaiting = false, playWaitSince = 0;
+
+/**
+ * Jump cuts from one long recording: hand the running element to the next clip.
+ *
+ * Every clip owns its element, so a talking-head edit of forty cuts from one file used to
+ * start forty decoders, and each arrival was a cold, paused element resuming - Chromium
+ * suspends idle players, and waking one means re-initialising the decoder and seeking to
+ * a keyframe, which on long-GOP footage is the 2-4 s freeze at the start of a clip. When
+ * the clip that just ended plays the same file on the same track and its element is
+ * already sitting at (or near) where this clip starts, there is nothing to decode at all:
+ * the element simply keeps playing under a new owner. Its WebAudio node moves with it,
+ * because `createMediaElementSource` can only ever be called once per element.
+ */
+function adoptRunningElement(clip, track, target, transIds) {
+  if (clip.kind !== 'video' && clip.kind !== 'audio') return;
+  if (Speed.has(clip)) return;
+  const mine = mediaEls.get(clip.id);
+  if (mine && !mine.paused && !mine.seeking) return;          // already running itself
+  for (const o of track.clips) {
+    if (o === clip || o.kind !== clip.kind || o.src !== clip.src) continue;
+    if (transIds.has(o.id) || Speed.has(o)) continue;
+    if (state.playhead >= o.start && state.playhead < clipEnd(o)) continue;   // still in use
+    const el = mediaEls.get(o.id);
+    if (!el || el === mine || el.seeking || el.readyState < 2) continue;
+    if (Math.abs(el.currentTime - target) > 0.35) continue;
+    if (mine) dropMedia(clip.id);
+    mediaEls.delete(o.id);
+    dropLayerSurface(o.id);
+    mediaEls.set(clip.id, el);
+    const node = previewMix.nodes.get(o.id);
+    if (node) { previewMix.nodes.delete(o.id); previewMix.nodes.set(clip.id, node); }
+    return;
   }
 }
 
@@ -4886,7 +5004,7 @@ function play() {
 function pause() {
   state.playing = false;
   $('#btnPlay').textContent = '▶';
-  for (const el of mediaEls.values()) { if (!el.paused) el.pause(); }
+  for (const el of mediaEls.values()) { if (el.pause && !el.paused) el.pause(); }
   // A rendered span plays from its own element, and syncMedia() - which would stop it -
   // only runs while playing. Without this, stop left the render running with no way to
   // halt it.
@@ -4913,6 +5031,42 @@ function scrollPlayheadIntoView() {
 
 let lastLoopError = null;
 
+let stillSig = '', stillAt = 0;
+
+/**
+ * Everything a paused frame depends on, as one cheap string: the playhead, the size, the
+ * edit counter and the decode state of every element under the playhead.
+ *
+ * Compositing a frame is not cheap - a project master finish with a LUT is a full
+ * getImageData pass - and the loop used to redo it sixty times a second with nothing
+ * moving, which is what made the whole interface crawl while the view was stopped.
+ */
+function stillSignature() {
+  const P = previewSize();
+  let s = state.playhead + '|' + P.w + 'x' + P.h + '|' + editVersion + '|' +
+    state.usePreviewRender + '|' + (state.cacheBands || []).length;
+  for (const c of activeLayers()) {
+    const el = mediaEls.get(c.id);
+    s += '|' + c.id + ':' + (el ? (el.currentTime || 0) + ':' + (el.readyState || 0) + ':' +
+      (el.complete ? 1 : 0) + ':' + elW(el) : '-');
+  }
+  return s;
+}
+
+/** True when the paused viewer can reuse the frame it already composited. */
+function stillFrameReusable() {
+  if (state.playing || !frameCacheValid || !frameCache) return false;
+  if (activePreviewBand() || transitionAt()) return false;
+  const now = performance.now();
+  const sig = stillSignature();
+  // A slow refresh anyway, for anything that lands asynchronously without an edit - a LUT
+  // file finishing its read, a matte decoding, a pointer image loading.
+  if (sig === stillSig && now - stillAt < 1500) return true;
+  stillSig = sig;
+  stillAt = now;
+  return false;
+}
+
 /**
  * The frame loop.
  *
@@ -4924,6 +5078,9 @@ let lastLoopError = null;
 function loop() {
   try {
     if (state.playing) {
+      // While a decoder is catching up (see the end of syncMedia) the clock is held, so
+      // the picture and the sound resume together from where they stopped.
+      if (playWaiting) { playT0 = performance.now(); playHead0 = state.playhead; }
       const t = playHead0 + (performance.now() - playT0) / 1000;
       if (t >= projectDuration()) { state.playhead = projectDuration(); pause(); }
       else state.playhead = t;
@@ -4933,7 +5090,15 @@ function loop() {
       // A take ends when its range does, rather than running on over whatever follows.
       if (Mouse.recording && state.playhead >= Mouse.range.to - 1e-3) stopMouseTake();
     }
-    drawPreview();
+    if (stillFrameReusable()) {
+      // The overlays below draw straight onto the canvas, so the held frame is put back
+      // underneath them first rather than letting them pile up on the last one.
+      const P = previewSize();
+      ctx.clearRect(0, 0, P.w, P.h);
+      ctx.drawImage(frameCache, 0, 0);
+    } else {
+      drawPreview();
+    }
     // AFTER the picture, and outside it: the selection rubber-band is an affordance for
     // the person performing, not a layer. It is never composited and never baked - what
     // gets baked is the `select` effect the drag turns into when the take is committed.

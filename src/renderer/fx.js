@@ -237,6 +237,34 @@
     };
   }
 
+  /** A copy of `src` whose every pixel is `colour`, keeping only its alpha. */
+  function silhouette(L, src, colour, name) {
+    const s = clean(L.surface, name, L.W, L.H);
+    s.c.drawImage(src, 0, 0);
+    s.c.globalCompositeOperation = 'source-in';
+    s.c.fillStyle = /^#[0-9a-f]{3,8}$/i.test(String(colour)) ? colour : '#000000';
+    s.c.fillRect(0, 0, L.W, L.H);
+    s.c.globalCompositeOperation = 'source-over';
+    return s.cv;
+  }
+
+  /** How long a clip is on the timeline, speed included when app.js can say so. */
+  function clipDuration(clip) {
+    try { if (typeof clipLen === 'function') return Math.max(0.001, clipLen(clip)); } catch (e) { /* fall through */ }
+    return Math.max(0.001, (Number(clip && clip.out) || 0) - (Number(clip && clip.in) || 0));
+  }
+
+  const ANIM_KIND_OPTIONS = [
+    { value: 'none', label: 'None' }, { value: 'fade', label: 'Fade' },
+    { value: 'slide', label: 'Slide' }, { value: 'zoom', label: 'Zoom' },
+    { value: 'pop', label: 'Pop' }, { value: 'flicker', label: 'Flicker' },
+  ];
+  const SLIDE_FROM_OPTIONS = [
+    { value: 'bottom', label: 'Bottom' }, { value: 'top', label: 'Top' },
+    { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' },
+  ];
+  const EASE_OPTIONS = Object.keys(Anim.EASING_PRESETS).map((k) => ({ value: k, label: k }));
+
   // ----------------------------------------------------------------- effect types
 
   /**
@@ -540,6 +568,178 @@
         // which is what it would have been if the frame continued.
         const b = padBlur(src, r, W, H, L.surface, 'fxPad', true);
         L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+      },
+    },
+
+    // ------------------------------------------------------------ the text card's looks
+    //
+    // A text card has in/out animation layers, a glow, a drop shadow and an outline in its
+    // own model. A still (a PNG logo, a screenshot, a photo) wants exactly the same looks,
+    // so they are here as ordinary effects: every one follows the picture's ALPHA, which
+    // is what makes a glow or an outline hug a transparent PNG rather than its rectangle.
+
+    animate: {
+      label: 'Animate in / out',
+      // It changes with time without a single keyframe, so the shutter has something to
+      // average - motion blur on a slide-in works the way it does on a card.
+      timeVarying: true,
+      params: {
+        inType: 'fade', inDur: 0.5, inEase: 'easeOut', inFrom: 'bottom', inDistance: 0.2, inZoom: 0.3,
+        outType: 'none', outDur: 0.4, outEase: 'easeIn', outFrom: 'bottom', outDistance: 0.2, outZoom: 0.3,
+        flickerHz: 9,
+      },
+      schema: [
+        { path: 'params.inType', label: 'In', type: 'select', options: ANIM_KIND_OPTIONS },
+        { path: 'params.inDur', label: 'In length', type: 'range', min: 0, max: 5, step: 0.02, unit: 's', digits: 2 },
+        { path: 'params.inEase', label: 'In easing', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.inFrom', label: 'In slides from', type: 'select', options: SLIDE_FROM_OPTIONS },
+        { path: 'params.inDistance', label: 'In slide distance', type: 'range', min: 0, max: 1.5, step: 0.01, digits: 2 },
+        { path: 'params.inZoom', label: 'In zoom amount', type: 'range', min: -2, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.outType', label: 'Out', type: 'select', options: ANIM_KIND_OPTIONS },
+        { path: 'params.outDur', label: 'Out length', type: 'range', min: 0, max: 5, step: 0.02, unit: 's', digits: 2 },
+        { path: 'params.outEase', label: 'Out easing', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.outFrom', label: 'Out slides to', type: 'select', options: SLIDE_FROM_OPTIONS },
+        { path: 'params.outDistance', label: 'Out slide distance', type: 'range', min: 0, max: 1.5, step: 0.01, digits: 2 },
+        { path: 'params.outZoom', label: 'Out zoom amount', type: 'range', min: -2, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.flickerHz', label: 'Flicker rate', type: 'range', min: 1, max: 30, step: 0.5, unit: 'Hz', digits: 1 },
+      ],
+      draw(L, p, t, e, clip) {
+        const dur = clipDuration(clip);
+        const st = { a: 1, dx: 0, dy: 0, s: 1 };
+        const phase = (type, len, ease, from, dist, zoom, isIn) => {
+          type = String(type || 'none');
+          len = Number(len) || 0;
+          if (type === 'none' || !(len > 0)) return;
+          const start = isIn ? 0 : dur - len;
+          const raw = clamp((t - start) / len, 0, 1);
+          const k = Anim.ease(Anim.EASING_PRESETS[ease] || Anim.EASING_PRESETS.easeOut, raw);
+          const on = isIn ? k : 1 - k;
+          if (type === 'fade') st.a *= clamp(on, 0, 1);
+          else if (type === 'slide') {
+            const off = (1 - on) * (Number(dist) || 0);
+            if (from === 'left') st.dx -= off;
+            else if (from === 'right') st.dx += off;
+            else if (from === 'top') st.dy -= off;
+            else st.dy += off;
+          } else if (type === 'zoom') {
+            st.s *= Math.max(0.001, 1 - (1 - on) * (Number(zoom) || 0));
+          } else if (type === 'pop') {
+            st.s *= Math.max(0.001, 0.3 + 0.7 * on);
+            st.a *= clamp(on * 3, 0, 1);
+          } else if (type === 'flicker') {
+            if (raw > 0 && raw < 1) st.a *= ((t * clamp(p.flickerHz, 0.1, 60)) % 1) < 0.55 ? 1 : 0;
+            else if (isIn ? raw <= 0 : raw >= 1) st.a = 0;
+          }
+        };
+        phase(p.inType, p.inDur, p.inEase, p.inFrom, p.inDistance, p.inZoom, true);
+        phase(p.outType, p.outDur, p.outEase, p.outFrom, p.outDistance, p.outZoom, false);
+        if (st.a >= 0.9999 && !st.dx && !st.dy && Math.abs(st.s - 1) < 1e-6) return;
+        const src = take(L, 'fxA');
+        if (!(st.a > 0)) return;
+        const W = L.W, H = L.H;
+        L.c.save();
+        L.c.globalAlpha = clamp(st.a, 0, 1);
+        L.c.translate(W / 2 + st.dx * W, H / 2 + st.dy * H);
+        L.c.scale(st.s, st.s);
+        L.c.translate(-W / 2, -H / 2);
+        L.c.drawImage(src, 0, 0);
+        L.c.restore();
+      },
+    },
+
+    glow: {
+      label: 'Glow',
+      params: { colour: '#4f8cff', size: 0.03, intensity: 1.5, over: 0.3 },
+      schema: [
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.size', label: 'Size', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
+        { path: 'params.intensity', label: 'Intensity', type: 'range', min: 0, max: 5, step: 0.05, digits: 2 },
+        { path: 'params.over', label: 'Glow over picture', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const r = pxMin(p.size, W, H);
+        const amt = clamp(p.intensity, 0, 5);
+        if (!(r > 0.05) || !(amt > 0)) return;
+        const src = take(L, 'fxA');
+        const b = padBlur(silhouette(L, src, p.colour, 'fxGlS'), r, W, H, L.surface, 'fxGl', false);
+        const passes = Math.ceil(amt);
+        for (let i = 0; i < passes; i++) {
+          L.c.globalAlpha = Math.min(1, amt - i);
+          L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+        }
+        L.c.globalAlpha = 1;
+        L.c.drawImage(src, 0, 0);
+        const over = clamp(p.over, 0, 1);
+        if (over > 0) {
+          L.c.globalCompositeOperation = 'lighter';
+          L.c.globalAlpha = over;
+          L.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+        }
+      },
+    },
+
+    shadow: {
+      label: 'Drop shadow',
+      params: { colour: '#000000', opacity: 0.65, distance: 0.012, angle: 135, blur: 0.015 },
+      schema: [
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.distance', label: 'Distance', type: 'range', min: 0, max: 0.15, step: 0.001, digits: 3 },
+        { path: 'params.angle', label: 'Angle', type: 'range', min: -180, max: 180, step: 1, digits: 0 },
+        { path: 'params.blur', label: 'Softness', type: 'range', min: 0, max: 0.15, step: 0.001, digits: 3 },
+      ],
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const op = clamp(p.opacity, 0, 1);
+        if (!(op > 0)) return;
+        const src = take(L, 'fxA');
+        const sil = silhouette(L, src, p.colour, 'fxShS');
+        const rad = (Number(p.angle) || 0) * Math.PI / 180;
+        const d = pxMin(p.distance, W, H);
+        const ox = Math.cos(rad) * d, oy = Math.sin(rad) * d;
+        const r = pxMin(p.blur, W, H);
+        L.c.globalAlpha = op;
+        if (r > 0.05) {
+          const b = padBlur(sil, r, W, H, L.surface, 'fxSh', false);
+          L.c.drawImage(b.cv, b.pad, b.pad, W, H, ox, oy, W, H);
+        } else {
+          L.c.drawImage(sil, ox, oy);
+        }
+        L.c.globalAlpha = 1;
+        L.c.drawImage(src, 0, 0);
+      },
+    },
+
+    stroke: {
+      label: 'Outline',
+      params: { colour: '#ffffff', width: 0.006, opacity: 1 },
+      schema: [
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.width', label: 'Width', type: 'range', min: 0, max: 0.05, step: 0.0005, digits: 4 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const w = pxMin(p.width, W, H);
+        const op = clamp(p.opacity, 0, 1);
+        if (!(w > 0.2) || !(op > 0)) return;
+        const src = take(L, 'fxA');
+        const sil = silhouette(L, src, p.colour, 'fxStS');
+        // The silhouette stamped round a circle is a dilation of the alpha: an outline
+        // that follows a transparent PNG's own shape.
+        const ring = clean(L.surface, 'fxStR', W, H);
+        const n = Math.max(12, Math.min(48, Math.round(w * 3)));
+        for (const rr of w > 3 ? [w, w * 0.5] : [w]) {
+          for (let i = 0; i < n; i++) {
+            const a = (i / n) * Math.PI * 2;
+            ring.c.drawImage(sil, Math.cos(a) * rr, Math.sin(a) * rr);
+          }
+        }
+        L.c.globalAlpha = op;
+        L.c.drawImage(ring.cv, 0, 0);
+        L.c.globalAlpha = 1;
+        L.c.drawImage(src, 0, 0);
       },
     },
 
@@ -1911,6 +2111,7 @@
   }
 
   const lutC0 = new Float32Array(3), lutC1 = new Float32Array(3);
+  const lutPix = new Float64Array(3);
 
   /**
    * Trilinear sample. `r`,`g`,`b` are 0..1 in the LUT's own domain; the answer is 0..1.
@@ -1954,11 +2155,62 @@
    * `grade` pass keeps. `ImageData` is unpremultiplied, so the colour of a half-
    * transparent pixel is meaningful and needs no undoing of a premultiply.
    */
+  /**
+   * Per-channel lattice positions for all 256 byte values, computed with exactly the
+   * arithmetic `sampleLUT()` uses, so the inlined loop below lands on the same numbers.
+   * Cached on the table: it depends only on the cube's size and domain.
+   */
+  function lutAxes(lut) {
+    if (lut._axes) return lut._axes;
+    const m = lut.n - 1;
+    const ax = [];
+    for (let ch = 0; ch < 3; ch++) {
+      const lo = lut.min[ch], hi = lut.max[ch], span = hi - lo;
+      const i0 = new Int32Array(256), i1 = new Int32Array(256), f = new Float64Array(256);
+      for (let v = 0; v < 256; v++) {
+        const u0 = span > 1e-9 ? (v / 255 - lo) / span : 0;
+        const x = (u0 < 0 ? 0 : u0 > 1 ? 1 : u0) * m;
+        i0[v] = Math.min(m, Math.floor(x));
+        i1[v] = Math.min(m, i0[v] + 1);
+        f[v] = x - i0[v];
+      }
+      ax.push({ i0, i1, f });
+    }
+    Object.defineProperty(lut, '_axes', { value: ax, enumerable: false });
+    return ax;
+  }
+
   function applyLUT(d, lut, amount) {
     const a = amount == null ? 1 : clamp(amount, 0, 1);
+    // The same trilinear sample as `sampleLUT()`, inlined: no array per pixel and no
+    // division, which took the master finish from ~110 ms a preview frame to a fraction.
+    const n = lut.n, nn = n * n, D = lut.data;
+    const [AX, AY, AZ] = lutAxes(lut);
     for (let i = 0; i < d.length; i += 4) {
       if (!d[i + 3]) continue;
-      const o = sampleLUT(lut, d[i] / 255, d[i + 1] / 255, d[i + 2] / 255);
+      const R = d[i], G = d[i + 1], B = d[i + 2];
+      const i0 = AX.i0[R], i1 = AX.i1[R], fx = AX.f[R];
+      const j0 = AY.i0[G], j1 = AY.i1[G], fy = AY.f[G];
+      const k0 = AZ.i0[B], k1 = AZ.i1[B], fz = AZ.f[B];
+      const o000 = (k0 * nn + j0 * n + i0) * 3, o100 = (k0 * nn + j0 * n + i1) * 3;
+      const o010 = (k0 * nn + j1 * n + i0) * 3, o110 = (k0 * nn + j1 * n + i1) * 3;
+      const o001 = (k1 * nn + j0 * n + i0) * 3, o101 = (k1 * nn + j0 * n + i1) * 3;
+      const o011 = (k1 * nn + j1 * n + i0) * 3, o111 = (k1 * nn + j1 * n + i1) * 3;
+      const out = lutPix;
+      for (let ch = 0; ch < 3; ch++) {
+        const c000 = D[o000 + ch], c100 = D[o100 + ch];
+        const c00 = c000 + (c100 - c000) * fx;
+        const c010 = D[o010 + ch], c110 = D[o110 + ch];
+        const c01 = c010 + (c110 - c010) * fx;
+        const c001 = D[o001 + ch], c101 = D[o101 + ch];
+        const c10 = c001 + (c101 - c001) * fx;
+        const c011 = D[o011 + ch], c111 = D[o111 + ch];
+        const c11 = c011 + (c111 - c011) * fx;
+        const c0 = c00 + (c01 - c00) * fy;
+        const c1 = c10 + (c11 - c10) * fy;
+        out[ch] = c0 + (c1 - c0) * fz;
+      }
+      const o = out;
       let r = o[0] * 255, g = o[1] * 255, b = o[2] * 255;
       if (a !== 1) {
         r = d[i] + (r - d[i]) * a;
