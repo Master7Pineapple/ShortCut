@@ -1938,6 +1938,27 @@ function buildArgs(job, opts) {
    */
   const lenOf = (c) => (c && c.len != null ? c.len : c.out - c.in);
 
+  /**
+   * Where an input is opened with `-ss`, in SOURCE seconds; 0 means "from the start".
+   *
+   * `trim=start=N` on its own DECODES the file from zero up to N and throws it away. On a
+   * clip cut from twelve minutes into a long recording that is minutes of silent decoding
+   * per input before ffmpeg emits a single frame - and since it prints no `time=` until it
+   * does, the render bar sat at 0% the whole while, looking broken. An input seek jumps to
+   * a keyframe instead (accurate seek discards the frames before the point, and the
+   * timestamps restart there), so the trim only has `in - ss` left to cut.
+   *
+   * Only past SEEK_MIN, and with a margin: a clip that starts near its head costs nothing
+   * to decode up to, and leaving those inputs alone keeps their argument lists
+   * byte-identical to what the suites assert.
+   */
+  const SEEK_MIN = 10, SEEK_MARGIN = 2;
+  const seekOf = (c) => {
+    if (!c || c.kind === 'image' || c.kind === 'text' || c.kind === 'graphic' ||
+        c.kind === 'trans' || c.kind === 'baked' || !(c.in > SEEK_MIN)) return 0;
+    return Math.floor((c.in - SEEK_MARGIN) * 1000) / 1000;
+  };
+
   // One ffmpeg input per clip occurrence - simple, and lets one file appear many times.
   const inputs = [];
   for (const c of clips) {
@@ -1960,6 +1981,8 @@ function buildArgs(job, opts) {
       // demuxer has been asked for frames that will never stop coming.
       args.push('-loop', '1', '-t', r3(Math.max(0.001, lenOf(c))), '-i', c.src);
     } else {
+      const ss = seekOf(c);
+      if (ss > 0) args.push('-ss', String(ss));
       args.push('-i', c.src);
     }
   }
@@ -2016,7 +2039,7 @@ function buildArgs(job, opts) {
       const dur = c.out - c.in;
       const delay = Math.max(0, Math.round(c.start * 1000));
       const parts = [
-        'atrim=start=' + r3(c.in) + ':duration=' + r3(dur),
+        'atrim=start=' + r3(c.in - seekOf(c)) + ':duration=' + r3(dur),
         'asetpts=PTS-STARTPTS',
         'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo',
       ]
@@ -2168,7 +2191,7 @@ function buildArgs(job, opts) {
     // A still's input was already cut to length by its own -t, and it has no source
     // timeline to seek into: its trim always starts at 0, whatever the range lopped off
     // the head. Using c.in there would cut the same head off twice.
-    const tin = c.kind === 'image' ? 0 : c.in;
+    const tin = c.kind === 'image' ? 0 : c.in - seekOf(c);
     // `trim` cuts the SOURCE, so it takes the source duration - the same number as `dur`
     // for everything that reaches this branch today, since a sped clip is composited by
     // the baker and never handed to this chain. Stated separately rather than shared,

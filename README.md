@@ -3602,6 +3602,14 @@ Two things to keep right when touching this:
 
 ### Preview renders - what the viewer plays
 
+**Long sources are opened with an input seek.** `trim=start=N` alone decodes the file from
+zero to N and throws it away, and ffmpeg prints no `time=` until its first output frame -
+so a clip cut from twelve minutes into a recording sat the render bar at 0% for over a
+minute and a half. `buildArgs()` puts `-ss (in - 2)` in front of any file input whose
+in-point is past 10 s and trims only what is left (`seekOf()`); accurate seek makes the
+frames byte-identical to the old path, and inputs near their head keep the argument list
+the suites assert. The bar pulses (`#renderBarWrap.busy`) until the first progress line.
+
 There are two different render actions and confusing them is the easiest mistake to make
 in this codebase:
 
@@ -3912,6 +3920,14 @@ clips and made the whole interface crawl while stopped:
 halfway through the loop, which left every later element playing after Stop and after the
 end of the timeline, and made `doPreviewRender()` (which pauses first) never start.
 
+### Frame-step audio
+
+A stopped `←` / `→` step calls `scrubAudio()`: every audible audio clip under the playhead
+(or the rendered span's player, inside a band) plays for one frame - never under 70 ms,
+which is a click rather than a sound - and pauses again. A held key restarts the window on
+each repeat, and skips the seek when the element is already within 50 ms of the target, so
+it reads as a continuous slow scrub instead of a string of decode holes.
+
 ### Selecting
 
 Clicking a clip selects its whole **link group**, so an imported A/V pair is one thing to
@@ -3923,7 +3939,11 @@ tracks are skipped, shift adds to the selection, and a press that never moves mo
 3px is still a plain click, which on empty timeline clears the selection. Ctrl+drag stays
 the playhead scrub.
 
-`Ctrl+A` selects everything. A selection of several clips that all share one `linkId` is
+`Ctrl+A` selects everything. `Y` adds every clip that starts at or after the clip last
+clicked (`state.selAnchor`) to the selection, on every unlocked track and extended to link
+groups; `Shift+Y` does the same backwards, for clips starting at or before it. The anchor
+is included both ways, so pressing either key twice changes nothing. With no anchor it
+falls back to the selection's edge, then the playhead (`selectFromAnchor()`). A selection of several clips that all share one `linkId` is
 **not** a multi-selection — `singleUnit()` treats it as the one pair it is, which is why
 the inspector shows framing and audio for a clicked A/V pair rather than "2 clips
 selected". A real multi-selection shows the count, and still offers Tighten, because
@@ -4552,7 +4572,8 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | --- | --- |
 | `Space` / `K` | Play / pause |
 | `J` / `L` | Back / forward 1 s |
-| `←` / `→` | Step one frame (`Shift` = one second) |
+| `←` / `→` | Step one frame, playing that frame's audio (`Shift` = one second) |
+| `Y` / `Shift+Y` | Add every clip after / before the clicked clip to the selection |
 | `S` | Split at playhead |
 | `Del` / `Shift+Del` | Delete / ripple delete |
 | `I` / `O` | Set the in / out mark for a ranged render |

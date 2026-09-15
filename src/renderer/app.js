@@ -3841,6 +3841,8 @@ $('#tracks').addEventListener('mousedown', (e) => {
   if (!found || found.track.locked) return;
   const c = found.clip;
 
+  // The clip last pressed is where Y / Shift+Y select forward and backward from.
+  state.selAnchor = c.id;
   if (!state.selection.has(c.id)) {
     const group = linkGroup(c).map((x) => x.id);
     setSelection(group, e.shiftKey);
@@ -5019,6 +5021,73 @@ function seek(t) {
   syncMedia();
   drawPreview();
   scrollPlayheadIntoView();
+}
+
+/**
+ * Frame-step audio: a stopped step with Left / Right plays a frame's worth of sound.
+ *
+ * Every element under the playhead - each audible audio clip, or a rendered span's player
+ * when one is on screen - plays from the new position for one frame (never shorter than
+ * SCRUB_MIN_MS, below which a blip is a click rather than a sound) and is paused again.
+ * A held key restarts the window on every repeat, so it reads as a slow, continuous scrub.
+ *
+ * The seek before it is skipped when the element is already within SCRUB_SEEK_TOL of the
+ * target, which is where the last scrub left it on a forward repeat; seeking anyway would
+ * cost a decode hole per frame and the scrub would be mostly silence.
+ */
+const SCRUB_MIN_MS = 70, SCRUB_SEEK_TOL = 0.05;
+let scrubToken = 0;
+const scrubEls = new Set();
+
+function scrubAudio() {
+  if (state.playing) return;
+  ensureAudioCtx();   // a key press is the user gesture the context waits for
+  const token = ++scrubToken;
+  const ms = Math.max(1000 / (state.out.fps || 30), SCRUB_MIN_MS);
+
+  const targets = [];
+  const band = activePreviewBand();
+  if (band) {
+    const el = syncPreviewBand(band);
+    if (el) targets.push({ el, t: state.playhead - band.from });
+  } else {
+    for (const { clip, track } of allClips()) {
+      if (clip.kind !== 'audio' || track.muted) continue;
+      if (!(state.playhead >= clip.start && state.playhead < clipEnd(clip))) continue;
+      const m = mediaFor(clip);
+      applyPlaybackRate(clip, m);
+      applyPreviewMix(clip, m, track.muted);
+      if (m.muted) continue;
+      targets.push({ el: m, t: srcAt(clip, state.playhead - clip.start) });
+    }
+  }
+
+  for (const el of scrubEls) {
+    if (!targets.some((x) => x.el === el) && !el.paused) el.pause();
+  }
+  scrubEls.clear();
+  for (const { el, t } of targets) {
+    scrubEls.add(el);
+    if (Math.abs(el.currentTime - t) > SCRUB_SEEK_TOL) el.currentTime = t;
+  }
+  if (!targets.length) return;
+
+  // Start the window once the seeks have landed, or a cold seek would eat the whole frame.
+  const t0 = performance.now();
+  const start = () => {
+    if (token !== scrubToken || state.playing) return;
+    if (targets.some((x) => x.el.seeking) && performance.now() - t0 < 300) {
+      requestAnimationFrame(start);
+      return;
+    }
+    for (const { el } of targets) el.play().catch(() => {});
+    setTimeout(() => {
+      if (token !== scrubToken || state.playing) return;
+      for (const { el } of targets) if (!el.paused) el.pause();
+      scrubEls.clear();
+    }, ms);
+  };
+  start();
 }
 
 function scrollPlayheadIntoView() {
@@ -6338,6 +6407,40 @@ function trimToPlayhead(edge) {
 
 function selectAll() {
   state.selection = new Set(allClips().map((x) => x.clip.id));
+  renderLanes(); renderInspector();
+}
+
+/**
+ * Add every clip from the anchor onwards (`dir` 1) or up to it (`dir` -1) to the
+ * selection, on every unlocked track, extended to link groups like any other selection.
+ *
+ * The anchor is the clip last clicked (`state.selAnchor`) while it is still selected, so
+ * pressing the key twice changes nothing and forward-then-backward selects both sides of
+ * the SAME clip. Without one it falls back to the selection's own edge, then the playhead.
+ * A clip is "after" when it starts at or after the anchor's start, "before" when it starts
+ * at or before it - so the anchor is always included and overlaps go by their start.
+ */
+function selectFromAnchor(dir) {
+  const eps = 1e-6;
+  const anchorHit = state.selAnchor && state.selection.has(state.selAnchor) && findClip(state.selAnchor);
+  let t;
+  if (anchorHit) t = anchorHit.clip.start;
+  else if (state.selection.size) {
+    const starts = selectedClips().map((x) => x.clip.start);
+    t = dir > 0 ? Math.min(...starts) : Math.max(...starts);
+  } else t = state.playhead;
+
+  const ids = new Set(state.selection);
+  for (const track of state.tracks) {
+    if (track.locked) continue;
+    for (const c of track.clips) {
+      if (dir > 0 ? c.start >= t - eps : c.start <= t + eps) {
+        for (const m of linkGroup(c)) ids.add(m.id);
+      }
+    }
+  }
+  if (ids.size) state.selTransition = null;
+  state.selection = ids;
   renderLanes(); renderInspector();
 }
 
@@ -8284,12 +8387,18 @@ async function doPreviewRender(opts) {
     const tb = Date.now();
     dirs = await bakeOverlays(job);
     bakeMs = Date.now() - tb;
+    // The bake may have left its own percentage on the bar; the encode starts from zero
+    // and reports through onRenderProgress once ffmpeg writes its first frame.
+    $('#renderBar').style.width = '0%';
+    setStatus('Encoding preview ' + fmtTc(range.from) + ' - ' + fmtTc(range.to) + '...');
     const te = Date.now();
+    $('#renderBarWrap').classList.add('busy');
     res = await window.api.startRender(job);
     encodeMs = Date.now() - te;
   } catch (err) {
     res = { ok: false, error: 'Preview render failed: ' + (err && err.message ? err.message : err) };
   } finally {
+    $('#renderBarWrap').classList.remove('busy');
     for (const d of dirs) window.api.endTextSeq(d);   // raw frames are scratch
   }
 
@@ -8371,10 +8480,13 @@ async function doRender(opts) {
     dirs = await bakeOverlays(job);
     setStatus('Rendering ' + (range.to - range.from).toFixed(2) + 's at ' +
       state.out.w + 'x' + state.out.h + ' (' + state.out.quality + ')...');
+    $('#renderBar').style.width = '0%';
+    $('#renderBarWrap').classList.add('busy');
     res = await window.api.startRender(job);
   } catch (err) {
     res = { ok: false, error: 'Text baking failed: ' + (err && err.message ? err.message : err) };
   } finally {
+    $('#renderBarWrap').classList.remove('busy');
     // Raw frames are bulky and now cheap to regenerate, so they are scratch rather than
     // cache. What gets cached is the finished MP4.
     for (const d of dirs) window.api.endTextSeq(d);
@@ -8415,6 +8527,7 @@ window.api.onRenderProgress((d) => {
   // The loudness measurement pass reports a stage rather than a time: it is a whole
   // decode of its own, and saying "0:00 / 0:30" through it looks like a stall.
   if (d.stage) { $('#renderBar').style.width = '0%'; setStatus(d.stage + '...'); return; }
+  $('#renderBarWrap').classList.remove('busy');
   $('#renderBar').style.width = clamp(d.time / d.total * 100, 0, 100) + '%';
   setStatus('Rendering... ' + fmtTc(d.time) + ' / ' + fmtTc(d.total));
 });
@@ -11104,7 +11217,7 @@ window.addEventListener('drop', async (e) => {
 const SHORTCUTS = [
   ['Space / K', 'Play / pause'],
   ['J / L', 'Step back / forward 1 second'],
-  ['Left / Right', 'Step one frame'],
+  ['Left / Right', 'Step one frame, playing a frame of audio'],
   ['Shift+Left / Right', 'Step one second'],
   ['Home / End', 'Go to start / end'],
   ['S or Ctrl+K', 'Split at playhead'],
@@ -11118,6 +11231,7 @@ const SHORTCUTS = [
   ['Alt+I / Alt+O', 'Trim the selected clip in / out to the playhead'],
   ['Ctrl+L / Ctrl+Shift+L', 'Link / unlink selected clips'],
   ['Ctrl+A', 'Select all clips'],
+  ['Y / Shift+Y', 'Add every clip after / before the clicked clip to the selection'],
   ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
   ['Ctrl+I / Ctrl+Shift+I', 'Import media / import folder'],
   ['Ctrl+N / Ctrl+O', 'New / open project'],
@@ -11173,8 +11287,8 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === ' ' || e.key.toLowerCase() === 'k') { togglePlay(); }
   else if (e.key.toLowerCase() === 'j') { seek(state.playhead - 1); }
   else if (e.key.toLowerCase() === 'l') { seek(state.playhead + 1); }
-  else if (e.key === 'ArrowLeft') { seek(state.playhead - (e.shiftKey ? 1 : frame)); }
-  else if (e.key === 'ArrowRight') { seek(state.playhead + (e.shiftKey ? 1 : frame)); }
+  else if (e.key === 'ArrowLeft') { seek(state.playhead - (e.shiftKey ? 1 : frame)); scrubAudio(); }
+  else if (e.key === 'ArrowRight') { seek(state.playhead + (e.shiftKey ? 1 : frame)); scrubAudio(); }
   else if (e.key === 'Home') { seek(0); }
   else if (e.key === 'End') { seek(projectDuration()); }
   else if (e.key.toLowerCase() === 's') { splitAtPlayhead(); }
@@ -11186,6 +11300,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'o') { e.altKey ? trimToPlayhead('out') : setOutPoint(); }
   else if (e.key.toLowerCase() === 'x') { clearRange(); }
   else if (e.key.toLowerCase() === 'g' && !ctrl) { closeGaps(); }
+  else if (e.key.toLowerCase() === 'y' && !ctrl) { selectFromAnchor(e.shiftKey ? -1 : 1); }
   else if (e.key.toLowerCase() === 'p') {
     const cb = $('#usePreviewRender');
     cb.checked = !cb.checked;

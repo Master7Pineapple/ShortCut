@@ -284,6 +284,9 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
 .status.ok { color: var(--ok); }
 #renderBarWrap { margin: 4px 12px 10px; height: 4px; background: var(--field); border-radius: 3px; overflow: hidden; flex: none; }
 #renderBar { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), #9b6bff); transition: width .15s linear; }
+/* Waiting on ffmpeg's first frame: it prints no time= until then, so show motion, not 0%. */
+#renderBarWrap.busy #renderBar { width: 30% !important; transition: none; animation: renderBusy 1.1s ease-in-out infinite alternate; }
+@keyframes renderBusy { from { transform: translateX(-100%); } to { transform: translateX(333%); } }
 
 #log {
   flex: 0 1 170px; min-width: 110px; border-left: 1px solid var(--line); overflow: auto; padding: 8px 12px;
