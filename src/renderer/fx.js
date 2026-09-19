@@ -2602,12 +2602,49 @@
     const entries = (stack || []).filter(
       (f) => f && DEFS[f.type] && MASTER_TYPES.indexOf(f.type) >= 0 && f.enabled !== false);
     if (!entries.length) return false;
-    const snap = clean(surface, 'fxMasterSrc', W, H);
-    snap.c.drawImage(target.canvas, 0, 0);
     // A clip with an id and nothing else: `paramsAt()` wants somewhere to look for a
     // binding and finds none, which is the right answer - a master pass follows nothing.
-    render(target, W, H, { id: 'master', fx: entries }, t, surface,
-      (tc, w, h) => tc.drawImage(snap.cv, 0, 0, w, h), frameDur);
+    // `clear: false`, and that is the behaviour this pass has always had: every
+    // MASTER_TYPE returns an opaque full-frame picture, so what it draws covers what was
+    // there and clearing first would be invisible. It is spelled out rather than left
+    // implicit because `renderOver()` below needs the opposite, and the difference is the
+    // whole reason the flag exists.
+    return renderOver(target, W, H, { id: 'master', fx: entries }, t, surface, frameDur, false,
+      'fxMasterSrc');
+  }
+
+  /**
+   * Run a stack over WHAT IS ALREADY ON THE TARGET, rather than over a clip's own picture.
+   *
+   * Two callers, and they are the same idea at two scales: the project master finish,
+   * which is the whole timeline's look, and an ADJUSTMENT CLIP - a clip carrying nothing
+   * but an effect stack, which applies to everything composited beneath it. Neither has a
+   * picture of its own, so the frame that has just been built is copied and handed back to
+   * `render()` as the "paint" of the clip. A grade applied per clip, on an adjustment
+   * layer, and in the master pass are therefore the same function three times over, which
+   * is the property this whole file exists to keep.
+   *
+   * `clear` DECIDES WHETHER THE OLD FRAME SHOWS THROUGH, and an adjustment layer needs it
+   * true. `render()` paints into a transparent layer of its own and draws the result onto
+   * the target - so an effect that does not cover the whole frame leaves the untouched
+   * original visible underneath it. For a grade that is invisible; for a `transform`
+   * scaled to 0.8 it is a double image, the shrunk picture sitting on top of the full-size
+   * one. Clearing first makes the stack's output the frame, which is what "this layer
+   * adjusts everything below it" has to mean.
+   *
+   * The clip is passed through WHOLE, not reduced to its stack, because `paramsAt()`
+   * resolves bindings from it: an adjustment layer whose `transform` binds to a track on
+   * the clip underneath is the reason this feature is worth having, and that resolution
+   * goes through the injected binder exactly as it does for any other clip.
+   */
+  function renderOver(target, W, H, clip, t, surface, frameDur, clear, key) {
+    const entries = active(clip);
+    if (!entries.length) return false;
+    const snap = clean(surface, key || 'fxOverSrc', W, H);
+    snap.c.drawImage(target.canvas, 0, 0);
+    if (clear) target.clearRect(0, 0, W, H);
+    render(target, W, H, clip, t, surface,
+      (tc, w, h) => tc.drawImage(snap.cv, 0, 0, w || W, h || H), frameDur);
     return true;
   }
   // ------------------------------------------------------------ per-effect shutter
@@ -2991,7 +3028,7 @@
     setLutReader, putLut, lutFor, lutState, lutDigest, lutPaths, preloadLuts,
     mulberry32, grainMap, GRAIN_SIZE,
     lumaStats, matchGrade,
-    MASTER_TYPES, normalizeStack, masterActive, renderMaster,
+    MASTER_TYPES, normalizeStack, masterActive, renderMaster, renderOver,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
     CHROME, chromeGeom, spotRect, cutoutRect, fitDraw,
   };

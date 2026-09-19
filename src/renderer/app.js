@@ -951,6 +951,57 @@ function addGraphicClip(type) {
   return clip;
 }
 
+/**
+ * Drop an ADJUSTMENT CLIP at the playhead - an effect stack that applies to what is under it.
+ *
+ * It goes on a track ABOVE whatever is at the playhead, because "below" is the whole
+ * semantics: a new video track is added rather than a free slot on an existing one being
+ * reused, which is the opposite of what `addTextCard()` and `addGraphicClip()` do. Those
+ * two are pictures and must not cover footage; this one has no picture and must cover it.
+ *
+ * It spans whatever is under the playhead by default, so the commonest thing - "grade
+ * this shot" - is one click rather than a click and a trim.
+ */
+function addAdjustClip(len) {
+  pushUndo();
+  const start = state.playhead;
+  // Default to the length of the clip under the playhead, so it lines up with the shot it
+  // was added for. A bare playhead over nothing gets four seconds, the same as a graphic.
+  let span = Number(len) || 0;
+  if (!(span > 0)) {
+    const under = layersAt(start).filter((c) => !isAdjustClip(c));
+    span = under.length ? Math.max(0.2, clipEnd(under[under.length - 1]) - start) : 4;
+  }
+
+  // The topmost video track, if it is free here; otherwise a new one above everything.
+  // `state.tracks` is in display order, so index 0 is the top.
+  const top = state.tracks.find((t) => t.type === 'video' && !t.locked);
+  const free = top && !top.clips.some((c) => start < clipEnd(c) && start + span > c.start);
+  const track = free ? top : addTrack('video', false);
+
+  const clip = {
+    id: nextId(),
+    src: null,
+    name: 'Adjustment',
+    kind: 'adjust',
+    start,
+    in: 0,
+    out: span,
+    mediaDuration: 3600,      // no source, so it stretches to any length
+    srcW: 0, srcH: 0, fps: 0,
+    panX: 0.5, panY: 0.5, zoom: 1, volume: 1,
+    linkId: null,
+  };
+  track.clips.push(clip);
+  sortTracks();
+  setSelection([clip.id], false);
+  markDirty();
+  renderAll();
+  log('Added an adjustment layer at ' + fmtTc(start) + '. Effects on it apply to every ' +
+    'clip underneath it.');
+  return clip;
+}
+
 /** The graphic clip the panel edits: the lead of the selection, or null. */
 function selectedGraphicClip() {
   const sel = selectedClips().filter((x) => x.clip.kind === 'graphic');
@@ -1066,7 +1117,10 @@ function activeCanvasClips() {
 /** Every cut on a track: a pair of clips that touch, with the time they meet at. */
 function trackCuts(track) {
   const out = [];
-  const clips = track.clips.filter((c) => c.kind !== 'audio').slice().sort((x, y) => x.start - y.start);
+  // An adjustment clip has no picture, so its edges are not cuts - a transition needs two
+  // sides to show, and one of them would be nothing at all.
+  const clips = track.clips.filter((c) => c.kind !== 'audio' && !isAdjustClip(c))
+    .slice().sort((x, y) => x.start - y.start);
   for (let i = 0; i < clips.length - 1; i++) {
     const a = clips[i], b = clips[i + 1];
     if (Math.abs(clipEnd(a) - b.start) < 0.002) out.push({ a, b, cut: b.start, track });
@@ -2227,9 +2281,10 @@ function renderInspector() {
   const isGraphic = c.kind === 'graphic';
   // A still, a card and a graphic share every "there is no source clock here" row: no
   // in/out to show, no link, and nothing to set a volume on.
-  const noClock = isCanvasClip(c) || isStill;
+  const noClock = noSourceClock(c) || isStill;
   const source = isText ? 'text card'
     : isGraphic ? 'graphic'
+    : isAdjustClip(c) ? 'adjustment layer'
     : isStill ? (c.srcW ? c.srcW + 'x' + c.srcH + ' still' : 'still')
     : (c.srcW ? c.srcW + 'x' + c.srcH + ' @' + c.fps + 'fps' : 'audio');
   const name = isCanvasClip(c) ? CANVAS_PAINTERS[c.kind].name(c) : c.name;
@@ -2276,32 +2331,117 @@ function renderInspector() {
     TextUI.attachWheel(vol, volWheel);
     TextUI.attachWheel(volN, volWheel);
   }
+  /*
+   * EVERY PANEL BELOW IS A COLLAPSIBLE SECTION, AND THE INDEX AT THE TOP IS WHY.
+   *
+   * These used to be appended straight into one scrolling column, and a clip with a
+   * tracker, a matte, a speed ramp and six effects on it was several screens tall - so
+   * "open the third effect" meant scrolling past everything before it, twice, because you
+   * had to scroll back to find out where you were. The order below is unchanged and it is
+   * still the order that matters; what changed is that each one is one line until it is
+   * asked for, and `inspIndex()` puts every line and every effect in one strip at the top
+   * that jumps to it.
+   */
+  const secs = [];
+  const add = (id, title, meta, node) => { if (node) secs.push({ id, title, meta, node }); };
+
   const fxTarget = audioFxTarget(c);
-  if (fxTarget) box.appendChild(audioFxPanel(fxTarget.clip, fxTarget.viaLink));
-  if (tightenAudioFor(c)) box.appendChild(tightenPanel());
+  if (fxTarget) {
+    add('audio', 'Audio chain', (fxTarget.clip.afx || []).length
+      ? (fxTarget.clip.afx.length + ' effect' + (fxTarget.clip.afx.length === 1 ? '' : 's'))
+      : 'none', audioFxPanel(fxTarget.clip, fxTarget.viaLink));
+  }
+  if (tightenAudioFor(c)) add('tighten', 'Tighten', 'remove silence', tightenPanel());
   // Above the stack, because the stack READS it: a binding row on an effect is only
   // offered once something has been tracked, so the tracker is the first of the two.
-  const place = imagePlacePanel(c);
-  if (place) box.appendChild(place);
-  const trk = trackPanel(c);
-  if (trk) box.appendChild(trk);
+  add('place', 'Size and position', null, imagePlacePanel(c));
+  add('track', 'Motion tracking',
+    Tracker.hasTracks(c) ? c.tracks.length + ' track' + (c.tracks.length === 1 ? '' : 's') : 'none',
+    trackPanel(c));
   // Above the stack for the same reason the tracker is: a `matte` effect names a mask, so
   // the mask has to exist before the row that points at one is worth offering.
-  const mm = maskPanel(c);
-  if (mm) box.appendChild(mm);
+  add('mask', 'Resolve Matte', Matte.hasMasks(c) ? c.masks.length + ' matte(s)' : 'none',
+    maskPanel(c));
   // Above the stack, because the stack sits ON it: the graphic says what is drawn and the
   // effects say where it is and what happens to it afterwards.
-  const gfx = graphicPanel(c);
-  if (gfx) box.appendChild(gfx);
+  add('graphic', 'Graphic', isGraphic ? Graphics.title(c) : null, graphicPanel(c));
   // Under the picture panels and above the keyframe strip: speed changes the clip's
   // LENGTH, which every panel above it is measured against.
-  const spd = speedPanel(c);
-  if (spd) box.appendChild(spd);
-  const fx = clipFxPanel(c);
-  if (fx) box.appendChild(fx);
-  const keys = clipKeyPanel(c);
-  if (keys) box.appendChild(keys);
+  add('speed', 'Speed', Speed.has(c) ? Speed.label(c) : '1x', speedPanel(c));
+  const stack = (c.fx || []).length;
+  add('fx', isAdjustClip(c) ? 'Effects (applied below)' : 'Effects',
+    stack ? stack + ' in stack, ' + FX.active(c).length + ' on' : 'none', clipFxPanel(c));
+  add('clipkeys', 'Clip keyframes', null, clipKeyPanel(c));
+
+  box.appendChild(inspIndex(c, secs));
+  for (const sc of secs) box.appendChild(inspSection(sc.id, sc.title, sc.meta, sc.node));
   syncFramingControls();
+}
+
+/**
+ * The index strip: every section, and every effect in the stack, as one clickable chip.
+ *
+ * THIS IS THE ANSWER TO "I HAVE TO SCROLL TO REACH IT". The chips are the whole contents
+ * of the inspector on one or two lines, so what is there is visible without scrolling at
+ * all; clicking one opens that section - and, for an effect chip, that effect - and
+ * scrolls it into view. It is sticky, so it is still there after the jump.
+ *
+ * An effect chip carries the same marks the rolled-up row does (bypassed, keyed, blur),
+ * because a list of six identical chips is a worse list than six that say what they are.
+ */
+function inspIndex(clip, secs) {
+  const el = TextUI.el;
+  const wrap = el('div', 'insp-index');
+  const jump = (secId, fxId) => {
+    inspShut.delete(secId);
+    if (fxId) fxOpen.add(fxId);
+    renderInspector();
+    const host = $('#inspectorCol');
+    const target = fxId
+      ? document.querySelector('#inspector .fx-fx[data-fxid="' + fxId + '"]')
+      : document.querySelector('#inspector .insp-sec[data-sec="' + secId + '"]');
+    if (target && host) {
+      // Measured against the column rather than `scrollIntoView()`, which also scrolls
+      // every other scrollable ancestor and can drag the whole app sideways.
+      const r = target.getBoundingClientRect(), hr = host.getBoundingClientRect();
+      host.scrollTop += (r.top - hr.top) - 46;
+      target.classList.add('flash');
+    }
+  };
+  for (const sc of secs) {
+    const chip = el('button', 'insp-chip' + (inspShut.has(sc.id) ? '' : ' open'), sc.title);
+    chip.title = sc.meta ? sc.title + ' - ' + sc.meta : sc.title;
+    chip.addEventListener('click', () => jump(sc.id, null));
+    wrap.appendChild(chip);
+    if (sc.id !== 'fx') continue;
+    // The effects get a chip each, indented under the Effects one. This is the list the
+    // whole strip exists for: a stack is the thing that gets long.
+    (clip.fx || []).forEach((f, i) => {
+      const d = FX.DEFS[f.type];
+      if (!d) return;
+      const marks = [];
+      if (f.enabled === false) marks.push('bypassed');
+      if (f.keys && Object.keys(f.keys).some((k) => f.keys[k].length)) marks.push('keyed');
+      if (f.mblur && f.mblur.on) marks.push('blur');
+      if (f.bind && f.bind.track) marks.push('tracked');
+      const b = el('button', 'insp-chip fx' + (f.enabled === false ? ' off' : '') +
+        (fxOpen.has(f.id) ? ' open' : ''), (i + 1) + '. ' + d.label);
+      b.title = d.label + (marks.length ? '  · ' + marks.join(' · ') : '');
+      b.addEventListener('click', () => jump('fx', f.id));
+      wrap.appendChild(b);
+    });
+  }
+  if (secs.length > 1) {
+    const anyOpen = secs.some((sc) => !inspShut.has(sc.id));
+    const all = el('button', 'insp-chip all', anyOpen ? 'Roll all up' : 'Open all');
+    all.title = 'Roll every section in this panel up or down. Nothing is edited.';
+    all.addEventListener('click', () => {
+      for (const sc of secs) { if (anyOpen) inspShut.add(sc.id); else inspShut.delete(sc.id); }
+      renderInspector();
+    });
+    wrap.appendChild(all);
+  }
+  return wrap;
 }
 
 /**
@@ -2348,22 +2488,128 @@ document.addEventListener('pointercancel', inspectorEditEnd);
  * graphic is what makes "a callout sticks to a moving button" free rather than a second
  * binding implementation living in `graphics.js`.
  */
-const FX_KINDS = new Set(['video', 'image', 'graphic']);
+const FX_KINDS = new Set(['video', 'image', 'graphic', 'adjust']);
 
 /**
- * Which effect rows are rolled up, by effect id.
+ * Which effect rows are OPEN, by effect id. Closed is the default.
  *
  * UI state, so it lives HERE and never on the clip. Undo is `JSON.stringify` of the track
- * list and the same shape is the `.scut` file - a collapsed row is not a fact about the
- * edit, and putting it on the effect would mean rolling a row up dirtied the project and
+ * list and the same shape is the `.scut` file - a rolled-up row is not a fact about the
+ * edit, and putting it on the effect would mean tidying the panel dirtied the project and
  * showed up as a change in every undo snapshot.
+ *
+ * IT USED TO RECORD THE CLOSED ONES, and the default was open. A stack of six effects is
+ * then six full parameter sets stacked in one scrolling column, and reaching the sixth
+ * means scrolling past five you were not looking at - which is the whole of why the panel
+ * became unusable once stacks got real. Closed by default makes the stack a LIST, one line
+ * per effect, and opening one is a click. An effect you just added opens, because adding
+ * one is how you say you are about to configure it.
  *
  * Keyed by `fx.id`, which is stable for the life of an effect and is exactly what the
  * cache key strips out for being identity rather than pixels. Ids are never reused, so a
  * deleted effect's entry is dead weight and nothing worse; the set is rebuilt every
  * session anyway.
  */
-const fxCollapsed = new Set();
+const fxOpen = new Set();
+
+/**
+ * Which inspector SECTIONS are rolled up, by a stable section id.
+ *
+ * The same rule as `fxOpen` and for the same reason - UI state, never on the clip - but
+ * the default is the other way round: a section is open unless it has been closed. The
+ * sections are few and they are the things people came for; the effects are many.
+ */
+const inspShut = new Set();
+
+/**
+ * The effects clipboard: a list of entries, deep-copied at the moment Copy was pressed.
+ *
+ * A COPY OF THE JSON, not a reference. An effect that stayed live in the clipboard would
+ * keep changing under the person who copied it - they would paste what the effect looks
+ * like now rather than what it looked like when they copied it - and deleting the clip it
+ * came from would empty the clipboard. It is deliberately NOT in the undo snapshot or the
+ * .scut: a clipboard is a thing the session is holding, not a fact about the edit.
+ */
+let fxClip = { items: [], from: '' };
+
+/** Put entries on the clipboard. `label` is what the paste button says it holds. */
+function fxCopyEntries(entries, label) {
+  const items = (entries || []).filter(Boolean).map((f) => JSON.parse(JSON.stringify(f)));
+  if (!items.length) return false;
+  fxClip = { items, from: label || '' };
+  setStatus('Copied ' + items.length + ' effect' + (items.length === 1 ? '' : 's') +
+    (label ? ' from ' + label : '') + '. Select another clip and press Paste.');
+  renderInspector();
+  return true;
+}
+
+/**
+ * Paste the clipboard onto a stack. Returns how many landed.
+ *
+ * EVERY PASTED ENTRY GETS A FRESH ID. Ids are identity, not pixels - the render key strips
+ * them out - but the panel keys its open/closed state by id and `Anim` keys nothing by it,
+ * so two entries sharing one id would roll up and down together and be indistinguishable
+ * to any code that looks one up. `FX.normalize()` is what mints the new id, and it also
+ * fills in a parameter this build knows and the copied one did not.
+ *
+ * An entry of a type the target cannot carry is DROPPED and counted, rather than pasted
+ * and left drawing nothing: the master finish takes six types and a clip takes all of
+ * them, so pasting a clip's stack onto the master is a normal thing to do and losing the
+ * `cursor` off the end of it is the right answer. The caller says so out loud.
+ */
+function fxPasteInto(list, allow) {
+  let landed = 0, dropped = 0;
+  for (const src of fxClip.items) {
+    const copy = JSON.parse(JSON.stringify(src));
+    delete copy.id;                       // `normalize()` mints a fresh one
+    if (allow && !allow(copy)) { dropped++; continue; }
+    if (!FX.normalize(copy)) { dropped++; continue; }
+    list.push(copy);
+    fxOpen.delete(copy.id);               // pasted rows arrive rolled up, like loaded ones
+    landed++;
+  }
+  return { landed, dropped };
+}
+
+/** One line describing what the clipboard is holding, for a button's tooltip. */
+function fxClipSummary() {
+  if (!fxClip.items.length) return 'Nothing copied yet.';
+  const names = fxClip.items.map((f) => (FX.DEFS[f.type] || {}).label || f.type);
+  return 'Holding ' + names.join(', ') + (fxClip.from ? '  (from ' + fxClip.from + ')' : '');
+}
+
+/**
+ * A collapsible section wrapper for the clip inspector.
+ *
+ * WRAPS the panel rather than changing it: every panel keeps the class its suites find it
+ * by (`.fx-box`, `.afx-box`, `.trk-box`, `.mm-box`, `.fx-az`), and the body stays in the
+ * DOM when it is shut - hidden with a class, never removed and never `hidden` - so
+ * anything that reads the inspector's text or clicks a control inside a rolled-up section
+ * still finds it. Rolling one up is UI only: no undo entry, no dirty flag, no redraw.
+ */
+function inspSection(id, title, meta, node) {
+  const el = TextUI.el;
+  const sec = el('div', 'insp-sec' + (inspShut.has(id) ? ' shut' : ''));
+  sec.dataset.sec = id;
+  const bar = el('div', 'insp-sec-head');
+  const caret = el('button', 'mini insp-caret', inspShut.has(id) ? '▸' : '▾');
+  caret.title = inspShut.has(id) ? 'Show ' + title : 'Roll ' + title + ' up';
+  const toggle = () => {
+    if (inspShut.has(id)) inspShut.delete(id); else inspShut.add(id);
+    renderInspector();       // UI only: no pushUndo, no markDirty
+  };
+  caret.addEventListener('click', toggle);
+  bar.appendChild(caret);
+  const t = el('b', 'insp-sec-title', title);
+  t.addEventListener('click', toggle);
+  bar.appendChild(t);
+  if (meta) bar.appendChild(el('span', 'tc-hint', meta));
+  sec.appendChild(bar);
+  const body = el('div', 'insp-sec-body');
+  body.appendChild(node);
+  sec.appendChild(body);
+  return sec;
+}
 
 /**
  * The visual effect stack for the selected clip.
@@ -2771,12 +3017,12 @@ function clipFxPanel(clip) {
   head.appendChild(el('span', 'tc-hint',
     !clip.fx ? 'none' : clip.fx.length + ' in stack' + (count < clip.fx.length ? ', ' + count + ' on' : '')));
   if ((clip.fx || []).length > 1) {
-    const anyOpen = clip.fx.some((f) => !fxCollapsed.has(f.id));
+    const anyOpen = clip.fx.some((f) => fxOpen.has(f.id));
     const all = el('button', 'mini', anyOpen ? 'Collapse all' : 'Expand all');
     all.title = 'Roll every effect in this stack up or down. Nothing is edited.';
     all.addEventListener('click', () => {
       for (const f of clip.fx) {
-        if (anyOpen) fxCollapsed.add(f.id); else fxCollapsed.delete(f.id);
+        if (anyOpen) fxOpen.delete(f.id); else fxOpen.add(f.id);
       }
       renderInspector();      // UI only: no pushUndo, no markDirty
     });
@@ -2784,10 +3030,14 @@ function clipFxPanel(clip) {
   }
   box.appendChild(head);
 
-  box.appendChild(el('div', 'tc-hint fx-note',
-    'Drawn once, by the baker - the preview and the export run the same code. Any clip ' +
-    'carrying an effect is composited rather than handed to ffmpeg, so it renders slower ' +
-    'than a plain one. Effects do not apply inside a transition window.'));
+  box.appendChild(el('div', 'tc-hint fx-note', isAdjustClip(clip)
+    ? 'This is an ADJUSTMENT LAYER: everything here applies to whatever is composited ' +
+      'underneath it, over the span it covers, on every track below its own. It paints ' +
+      'no picture of its own - move it, trim it, or drag it to another track to change ' +
+      'what it reaches. Effects do not apply inside a transition window.'
+    : 'Drawn once, by the baker - the preview and the export run the same code. Any clip ' +
+      'carrying an effect is composited rather than handed to ffmpeg, so it renders slower ' +
+      'than a plain one. Effects do not apply inside a transition window.'));
 
   // A structural change is one undo entry and a full rebuild.
   const edit = (fn) => {
@@ -2797,6 +3047,54 @@ function clipFxPanel(clip) {
     markDirty();
     renderAll();
   };
+
+  /*
+   * COPY AND PASTE, for the whole stack and for one effect at a time.
+   *
+   * A graded, rounded, vignetted look is eight sliders across three effects, and before
+   * this the only way to put it on the next clip was to build it again - there was no
+   * "apply to the rest of them" anywhere, and the presets in the PresetList are whole
+   * B2B recipes rather than a stack somebody just dialled in. The clipboard holds plain
+   * JSON, so it survives changing the selection, and it reaches anything with a stack:
+   * another clip, a graphic, an adjustment layer, and the master finish (which takes the
+   * six types it is allowed and says how many it could not).
+   */
+  const clipName = isCanvasClip(clip) ? CANVAS_PAINTERS[clip.kind].name(clip) : clip.name;
+  const bar = el('div', 'fx-clipbar');
+  const copyAll = el('button', 'mini', 'Copy all');
+  copyAll.disabled = !(clip.fx || []).length;
+  copyAll.title = 'Copy every effect on this clip, with its parameters, keyframes, ' +
+    'shutter and binding.';
+  copyAll.addEventListener('click', () => fxCopyEntries(clip.fx, clipName));
+  bar.appendChild(copyAll);
+
+  const paste = el('button', 'mini', 'Paste' +
+    (fxClip.items.length ? ' (' + fxClip.items.length + ')' : ''));
+  paste.disabled = !fxClip.items.length;
+  paste.title = fxClipSummary() + '\nPasted effects are APPENDED to the end of the stack, ' +
+    'so they draw after what is already here.';
+  paste.addEventListener('click', () => {
+    let r = null;
+    edit(() => {
+      if (!Array.isArray(clip.fx)) clip.fx = [];
+      r = fxPasteInto(clip.fx);
+    });
+    setStatus('Pasted ' + r.landed + ' effect' + (r.landed === 1 ? '' : 's') + '.' +
+      (r.dropped ? ' ' + r.dropped + ' could not be pasted here.' : ''));
+  });
+  bar.appendChild(paste);
+
+  const replace = el('button', 'mini', 'Paste as stack');
+  replace.disabled = !fxClip.items.length;
+  replace.title = 'Replace this clip’s whole stack with what was copied. One undo entry.';
+  replace.addEventListener('click', () => {
+    edit(() => { clip.fx = []; fxPasteInto(clip.fx); });
+    setStatus('Replaced the stack with ' + fxClip.items.length + ' copied effect(s).');
+  });
+  bar.appendChild(replace);
+  if (fxClip.items.length) bar.appendChild(el('span', 'tc-hint', fxClipSummary()));
+  box.appendChild(bar);
+
   const rowHooks = {
     onEdit: inspectorEdit,
     onEditEnd: inspectorEditEnd,
@@ -2822,14 +3120,16 @@ function clipFxPanel(clip) {
     // could ever reorder a stack, and they cannot be triggered by accident. So the drag
     // is gone rather than defended, and `smoke-fx.js` asserts that it stays gone.
     const row = el('div', 'fx-fx' + (fx.enabled === false ? ' off' : ''));
+    // The index strip scrolls to a row by id, so the row has to carry one.
+    row.dataset.fxid = fx.id;
 
     const bar = el('div', 'fx-fx-head');
-    const shut = fxCollapsed.has(fx.id);
-    const caret = el('button', 'mini fx-caret', shut ? '\u25b8' : '\u25be');
-    caret.title = shut ? 'Show this effect\u2019s controls' : 'Roll this effect up';
+    const shut = !fxOpen.has(fx.id);
+    const caret = el('button', 'mini fx-caret', shut ? '▸' : '▾');
+    caret.title = shut ? 'Show this effect’s controls' : 'Roll this effect up';
     caret.addEventListener('click', () => {
       // Purely how the panel looks: no snapshot, no dirty flag, no redraw of the picture.
-      if (fxCollapsed.has(fx.id)) fxCollapsed.delete(fx.id); else fxCollapsed.add(fx.id);
+      if (fxOpen.has(fx.id)) fxOpen.delete(fx.id); else fxOpen.add(fx.id);
       renderInspector();
     });
     bar.appendChild(caret);
@@ -2847,13 +3147,15 @@ function clipFxPanel(clip) {
     bar.appendChild(title);
     // Rolled up, the row still has to say what it is doing - a bypassed or motion-blurred
     // effect that looks identical to a plain one is how a stack stops being readable.
+    // Closed is now the DEFAULT, so this line is what most rows show most of the time.
     if (shut) {
       const marks = [];
       if (fx.enabled === false) marks.push('bypassed');
       if (fx.keys && Object.keys(fx.keys).some((k) => fx.keys[k].length)) marks.push('keyed');
       if (fx.mblur && fx.mblur.on) marks.push('blur');
+      if (fx.bind && fx.bind.track) marks.push('tracked');
       if (fx.gen) marks.push(fx.gen);
-      if (marks.length) bar.appendChild(el('span', 'tc-hint', marks.join(' \u00b7 ')));
+      if (marks.length) bar.appendChild(el('span', 'tc-hint', marks.join(' · ')));
     }
 
     const btns = el('div', 'fx-fx-btns');
@@ -2871,7 +3173,21 @@ function clipFxPanel(clip) {
     mk('▼', 'Draw this effect later in the stack', () => edit(() => {
       clip.fx.splice(i + 1, 0, clip.fx.splice(i, 1)[0]);
     }), i === stack.length - 1);
-    mk('✕', 'Remove this effect', () => edit(() => { clip.fx.splice(i, 1); }));
+    // Copy THIS one. The whole entry goes - parameters, keyframes, shutter and binding -
+    // because half an effect on the clipboard is a trap rather than a shortcut.
+    mk('⧉', 'Copy this effect, with its parameters, keyframes, shutter and binding',
+      () => fxCopyEntries([fx], d.label + ' on ' + clipName));
+    // And duplicate it in place, which is copy + paste of one row and is what somebody
+    // wants when they are building two blurs or two transforms at different strengths.
+    mk('+', 'Duplicate this effect, directly after it', () => edit(() => {
+      const copy = JSON.parse(JSON.stringify(fx));
+      delete copy.id;
+      if (FX.normalize(copy)) { clip.fx.splice(i + 1, 0, copy); fxOpen.add(copy.id); }
+    }));
+    mk('✕', 'Remove this effect', () => edit(() => {
+      clip.fx.splice(i, 1);
+      fxOpen.delete(fx.id);
+    }));
     bar.appendChild(btns);
     row.appendChild(bar);
 
@@ -3070,7 +3386,12 @@ function clipFxPanel(clip) {
     const type = add.value;
     edit(() => {
       if (!Array.isArray(clip.fx)) clip.fx = [];
-      clip.fx.push(FX.create(type));
+      const e = FX.create(type);
+      clip.fx.push(e);
+      // Adding an effect is how somebody says they are about to configure it, so this one
+      // arrives OPEN even though the default is closed. Everything already on the clip
+      // stays rolled up, which is what keeps a long stack a list.
+      fxOpen.add(e.id);
     });
   });
   addRow.appendChild(add);
@@ -3480,7 +3801,7 @@ function easingName(e) {
 }
 
 function clipKeyPanel(clip) {
-  if (!clip || isCanvasClip(clip)) return null;
+  if (!clip || noSourceClock(clip)) return null;
   const props = Anim.clipPropsFor(clip);
   if (!props.length) return null;
   // Clip keys are timed in TIMELINE seconds from the clip's start, so under a ramp the
@@ -4572,6 +4893,33 @@ function isPictureClip(c) { return c && (c.kind === 'video' || c.kind === 'image
 const CANVAS_KINDS = new Set(['text', 'graphic']);
 function isCanvasClip(c) { return !!c && CANVAS_KINDS.has(c.kind); }
 
+/**
+ * An ADJUSTMENT CLIP: an effect stack with no picture of its own.
+ *
+ * It sits on a video track like anything else, and what it applies to is everything
+ * composited BENEATH it over the span it covers - the same stack, the same panel, the
+ * same keyframes and the same bindings a clip's own stack has. `compositeLayers()` hands
+ * the frame built so far back to `FX.renderOver()` when it reaches one, which is exactly
+ * what the project master finish does; the difference is only that this one has a start,
+ * a length and a place in the track order.
+ *
+ * It is NOT a canvas clip. A canvas clip is one the renderer paints - a card or a graphic
+ * - and it bakes into its own cropped sequence that ffmpeg overlays. This one paints
+ * nothing and must never be overlaid: it modifies. What it shares with a card is only
+ * that there is no source clock here, which is what `noSourceClock()` below is for.
+ */
+function isAdjustClip(c) { return !!c && c.kind === 'adjust'; }
+
+/**
+ * No source clock: nothing to decode, no in/out to show, no link, no volume, no speed.
+ *
+ * Cards, graphics and adjustment clips all answer yes, and everything that used to ask
+ * `isCanvasClip()` when what it MEANT was this now asks here. The two questions were the
+ * same answer until adjustment clips existed and they are not any more: a card is painted
+ * and an adjustment clip is not, but neither of them has a decoder.
+ */
+function noSourceClock(c) { return isCanvasClip(c) || isAdjustClip(c); }
+
 /** The painter for a canvas-drawn clip: the one place `text` and `graphic` differ. */
 const CANVAS_PAINTERS = {
   text: {
@@ -4639,7 +4987,10 @@ function layersAt(time) {
   for (const t of state.tracks) {
     if (t.type !== 'video' || t.hidden) continue;
     for (const c of t.clips) {
-      if (!isPictureClip(c) && !isCanvasClip(c)) continue;
+      // Adjustment clips are in the list and in TRACK ORDER, which is the whole of how
+      // "it applies to what is below it" is expressed: the loop in `compositeLayers()`
+      // reaches one after everything under it has already painted.
+      if (!isPictureClip(c) && !isCanvasClip(c) && !isAdjustClip(c)) continue;
       const live = time >= c.start - eps && time < clipEnd(c) - eps;
       if (live || (atEnd && Math.abs(clipEnd(c) - dur) < 0.001)) out.push(c);
     }
@@ -4689,6 +5040,14 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
   let painted = false;
   for (const c of layers) {
     const local = time - c.start;
+    // An ADJUSTMENT CLIP takes the frame built so far and runs its stack over it. It is
+    // skipped entirely when nothing has painted yet - an adjustment layer hanging over a
+    // gap has nothing to adjust, and running it over the black base would turn a hole in
+    // the edit into a graded hole, and would cost a bake for it.
+    if (isAdjustClip(c)) {
+      if (painted) FX.renderOver(cctx, W, H, c, local, fxSurface, frameDur, true);
+      continue;
+    }
     if (isCanvasClip(c)) {
       // Both painters scale every size off the frame, so a smaller canvas gives a
       // proportionally smaller picture - the layout is identical, there is just less to
@@ -4963,7 +5322,10 @@ function drawPreview() {
   const layers = activeLayers();
   const cache = videoFrameCache();
 
-  if (!layers.length) {
+  // "Nothing here" means nothing that PAINTS. An adjustment clip hanging over a gap is
+  // still a gap: it has no picture, `compositeLayers()` skips it, and treating it as a
+  // layer would leave the viewer holding the last good frame instead of showing black.
+  if (!layers.some((c) => !isAdjustClip(c))) {
     // A real gap shows black, not the previous frame.
     frameCacheValid = false;
     ctx.fillStyle = '#000';
@@ -5218,7 +5580,7 @@ function syncMedia() {
 
   const live = [];   // elements that should be playing right now
   for (const { clip, track } of allClips()) {
-    if (isCanvasClip(clip)) continue; // drawn from canvas, nothing to decode
+    if (noSourceClock(clip)) continue; // painted, or paints nothing: no decoder either way
     if (clip.kind === 'image') {
       // A still has no clock to keep in step, only a picture to have ready. Warming it
       // on approach is the same reason video clips are pre-created: arriving at the cut
@@ -6061,7 +6423,7 @@ function removeTimelineSpan(a, b, cutIds) {
     const kept = [];
     for (const c of track.clips) {
       const s = c.start, e = clipEnd(c);
-      const cuttable = cutIds.has(c.id) && !isCanvasClip(c);
+      const cuttable = cutIds.has(c.id) && !noSourceClock(c);
 
       if (e <= a + E) { kept.push(c); continue; }                     // wholly before
       if (s >= b - E) { c.start -= amount; kept.push(c); continue; }  // wholly after
@@ -7659,6 +8021,36 @@ function renderMasterPanel() {
     'covers off the fast path, so the project renders slower than it did without one. ' +
     'Keys here are TIMELINE seconds, not clip seconds: the project has no in-point.'));
 
+  // The same clipboard the clip panel uses, so a look built on one clip can be lifted
+  // onto the whole project. `FX.MASTER_TYPES` is the gate and it is enforced here rather
+  // than trusted: pasting a clip's stack is a normal thing to want, and most clip stacks
+  // carry something a master pass cannot run. What is dropped is COUNTED and said out
+  // loud - silently losing half a paste is worse than refusing the whole thing.
+  {
+    const bar = el('div', 'fx-clipbar');
+    const copyAll = el('button', 'mini', 'Copy all');
+    copyAll.disabled = !stack.length;
+    copyAll.title = 'Copy the whole master stack.';
+    copyAll.addEventListener('click', () => fxCopyEntries(stack, 'the master finish'));
+    bar.appendChild(copyAll);
+    const paste = el('button', 'mini', 'Paste' +
+      (fxClip.items.length ? ' (' + fxClip.items.length + ')' : ''));
+    paste.disabled = !fxClip.items.length;
+    paste.title = fxClipSummary() + '\nThe master pass runs ' +
+      FX.MASTER_TYPES.join(', ') + ' and nothing else; anything else is dropped.';
+    paste.addEventListener('click', () => {
+      let r = null;
+      edit(() => { r = fxPasteInto(state.master, (f) => FX.MASTER_TYPES.indexOf(f.type) >= 0); });
+      setStatus('Pasted ' + r.landed + ' into the master finish.' + (r.dropped
+        ? ' ' + r.dropped + ' dropped - the master pass only runs ' +
+          FX.MASTER_TYPES.join(', ') + '.'
+        : ''));
+    });
+    bar.appendChild(paste);
+    if (fxClip.items.length) bar.appendChild(el('span', 'tc-hint', fxClipSummary()));
+    box.appendChild(bar);
+  }
+
   stack.forEach((fx, i) => {
     const d = FX.DEFS[fx.type];
     const row = el('div', 'fx-fx' + (fx.enabled === false ? ' off' : ''));
@@ -7683,6 +8075,7 @@ function renderMasterPanel() {
     mk('▼', 'Draw this later in the master stack', () => edit(() => {
       stack.splice(i + 1, 0, stack.splice(i, 1)[0]);
     }), i === stack.length - 1);
+    mk('⧉', 'Copy this effect', () => fxCopyEntries([fx], 'the master finish'));
     mk('✕', 'Remove this effect', () => edit(() => { stack.splice(i, 1); }));
     bar.appendChild(btns);
     row.appendChild(bar);
@@ -7958,6 +8351,12 @@ function buildJob(outPath, range) {
         entry.tStart = headCut;
         entry[CANVAS_PAINTERS[c.kind].ref] = c;
       }
+      // An adjustment clip is `visible: false` and `audible: false`, so ffmpeg never sees
+      // it as an input - it is in the job for the CACHE KEY, because its stack decides
+      // the pixels of every span it covers. Its keys are timed from its own start for the
+      // same reason a card's are, so a ranged render starting inside one picks the
+      // animation up where the playhead was.
+      if (isAdjustClip(c)) entry.tStart = headCut;
       clips.push(entry);
     }
 
@@ -8396,18 +8795,26 @@ function needsCompositeAt(t, windows) {
   // The transition-window test above still wins, because a transition's baked layer must
   // stay its own layer - `bakeTransitions()` applies the master finish itself instead.
   const layers = layersAt(t);
+  // Only the layers that PAINT count as "there is something here". An adjustment clip
+  // over a gap adjusts nothing - `compositeLayers()` skips it for the same reason.
+  const paint = layers.filter((c) => !isAdjustClip(c));
   // An EMPTY span is exempt: there is no picture there to finish, and baking one would
   // write a full-frame raw sequence of black. Grain and bloom over black are black
   // anyway; a LUT that lifts its black point would tint a GAP, and that is the one thing
   // this exemption knowingly gives up rather than pay a bake for every hole in the edit.
   // The viewer agrees, for the same reason - `drawPreview()` fills a real gap with black
   // and returns before it ever reaches `compositeLayers()`.
-  if (layers.length && FX.masterActive(state.master)) return true;
+  if (paint.length && FX.masterActive(state.master)) return true;
   let pictures = 0;
-  for (const c of layers) {
+  for (const c of paint) {
     if (isPictureClip(c)) pictures++;
     if (clipNeedsBake(c)) return true;
   }
+  // An ADJUSTMENT LAYER takes its span off the fast path for exactly the reason the
+  // master finish does: there is no ffmpeg half of a grade or a transform to hand the
+  // crop-and-fill chain, so a span ffmpeg built would come out of the export unadjusted
+  // while the viewer showed it adjusted. Same exemption for an empty span, same reason.
+  if (paint.length && layers.some((c) => isAdjustClip(c) && FX.active(c).length)) return true;
   return pictures >= 2;
 }
 
@@ -11757,6 +12164,7 @@ const SHORTCUTS = [
   ['N', 'Toggle snapping'],
   ['B', 'Show / hide the QuickBin'],
   ['Double-click in the bin', 'Put that clip on the timeline at the playhead'],
+  ['E', 'Add an adjustment layer: effects that apply to everything below it'],
   ['M', 'Drop a marker at the playhead'],
   ['Shift+M / Alt+Shift+M', 'Go to the next / previous marker'],
   ['Alt+Delete', 'Remove the marker at the playhead'],
@@ -11849,6 +12257,7 @@ document.addEventListener('keydown', (e) => {
     if (m) { seek(m.t); setStatus('Marker "' + m.name + '".'); } else setStatus('No later marker.');
   }
   else if (e.key.toLowerCase() === 'm') { addMarker(); }
+  else if (e.key.toLowerCase() === 'e' && !ctrl) { addAdjustClip(); }
   else if (e.key === 'F5') { location.reload(); }
   // Esc stops a take FIRST and does nothing else: the person performing has both hands
   // busy and the nearest exit has to be unambiguous, not also a deselect.
@@ -11915,6 +12324,7 @@ $('#btnAddText').addEventListener('click', () => addTextCard());
 })();
 $('#btnAddTransition').addEventListener('click', () => addTransition(state.lastTransitionType));
 $('#btnAddMarker').addEventListener('click', () => addMarker());
+$('#btnAddAdjust').addEventListener('click', () => addAdjustClip());
 $('#btnDelTransition').addEventListener('click', () => deleteTransition());
 
 // Closing the drawer just clears the selection - the drawer follows the selected card.

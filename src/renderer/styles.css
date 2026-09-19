@@ -910,3 +910,83 @@ optgroup { color: var(--dim); font-weight: 600; }
 #inspectorCol[data-tab="deliver"] > .panel-head[data-itab="deliver"]:not([hidden]) { display: flex !important; }
 #inspectorCol > #binBar:not([hidden]) { display: flex; }
 #inspectorCol[data-tab="media"] #quickBin { max-height: none; }
+
+/* ---------------------------------------------------- the inspector's index + sections
+
+   THE ANSWER TO "I HAVE TO SCROLL TO REACH IT". The clip inspector used to be one long
+   scrolling column of always-open panels, so a clip with a tracker, a matte, a ramp and
+   six effects was several screens tall. Every panel is now a collapsible `.insp-sec`,
+   and `.insp-index` is a sticky strip of chips at the top listing all of them AND every
+   effect in the stack - so the whole contents are visible without scrolling and one
+   click opens the one that was wanted. */
+.insp-index {
+  position: sticky; top: 0; z-index: 4;
+  display: flex; flex-wrap: wrap; gap: 3px;
+  margin: -2px -2px 8px; padding: 5px 2px 6px;
+  background: var(--panel); border-bottom: 1px solid var(--line-soft);
+}
+.insp-chip {
+  font-size: 10px; line-height: 1.5; padding: 1px 7px;
+  border: 1px solid var(--line); border-radius: 9px;
+  background: var(--field); color: var(--dim); cursor: pointer;
+  white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+}
+.insp-chip:hover { border-color: var(--accent); color: var(--text); }
+/* An OPEN section's chip reads as the thing you are looking at. */
+.insp-chip.open { color: var(--text); border-color: var(--line-soft); background: var(--panel2); }
+/* Effect chips are indented under the Effects one, so the strip reads as a tree rather
+   than as one undifferentiated row of pills. */
+.insp-chip.fx { margin-left: 8px; border-style: dashed; }
+.insp-chip.fx.open { border-style: solid; border-color: var(--accent); }
+.insp-chip.fx.off { opacity: 0.5; text-decoration: line-through; }
+.insp-chip.all { margin-left: auto; font-style: italic; }
+
+.insp-sec { margin-top: 8px; border: 1px solid var(--line); border-radius: var(--radius); }
+.insp-sec-head {
+  display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+  background: var(--panel2); border-radius: var(--radius) var(--radius) 0 0;
+}
+.insp-sec.shut .insp-sec-head { border-radius: var(--radius); }
+.insp-sec-head .insp-sec-title { flex: 1; font-weight: 600; cursor: pointer; }
+.insp-sec-head .insp-sec-title:hover { color: var(--accent); }
+.insp-caret { min-width: 20px; padding: 0 4px; }
+.insp-sec-body { padding: 0 8px 8px; }
+/* Hidden with a CLASS, never removed and never the `hidden` attribute: everything the
+   section holds stays in the DOM, so reading the inspector's text or clicking a control
+   inside a rolled-up section still works exactly as it did. */
+.insp-sec.shut > .insp-sec-body { display: none; }
+/* The panels inside a section already had a top border and margin of their own, which
+   would draw a second line right under the section's head. */
+.insp-sec-body > .fx-box,
+.insp-sec-body > .afx-box,
+.insp-sec-body > .fx-az { margin-top: 6px; border-top: none; padding-top: 0; }
+/* A one-second highlight after the index jumps to something, so it is obvious which of
+   several identical-looking rows was landed on. */
+@keyframes inspFlash { from { background: rgba(91,140,255,.22); } to { background: transparent; } }
+.insp-sec.flash, .fx-fx.flash { animation: inspFlash 1.1s ease-out; }
+
+/* The effects clipboard bar: copy the stack, copy one effect, paste onto anything else
+   that has a stack - another clip, a graphic, an adjustment layer, the master finish. */
+.fx-clipbar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; margin-bottom: 6px; }
+.fx-clipbar .tc-hint { flex-basis: 100%; line-height: 1.3; }
+
+/* An ADJUSTMENT CLIP on the timeline. Deliberately unlike a picture clip: it is striped
+   rather than solid, because what it contributes is not a picture and a clip that looks
+   like footage but shows none is the thing people would file a bug about. */
+.clip.adjust {
+  background:
+    repeating-linear-gradient(135deg,
+      rgba(255,255,255,.06) 0 6px, rgba(255,255,255,0) 6px 12px),
+    #6a4b86;
+  border-color: rgba(255,255,255,.25);
+}
+.clip.adjust .label { font-style: italic; }
+
+/* The section head now carries the title, so the panel inside it must not repeat it.
+   Only a panel that is the DIRECT child of a section body is hidden this way - auto-zoom
+   sits inside the effects box and keeps its own head, because it is a sub-panel rather
+   than the thing the section is named after. The heads themselves stay: they carry
+   Collapse all, Add tracker, Import and the rest, and three suites find them. */
+.insp-sec-body > .fx-box > .fx-head > b,
+.insp-sec-body > .fx-az > .fx-head > b,
+.insp-sec-body > .afx-box > .afx-head > b { display: none; }

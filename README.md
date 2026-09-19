@@ -800,6 +800,86 @@ canvas whose alpha is the matte, and takes on the matching duty of putting the m
 into the render key. Exactly the arrangement `setBinder()` already had, for exactly the
 same reason. See "Resolve Matte".
 
+#### An adjustment clip: a stack with no picture
+
+An effect can live **on a clip**, or **as a clip**. Drop an adjustment layer (`E`, or
+**+ Adjust**) and it lands on the track above whatever is under the playhead, spanning it;
+everything on its stack then applies to **every clip composited beneath it**, over the
+span it covers, on every track below its own.
+
+```js
+{ kind: 'adjust', start, in: 0, out, fx: [ ... ] }    // no src, no picture, no painter
+```
+
+It is the same panel, the same `FX.DEFS`, the same keyframes and the same motion-track
+bindings a clip's own stack has — because it is the same stack. What differs is only where
+the pixels it works on come from: `compositeLayers()` reaches it in track order, after
+everything under it has painted, and hands the frame back to **`FX.renderOver()`**. That
+is the function the project master finish already used, generalised: a grade applied per
+clip, on an adjustment layer, and in the master pass are now one function three times over,
+which is the property this whole file exists to keep.
+
+**`renderOver()` clears the target first, and the master pass does not.** `render()` paints
+into a transparent layer of its own and draws the result onto the target, so an effect that
+does not cover the whole frame leaves the untouched original visible underneath it. For a
+grade that is invisible, which is why the master pass never needed the clear — every
+`MASTER_TYPE` returns an opaque full-frame picture. For a `transform` scaled to 0.8 it is a
+**double image**, the shrunk picture sitting on top of the full-size one. So `clear` is an
+argument rather than a rule, and the master pass keeps passing `false`.
+
+Three things fall out of the design rather than being written:
+
+- **What it reaches is what it covers.** Move it, trim it or drag it to another track and
+  what it applies to changes. There is no "apply to" list to keep in step with the edit.
+- **It is `visible: false` and `audible: false` in the job**, so ffmpeg never sees it as an
+  input. It is in the job for the **cache key** — its stack decides the pixels of every
+  span it covers, and leaving it out would hit the cached render of the unadjusted picture.
+- **It takes its span off the fast path** for exactly the reason a master finish does:
+  there is no ffmpeg half of a grade or a transform, so a span ffmpeg built would come out
+  of the export unadjusted while the viewer showed it adjusted.
+
+An adjustment layer hanging over a **gap** adjusts nothing: `compositeLayers()` skips it
+when nothing has painted yet, `drawPreview()` still shows black rather than holding the
+last good frame, and `needsCompositeAt()` does not bake it. Running it over the black base
+would turn a hole in the edit into a graded hole and charge a full bake for it — the same
+exemption, and the same reasoning, the master finish carries.
+
+It is **not a canvas clip**. A canvas clip is one the renderer *paints* — a card or a
+graphic — and it bakes into its own cropped sequence that ffmpeg overlays. This one paints
+nothing and must never be overlaid: it modifies. What it shares with a card is only that
+there is no source clock, which is what `noSourceClock()` is for: no decoder, no in/out, no
+link, no volume, no speed, and never sliced by Tighten. `trackCuts()` also skips it, because
+its edges are not cuts — a transition needs two sides to show and one of them would be
+nothing at all.
+
+The "add an effect" menu already greys out `cursor`, `ripple` and `matte` on it with no
+extra code: they declare `needs`, and an adjustment clip carries neither a mouse take nor a
+matte. A `transform` bound to a track on **another** clip works, though — `bind.clip` and
+the injected binder were built for exactly that, so "this vignette follows that button" is
+an adjustment layer with one binding.
+
+#### Copying effects
+
+Every row has a **copy** button and a **duplicate** button, the panel header has **Copy
+all**, **Paste** and **Paste as stack**, and the master finish panel has the same pair.
+
+A graded, rounded, vignetted look is eight sliders across three effects, and before this
+the only way to put it on the next clip was to build it again — the PresetList holds whole
+B2B recipes rather than a stack somebody just dialled in. The clipboard holds **plain JSON,
+deep-copied at the moment Copy was pressed**: an entry that stayed live would keep changing
+under the person who copied it, and deleting the clip it came from would empty it. It is
+deliberately not in the undo snapshot or the `.scut` — a clipboard is something the session
+is holding, not a fact about the edit.
+
+**Every pasted entry gets a fresh id.** Ids are identity rather than pixels and the render
+key strips them out, but the panel keys its open/closed state by id, so two entries sharing
+one would roll up and down together. `FX.normalize()` mints the new one and fills in any
+parameter this build knows that the copied entry did not.
+
+Pasting onto the **master finish** is a normal thing to want and most clip stacks carry
+something the master pass cannot run, so an entry of a disallowed type is **dropped and
+counted** rather than pasted and left drawing nothing — and the status line says how many.
+
 #### Binding a position to a motion track
 
 Three types carry a `bind` descriptor — `transform`, `spotlight` and `cutout` — and an
@@ -970,19 +1050,57 @@ job, they are the only route a keyboard or a smoke suite has, and they cannot be
 by accident — so the drag is gone rather than defended, and `smoke-fx.js` asserts it stays
 gone.
 
-#### Rows roll up
+#### Rows roll up, and closed is the default
 
 Each row has a caret, the title toggles it too, and a stack of more than one gets
 **Collapse all** / **Expand all** in the panel header. A rolled-up row still reports what
-it is doing — `bypassed`, `keyed`, `blur`, or the name of the generator that made it —
-because a stack of identical-looking closed rows is a worse list than an open one.
+it is doing — `bypassed`, `keyed`, `blur`, `tracked`, or the name of the generator that made
+it — because a stack of identical-looking closed rows is a worse list than an open one, and
+since closed is now the default that line is what most rows show most of the time.
 
-Collapse state lives in `fxCollapsed`, a module-level `Set` keyed by effect id, and
-**never on the clip**. Undo is `JSON.stringify` of the track list and the same shape is
-the `.scut` file: a rolled-up row is not a fact about the edit, and putting it on the
-effect would mean tidying the panel dirtied the project and showed up as a change in every
-undo snapshot. Rolling a row up therefore pushes no undo entry, sets no dirty flag and
-does not redraw the picture — `smoke-fx.js` asserts all three.
+**It used to record the closed ones and default to open.** A stack of six effects was then
+six full parameter sets in one scrolling column, and reaching the sixth meant scrolling past
+five you were not looking at — which is the whole of why the panel stopped being usable once
+stacks got real. Closed by default makes the stack a **list**, one line per effect, and
+opening one is a click. An effect you just **added** opens, because adding one is how you say
+you are about to configure it; everything already there stays rolled up.
+
+Open state lives in `fxOpen`, a module-level `Set` keyed by effect id, and **never on the
+clip**. Undo is `JSON.stringify` of the track list and the same shape is the `.scut` file: a
+rolled-up row is not a fact about the edit, and putting it on the effect would mean tidying
+the panel dirtied the project and showed up as a change in every undo snapshot. Rolling a
+row up therefore pushes no undo entry, sets no dirty flag and does not redraw the picture —
+`smoke-fx.js` asserts all three.
+
+#### The inspector's index, and collapsible sections
+
+The clip inspector used to append every panel straight into one scrolling column, all of
+them open: a clip with a tracker, a matte, a speed ramp and six effects was several screens
+tall, so "open the third effect" meant scrolling past everything before it — twice, because
+you had to scroll back to find out where you were.
+
+Every panel is now a collapsible **`.insp-sec`**, and `inspIndex()` builds a **sticky strip
+of chips** at the top listing all of them *and every effect in the stack*. That is the
+answer to "I have to scroll to reach it": the whole contents of the inspector are one or two
+lines, visible without scrolling at all, and clicking a chip opens that section — and, for
+an effect chip, that effect — and scrolls it into view with a one-second highlight. An
+effect chip carries the same marks the rolled-up row does, because six identical chips would
+be a worse list than six that say what they are.
+
+Two rules the wrapper keeps, and both are about not breaking what already worked:
+
+- **It wraps, it does not replace.** Every panel keeps the class its suites find it by
+  (`.fx-box`, `.afx-box`, `.trk-box`, `.mm-box`, `.fx-az`), and the inner head stays — it
+  carries Collapse all, Add tracker, Import and the rest. Only the head's duplicated
+  **title** is hidden, and only when the panel is the direct child of a section body, so
+  auto-zoom keeps its own head inside the effects box.
+- **A shut body is hidden with a CLASS**, never removed and never with the `hidden`
+  attribute app.js toggles elsewhere. Everything stays in the DOM, so reading the
+  inspector's text or clicking a control inside a rolled-up section works exactly as before.
+
+Section state lives in `inspShut` — the same rule as `fxOpen` and for the same reason, but
+defaulting the other way: the sections are few and they are the things people came for, the
+effects are many.
 
 #### Motion blur, per effect
 
@@ -1027,8 +1145,8 @@ says what it costs.
 
 #### What does not get a stack, and where effects do not apply
 
-Effects are offered on `kind:'video'`, `kind:'image'` and `kind:'graphic'` — everything
-except a **text card**. The text card's own looks exist as effects too, so a PNG or a
+Effects are offered on `kind:'video'`, `kind:'image'`, `kind:'graphic'` and
+`kind:'adjust'` — everything except a **text card**. The text card's own looks exist as effects too, so a PNG or a
 photo can have them: `animate` (in/out fade, slide, zoom, pop, flicker with easing - it is
 `timeVarying`, so per-effect motion blur works on it), `glow`, `shadow` and `stroke`. All
 three looks follow the picture's **alpha** (`silhouette()`), so they hug a transparent PNG
@@ -4763,6 +4881,7 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `Ctrl+Shift+R` | Export a file to disk |
 | `Ctrl+Shift+F9` | Start / stop recording the screen (works while another app has focus) |
 | `P` | Play rendered spans / composite live |
+| `E` | Add an adjustment layer: a clip whose effects apply to everything below it |
 | `M` | Drop a marker at the playhead |
 | `Shift+M` / `Alt+Shift+M` | Go to the next / previous marker |
 | `Alt+Delete` | Remove the marker at the playhead |
