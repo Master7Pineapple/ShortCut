@@ -4357,29 +4357,69 @@ a door closing.
 | **J cut** | The **incoming** clip's sound starts **early**, under the outgoing picture. You hear the next line begin before you see who is saying it |
 
 `Shift+L` / `Shift+J`, the two toolbar buttons, or the **J / L cut** section in the clip
-inspector, which carries the length and says what it would do before either button is
-pressed. It lands on the cut the **selection** names — two adjacent clips selected is the
-clearest way there is to say which one — and falls back to the cut nearest the playhead,
-the same fast grab dropping a transition uses. Selecting the two clips shows the panel in
-the multi-selection branch, which is the gesture people reach for and which otherwise
-reached no panel at all.
+inspector. It lands on the cut the **selection** names — two adjacent clips selected is the
+clearest way there is to say which one, and in that branch the panel comes *first*, since
+it is usually why the pair was selected — and falls back to the cut nearest the playhead,
+the same fast grab dropping a transition uses.
 
-**Neither invents any audio.** What runs past the cut is the handle either side of it, so a
-clip trimmed to the end of what was recorded is refused with that sentence rather than
-stretched. The amount asked for is clamped to whatever handle is actually there, and the
-panel says when it has been.
+#### Setting the length before you cut
 
-Both are the same operation with the sign flipped, and in both the **total occupancy of the
-audio track is unchanged** — one clip gives up exactly what the other takes — so a split
-edit can never open a gap or leave an overlap, whichever tracks the two sit on:
+The length lives on `state.splitEdit.len` and there are two controls on it: a slider and a
+number box in the panel, and a number box in the **toolbar beside the two buttons**. The
+toolbar copy exists because those buttons are reachable with nothing selected, and "define
+the duration before I cut" has to work there too rather than only on a clip that happens to
+show the panel. `syncSplitEditToolbar()` keeps the two in step and never writes to the field
+that currently has focus.
 
-- **L**: B's audio head retreats by `d`, A's audio tail extends into the space.
-- **J**: A's audio tail retreats by `d`, B's audio head extends back into the space.
+**Changing it must not rebuild the panel**, and that was a real bug: the first version
+called `renderInspector()` on every `input` event, which replaced the very field being typed
+into — the first keystroke landed, the input was destroyed and the caret went with it, so
+the number could not be typed at all. Everything the length decides is refreshed *in place*
+by the panel's own `sync()`: the two buttons, their tooltips and the sentence underneath.
+
+It is a **setting**, like Tighten's: changing it snapshots no undo entry and dirties
+nothing. It only changes what the next button press would do.
+
+#### Two ways to open the same offset, and only one of them keeps the words
+
+A split edit is nothing but "the sound cut and the picture cut are `d` apart". There are two
+ways to get there and they are not equally good. **Keep the sound whole** picks between
+them, and it is **on by default**.
+
+| Mode | What moves |
+| --- | --- |
+| `picture` (**Keep the sound whole**, the default) | The **picture** cut moves and **no audio is touched at all**. For an L cut it goes `d` *earlier*: A's picture ends sooner and B's picture is lengthened at its head out of B's own handle. A's sound, which nobody trimmed, now runs `d` past the picture cut — which is exactly an L cut |
+| `sound` (the option off) | The audio edit **rolls**, which is the classic move. For an L cut, B's audio head retreats by `d` and A's audio tail extends into the space — and B's sound now starts `d` into its own take, so if B was already speaking on the first frame, **the first word is gone** |
+
+`picture` is strictly better wherever the handle exists, and that is why it is the default:
+
+- **Nothing spoken is lost.** Neither audio clip is trimmed by so much as a frame. A split
+  edit should not quietly decide to drop half a sentence.
+- **Lip sync survives.** A picture clip's `start` and `in` move together by the same amount,
+  so every frame still lands on the sound it was recorded with — B's picture at the old cut
+  point shows exactly the source frame it did before.
+- **The timeline does not get longer and no gap opens**: one picture clip gives up exactly
+  what the other takes, the same conservation the `sound` route has on the audio track.
+
+What it needs is picture **handle** on the clip being lengthened. Without it the sound edit
+is rolled instead — announced in the status line and on the panel, never silently, because
+it is a different edit and it is the one that can clip a word.
+
+Whose audio has to exist depends on the direction and on the mode. The clip whose sound runs
+past the picture cut must have some — the outgoing clip on an L, the incoming one on a J —
+and in `sound` mode both must, because both edges move. That asymmetry is what lets an L cut
+run a voice under **silent B-roll**, which is the commonest split edit there is.
+
+**Neither mode invents any audio.** What runs past the cut is the handle either side of it,
+so a clip trimmed to the end of what was recorded is refused with that sentence rather than
+stretched, and the amount asked for is clamped to whatever handle is actually there.
 
 The edges move with the same arithmetic `startTrim()` uses — a wanted **timeline** length
 converted to a source point through `Speed` — rather than by adding seconds to `in`/`out`.
 Under a ramp those are different numbers, and a split edit that drifted by the rate at the
-cut would be the exact preview/export mismatch this codebase is built to avoid.
+cut would be the exact preview/export mismatch this codebase is built to avoid. `grow` gains
+`d` at one edge and `give` loses `d` at the opposite one, in both modes and both directions,
+which is why there is one pair of calls rather than four.
 
 **The A/V link is kept.** It is tempting to unlink, since the two halves no longer line up —
 but `startMove()` moves a whole link group by one delta and `startTrim()` measures each

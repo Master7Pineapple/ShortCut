@@ -88,6 +88,8 @@
           <button id="btnAddTransition" title="Drop a transition on the nearest cut (T). Double-clicking a cut does the same.">+ Transition</button>
           <button id="btnJCut" title="J cut (Shift+J): the incoming clip's sound starts early, under the outgoing picture. Applied to the two selected clips, or to the cut nearest the playhead.">J cut</button>
           <button id="btnLCut" title="L cut (Shift+L): the outgoing clip's sound runs on under the incoming picture. Applied to the two selected clips, or to the cut nearest the playhead.">L cut</button>
+          <input id="jlLen" class="tc-num jl-len" type="number" min="0.02" max="10" step="0.05" value="0.5" title="How far a J or L cut slides the sound past the picture, in seconds. Set it before you press the button. Clamped to whatever handle is actually there." />
+          <label class="snap" title="Move the PICTURE cut instead of the sound edit, so neither clip's audio is trimmed and nothing spoken is lost. Needs picture handle on the clip being lengthened; without it the sound edit is rolled instead and it says so."><input id="jlKeep" type="checkbox" checked /> Keep sound</label>
           <button id="btnAddMarker" title="Drop a marker at the playhead (M). Clips snap to markers. Drag one in the lane below the ruler to move it, double-click to rename, right-click to remove.">+ Mark</button>
           <button id="btnAddAdjust" title="Add an adjustment layer (E): a clip that carries an effect stack and applies it to everything underneath it, on every track below its own.">+ Adjust</button>
         </div>

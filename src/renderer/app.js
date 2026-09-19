@@ -52,10 +52,11 @@ const state = {
   /** Tighten's settings. Not timeline state: changing them snapshots no undo entry and
    *  dirties nothing, it only changes what the next Tighten would remove. */
   tighten: { threshold: 0.35, pad: 0.05, noise: -30 },
-  /** How far a J or an L cut slides the sound past the picture, in seconds. A setting
-   *  like Tighten's: changing it snapshots no undo entry, it only changes what the next
-   *  one would do. See `splitEdit()`. */
-  splitEdit: { len: 0.5 },
+  /** How far a J or an L cut slides the sound past the picture, and whether it does it
+   *  by moving the PICTURE (which loses no sound at all) or by rolling the audio edit.
+   *  Settings like Tighten's: changing one snapshots no undo entry, it only changes what
+   *  the next one would do. See `splitEdit()`. */
+  splitEdit: { len: 0.5, keepSpeech: true },
   /** Caption settings - the look and the phrasing, not the words. Settings like
    *  Tighten's: changing one snapshots no undo entry, it only changes what the next
    *  Generate would produce. Saved in the .scut so a project keeps its caption style. */
@@ -1043,54 +1044,131 @@ function splitEditPanel(clip) {
     'J starts ' + r.b.name + '’s sound early, under ' + r.a.name + '. ' +
     'Neither invents any audio - what runs past the cut is the handle either side of it.'));
 
+  /*
+   * THE LENGTH IS SET BEFORE THE CUT, AND SETTING IT MUST NOT REBUILD THE PANEL.
+   *
+   * It used to call `renderInspector()` on every `input` event, which replaced the very
+   * field being typed into - so the first keystroke landed, the input was destroyed and
+   * the caret went with it, and the number simply could not be typed. Everything that
+   * depends on the length is refreshed IN PLACE by `sync()` instead: the two buttons,
+   * their tooltips, and the sentence underneath. Nothing is rebuilt, so focus stays.
+   */
   const row = el('div', 'tc-row');
   row.appendChild(el('label', 'tc-label', 'Slide by'));
+  const rng = el('input');
+  rng.type = 'range';
+  rng.min = '0.05'; rng.max = '3'; rng.step = '0.01';
+  rng.value = String(state.splitEdit.len);
   const num = el('input', 'tc-num');
   num.type = 'number';
   num.min = '0.02'; num.max = '10'; num.step = '0.05';
   num.value = String(state.splitEdit.len);
   num.title = 'How far the sound runs past the picture, in seconds. Clamped to whatever ' +
-    'handle is actually there.';
-  // A setting, like Tighten's: it snapshots no undo entry and dirties nothing. It only
-  // changes what the next button press would do.
-  num.addEventListener('keydown', (e) => e.stopPropagation());
-  num.addEventListener('input', () => {
-    state.splitEdit.len = splitEditLen(num.value);
-    renderInspector();
-  });
+    'handle is actually there. The slider stops at 3s; the box takes any value.';
+  row.appendChild(rng);
   row.appendChild(num);
-  TextUI.attachWheel(num, {
-    step: 0.05, min: 0.02, max: 10,
-    get: () => state.splitEdit.len,
-    set: (v) => { state.splitEdit.len = splitEditLen(v); renderInspector(); },
-  });
+  const rst = el('button', 'tc-reset', '↺');
+  rst.title = 'Back to 0.5s';
+  row.appendChild(rst);
   box.appendChild(row);
 
+  const keepRow = el('div', 'tc-row');
+  keepRow.appendChild(el('label', 'tc-label', 'Keep the sound whole'));
+  const keep = el('input');
+  keep.type = 'checkbox';
+  keep.checked = state.splitEdit.keepSpeech !== false;
+  keep.title = 'ON: move the PICTURE cut instead of the sound edit, so neither clip’s ' +
+    'audio is trimmed by a single frame and nothing spoken is lost. It needs picture ' +
+    'handle on the clip being lengthened; without it the sound edit is rolled instead, ' +
+    'and it says so.\nOFF: roll the sound edit. That is the classic move, and it is the ' +
+    'one that can clip the first or last word of a take.';
+  keepRow.appendChild(keep);
+  box.appendChild(keepRow);
+
+  const note = el('div', 'tc-hint');
+  box.appendChild(note);
+
   const btns = el('div', 'fx-add');
+  const made = {};
   for (const kind of ['J', 'L']) {
-    const plan = splitEditPlan(kind);
     const b = el('button', 'mini', kind + ' cut');
-    b.disabled = !!plan.why;
-    b.title = plan.why || (kind === 'L'
-      ? r.a.name + '’s sound runs on ' + plan.d.toFixed(2) + 's under ' + r.b.name
-      : r.b.name + '’s sound starts ' + plan.d.toFixed(2) + 's early');
     b.addEventListener('click', () => splitEdit(kind));
+    made[kind] = b;
     btns.appendChild(b);
   }
   box.appendChild(btns);
 
-  // The reason it is refused, on screen rather than only in a tooltip: a disabled button
-  // with no sentence beside it is the shape people file a bug about.
-  const bad = ['J', 'L'].map((k) => splitEditPlan(k)).find((pl) => pl.why);
-  if (bad) box.appendChild(el('div', 'tc-hint fx-warn', bad.why));
-  else {
-    const pl = splitEditPlan('L');
-    if (pl.clamped) {
-      box.appendChild(el('div', 'tc-hint fx-warn',
-        'Only ' + pl.room.toFixed(2) + 's of handle is there, so that is as far as it goes.'));
+  /** Everything the length and the checkbox decide, refreshed without a rebuild. */
+  const sync = () => {
+    let warn = '', tell = '';
+    for (const kind of ['J', 'L']) {
+      const pl = splitEditPlan(kind);
+      const b = made[kind];
+      b.disabled = !!pl.why;
+      b.title = pl.why || ((kind === 'L'
+        ? r.a.name + '’s sound runs on ' + pl.d.toFixed(2) + 's under ' + r.b.name
+        : r.b.name + '’s sound starts ' + pl.d.toFixed(2) + 's early') +
+        (pl.mode === 'picture' ? ' - by moving the picture cut, losing no sound'
+          : ' - by rolling the sound edit'));
+      if (pl.why) { warn = warn || pl.why; continue; }
+      if (pl.fellBack) {
+        warn = warn || (kind + ' cut: no picture handle to lengthen, so the sound edit ' +
+          'would be rolled instead - which is the one that can clip a word.');
+      } else if (pl.clamped) {
+        warn = warn || (kind + ' cut: only ' + pl.room.toFixed(2) + 's of handle is ' +
+          'there, so that is as far as it goes.');
+      }
+      if (!tell) {
+        tell = pl.mode === 'picture'
+          ? 'The picture cut moves ' + pl.d.toFixed(2) + 's and no sound is trimmed.'
+          : 'The sound edit rolls by ' + pl.d.toFixed(2) + 's, so ' + pl.give.name +
+            ' loses that much off its ' + (pl.growEdge === 'out' ? 'head' : 'tail') + '.';
+      }
     }
-  }
+    note.textContent = warn || tell;
+    note.className = 'tc-hint' + (warn ? ' fx-warn' : '');
+  };
+  sync();
+
+  // A SETTING, like Tighten's: no undo entry, no dirty flag. It only changes what the next
+  // button press would do - so there is nothing to snapshot and nothing to redraw.
+  const setLen = (v, from) => {
+    state.splitEdit.len = splitEditLen(v);
+    if (from !== 'range') rng.value = String(clamp(state.splitEdit.len, 0.05, 3));
+    if (from !== 'num') num.value = String(state.splitEdit.len);
+    syncSplitEditToolbar();
+    sync();
+  };
+  rng.addEventListener('input', () => setLen(rng.value, 'range'));
+  num.addEventListener('keydown', (e) => e.stopPropagation());
+  num.addEventListener('input', () => setLen(num.value, 'num'));
+  rst.addEventListener('click', () => setLen(0.5));
+  const wheel = { step: 0.05, min: 0.02, max: 10,
+    get: () => state.splitEdit.len, set: (v) => setLen(v) };
+  TextUI.attachWheel(rng, wheel);
+  TextUI.attachWheel(num, wheel);
+  keep.addEventListener('change', () => {
+    state.splitEdit.keepSpeech = keep.checked;
+    syncSplitEditToolbar();
+    sync();
+  });
   return box;
+}
+
+/**
+ * The toolbar's copy of the two settings, kept in step with the panel's.
+ *
+ * Two controls on one number, because the buttons that use it are reachable from the
+ * toolbar with nothing selected - and "let me define the duration before I cut" has to
+ * work there too, or the only way to change it is to find a clip that happens to show
+ * the panel. The focused field is never written to, so typing into one is not undone by
+ * the other syncing back.
+ */
+function syncSplitEditToolbar() {
+  const len = $('#jlLen');
+  if (len && document.activeElement !== len) len.value = String(state.splitEdit.len);
+  const keep = $('#jlKeep');
+  if (keep) keep.checked = state.splitEdit.keepSpeech !== false;
 }
 
 /** The graphic clip the panel edits: the lead of the selection, or null. */
@@ -2358,17 +2436,17 @@ function renderInspector() {
     // A multi-selection is what a track head produces, so the audio chain and Tighten
     // both have to be reachable from one - "clean up this whole voice track" is the
     // commonest thing anybody wants to do to a track.
+    // FIRST, because two adjacent clips selected is the clearest way there is to say which
+    // cut a J or an L cut goes on - it is usually the reason the pair was selected at all,
+    // and it was reaching no panel before this branch offered one.
+    const jl = splitEditPanel(null);
+    if (jl) box.appendChild(jl);
     const fxTargets = audioFxTargets(sel);
     if (fxTargets.length) {
       const lead = allClips().find((x) => x.clip === fxTargets[0]);
       box.appendChild(audioFxPanel(fxTargets[0], lead ? lead.track.name : null, fxTargets.slice(1)));
     }
     if (sel.some((x) => tightenAudioFor(x.clip))) box.appendChild(tightenPanel());
-    // Two adjacent clips selected is the clearest way there is to say which cut a J or an
-    // L cut goes on, and it is the gesture people reach for - so it has to be answered
-    // here rather than only from a single clip's panel.
-    const jl = splitEditPanel(null);
-    if (jl) box.appendChild(jl);
     return;
   }
   const c = row.clip;
@@ -4462,6 +4540,15 @@ function splitEditLen(v) {
   return isFinite(n) ? clamp(n, 0.02, 10) : 0.5;
 }
 
+/** The settings, filled in. `keepSpeech` defaults ON - see `splitEditPlan()`. */
+function normalizeSplitEdit(o) {
+  const src = o && typeof o === 'object' ? o : {};
+  return {
+    len: splitEditLen(src.len),
+    keepSpeech: src.keepSpeech !== false,
+  };
+}
+
 /** The audio clip linked to a picture clip, or null. */
 function linkedAudio(clip) {
   if (!clip || !clip.linkId) return null;
@@ -4535,46 +4622,114 @@ function splitEditTarget() {
  * a button that is enabled and then reports failure is worse than one that says what is
  * missing before it is pressed.
  */
+/*
+ * THE TWO WAYS TO OPEN THE SAME OFFSET, and why one of them loses spoken words.
+ *
+ * A split edit is nothing but "the sound cut and the picture cut are `d` apart". There
+ * are two ways to get there, and they are not equally good:
+ *
+ *   'sound'    ROLL THE AUDIO EDIT. For an L cut, B's audio head retreats by d and A's
+ *              audio tail extends into the space. It is the obvious move and it has a
+ *              real cost: B's sound now starts d seconds into its own take, so if B was
+ *              already speaking on the first frame, the first word is gone.
+ *
+ *   'picture'  MOVE THE PICTURE CUT INSTEAD, and touch no audio at all. For an L cut the
+ *              picture cut goes d EARLIER: A's picture ends d sooner and B's picture is
+ *              lengthened at its head out of B's own handle. A's sound, which nobody
+ *              touched, now runs d past the picture cut - which is exactly an L cut.
+ *
+ * `picture` is the default, and it is strictly better wherever the handle exists:
+ *
+ *   - NOTHING SPOKEN IS LOST. Neither audio clip is trimmed by so much as a frame, which
+ *     is the whole point - a split edit should not decide to drop half a sentence.
+ *   - LIP SYNC SURVIVES. A picture clip's `start` and `in` move together by the same
+ *     amount, so every frame still lands on the sound it was recorded with. (B's picture
+ *     at the old cut point shows exactly the source frame it did before.)
+ *   - The timeline does not get longer and no gap opens: one picture clip gives up
+ *     exactly what the other takes.
+ *
+ * What it needs is picture HANDLE on the clip being lengthened - `(if stretchable)` - and
+ * when that is not there it says so and rolls the audio edit instead rather than refusing.
+ */
 function splitEditPlan(kind, want) {
   const r = splitEditTarget();
   if (!r) return { why: 'There is no cut on a video track to put a J or an L cut on.' };
   const audA = linkedAudio(r.a), audB = linkedAudio(r.b);
-  if (!audA || !audB) {
-    return { r, why: 'Both clips either side of the cut need linked audio. ' +
-      (audA ? r.b.name : r.a.name) + ' has none, so there is no sound to slide.' };
-  }
-  const rowA = allClips().find((x) => x.clip === audA);
-  const rowB = allClips().find((x) => x.clip === audB);
-  if ((rowA && rowA.track.locked) || (rowB && rowB.track.locked)) {
-    return { r, audA, audB, why: 'The audio track is locked.' };
+  // WHOSE SOUND RUNS PAST THE PICTURE CUT: the outgoing clip's on an L, the incoming
+  // clip's on a J. That one must have audio or there is no split edit to make. The other
+  // one only has to have audio in 'sound' mode, where its edge is what moves - which is
+  // what lets an L cut run a voice under silent B-roll, the commonest one there is.
+  const voice = kind === 'L' ? audA : audB;
+  const voiceName = kind === 'L' ? r.a.name : r.b.name;
+  if (!voice) {
+    return { r, why: voiceName + ' has no linked audio, so there is no sound to run past ' +
+      'the cut. A ' + kind + ' cut carries ' + (kind === 'L' ? 'the outgoing' : 'the incoming') +
+      ' clip’s sound.' };
   }
   const d = splitEditLen(want == null ? state.splitEdit.len : want);
+  const locked = (c) => {
+    const row = c && allClips().find((x) => x.clip === c);
+    return !!(row && row.track.locked);
+  };
+
   /*
-   * WHICH EDGE MOVES WHICH WAY. In both cases the total occupancy of the audio track is
-   * unchanged - one clip gives up exactly what the other takes - so a split edit can
-   * never open a gap or an overlap, whichever track the two sit on.
-   *
-   *   L: B's audio head retreats by d, A's audio tail extends into the space.
-   *   J: A's audio tail retreats by d, B's audio head extends back into the space.
+   * 'picture': the picture cut moves, the sound is not touched.
+   *   L - the cut goes EARLIER: B's picture grows at its head, A's picture gives up its tail.
+   *   J - the cut goes LATER:   A's picture grows at its tail, B's picture gives up its head.
    */
-  const grow = kind === 'L' ? audA : audB;
-  const give = kind === 'L' ? audB : audA;
-  const growEdge = kind === 'L' ? 'out' : 'in';
-  const room = Math.min(
-    handleRoom(grow, growEdge),
-    Math.max(0, clipLen(give) - SPLIT_EDIT_MINLEN),
+  const pGrow = kind === 'L' ? r.b : r.a;
+  const pGive = kind === 'L' ? r.a : r.b;
+  const pEdge = kind === 'L' ? 'in' : 'out';
+  const pRoom = (locked(pGrow) || locked(pGive)) ? 0 : Math.min(
+    handleRoom(pGrow, pEdge),
+    Math.max(0, clipLen(pGive) - SPLIT_EDIT_MINLEN));
+
+  /*
+   * 'sound': the audio edit rolls. Both sides need audio here, because both edges move.
+   * The total occupancy of the audio track is unchanged either way - one clip gives up
+   * exactly what the other takes - so this can never open a gap or leave an overlap.
+   */
+  const sGrow = kind === 'L' ? audA : audB;
+  const sGive = kind === 'L' ? audB : audA;
+  const sEdge = kind === 'L' ? 'out' : 'in';
+  const sRoom = (!audA || !audB || locked(audA) || locked(audB)) ? 0 : Math.min(
+    handleRoom(sGrow, sEdge),
+    Math.max(0, clipLen(sGive) - SPLIT_EDIT_MINLEN),
     // Only when the two are on DIFFERENT tracks: on the same one the clip in the way is
     // the one stepping aside, and it is excluded.
-    neighbourRoom(grow, kind === 'L' ? 1 : -1, give));
+    neighbourRoom(sGrow, kind === 'L' ? 1 : -1, sGive));
+
+  const want1 = state.splitEdit.keepSpeech ? 'picture' : 'sound';
+  const other = want1 === 'picture' ? 'sound' : 'picture';
+  const roomOf = (m) => (m === 'picture' ? pRoom : sRoom);
+  // The asked-for mode if it has any room at all, else the other one. A fallback is
+  // ANNOUNCED rather than silent - it is a different edit, and one that can lose a word.
+  const mode = roomOf(want1) > 0.005 ? want1 : (roomOf(other) > 0.005 ? other : want1);
+  const room = roomOf(mode);
+
   if (!(room > 0.005)) {
-    const noHandle = handleRoom(grow, growEdge) <= 0.005;
-    return { r, audA, audB, grow, give, room: 0, why: noHandle
-      ? 'There is no audio handle past the cut on ' + grow.name + ' - the trimmed clip ' +
-        'already reaches the end of what was recorded, so there is nothing to run on.'
-      : 'There is no room here: ' + give.name + ' would be trimmed away to nothing.' };
+    const noHandle = handleRoom(want1 === 'picture' ? pGrow : sGrow,
+      want1 === 'picture' ? pEdge : sEdge) <= 0.005;
+    return { r, audA, audB, room: 0, why: want1 === 'picture'
+      ? (noHandle
+        ? 'There is no picture handle on ' + pGrow.name + ' to lengthen it with, and no ' +
+          'audio handle to roll the sound edit with either - both clips are already ' +
+          'trimmed to the ends of what was recorded.'
+        : 'There is no room here: ' + pGive.name + ' would be trimmed away to nothing.')
+      : (noHandle
+        ? 'There is no audio handle past the cut on ' + sGrow.name + ' - the trimmed clip ' +
+          'already reaches the end of what was recorded, so there is nothing to run on.'
+        : 'There is no room here: ' + sGive.name + ' would be trimmed away to nothing.') };
   }
-  return { r, audA, audB, grow, give, growEdge, d: Math.min(d, room), room,
-    clamped: d > room + 1e-6 };
+  return {
+    r, audA, audB, mode, room,
+    grow: mode === 'picture' ? pGrow : sGrow,
+    give: mode === 'picture' ? pGive : sGive,
+    growEdge: mode === 'picture' ? pEdge : sEdge,
+    d: Math.min(d, room),
+    clamped: d > room + 1e-6,
+    fellBack: mode !== want1,
+  };
 }
 
 /**
@@ -4602,20 +4757,30 @@ function splitEdit(kind, want) {
       c.start = Math.max(0, end0 - clipLen(c));
     }
   };
-  if (kind === 'L') {
-    shift(give, 'in', -d);      // B's audio starts later
-    shift(grow, 'out', d);      // A's audio runs on into the space
+  // `grow` gains d at `growEdge` and `give` loses d at the opposite edge, in both modes
+  // and in both directions - which is why there is one pair of calls rather than four.
+  if (plan.growEdge === 'in') {
+    shift(give, 'out', -d);
+    shift(grow, 'in', d);
   } else {
-    shift(give, 'out', -d);     // A's audio ends earlier
-    shift(grow, 'in', d);       // B's audio starts early, into the space
+    shift(give, 'in', -d);
+    shift(grow, 'out', d);
   }
   markDirty();
   renderAll();
-  setStatus((kind === 'L' ? 'L cut' : 'J cut') + ' at ' + fmtTc(r.cut) + ': ' +
-    (kind === 'L' ? r.a.name + '’s sound runs ' + d.toFixed(2) + 's under ' + r.b.name
-      : r.b.name + '’s sound starts ' + d.toFixed(2) + 's before its picture') +
-    (plan.clamped ? ' (shortened to the handle that was there)' : ''));
-  return { kind, d, cut: r.cut };
+  const what = kind === 'L'
+    ? r.a.name + '’s sound runs ' + d.toFixed(2) + 's under ' + r.b.name
+    : r.b.name + '’s sound starts ' + d.toFixed(2) + 's before its picture';
+  const how = plan.mode === 'picture'
+    ? ' The picture cut moved ' + d.toFixed(2) + 's ' + (kind === 'L' ? 'earlier' : 'later') +
+      ' and no sound was trimmed.'
+    : ' The sound edit was rolled, so ' + plan.give.name + ' lost ' + d.toFixed(2) + 's.';
+  setStatus((kind === 'L' ? 'L cut' : 'J cut') + ' at ' + fmtTc(r.cut) + ': ' + what + '.' + how +
+    (plan.fellBack ? ' (There was no picture handle to lengthen, so the sound edit was ' +
+      'rolled instead - that is the one that can clip a word.)' : '') +
+    (plan.clamped ? ' Shortened to the ' + plan.room.toFixed(2) + 's of handle that was there.'
+      : ''), plan.fellBack ? 'err' : '');
+  return { kind, d, cut: r.cut, mode: plan.mode };
 }
 
 /** Every clip that must move with `clip` because of A/V linking. */
@@ -7526,7 +7691,7 @@ function newProject() {
   state.filePath = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
-  state.splitEdit = { len: 0.5 };
+  state.splitEdit = normalizeSplitEdit(null);
   state.captions = Object.assign({}, Captions.DEFAULTS);
   state.presetList = PresetList.defaults();
   state.sfx = SFX.defaultOpts();
@@ -8510,7 +8675,7 @@ async function openProject(filePath) {
   state.selTransition = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
-  state.splitEdit = { len: splitEditLen((d.splitEdit || {}).len) };
+  state.splitEdit = normalizeSplitEdit(d.splitEdit);
   state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
   state.presetList = PresetList.normalize(d.presetList);
   state.sfx = SFX.normalizeOpts(d.sfx);
@@ -12731,6 +12896,23 @@ $('#btnAddMarker').addEventListener('click', () => addMarker());
 $('#btnAddAdjust').addEventListener('click', () => addAdjustClip());
 $('#btnJCut').addEventListener('click', () => splitEdit('J'));
 $('#btnLCut').addEventListener('click', () => splitEdit('L'));
+// The length and the option, beside the two buttons that use them - so both can be set
+// with nothing selected, which is where those buttons live.
+$('#jlLen').addEventListener('keydown', (e) => e.stopPropagation());
+$('#jlLen').addEventListener('input', () => {
+  state.splitEdit.len = splitEditLen($('#jlLen').value);
+  renderInspector();          // the panel, if it is open, follows the toolbar
+});
+TextUI.attachWheel($('#jlLen'), {
+  step: 0.05, min: 0.02, max: 10,
+  get: () => state.splitEdit.len,
+  set: (v) => { state.splitEdit.len = splitEditLen(v); syncSplitEditToolbar(); renderInspector(); },
+});
+$('#jlKeep').addEventListener('change', () => {
+  state.splitEdit.keepSpeech = $('#jlKeep').checked;
+  renderInspector();
+});
+syncSplitEditToolbar();
 $('#btnDelTransition').addEventListener('click', () => deleteTransition());
 
 // Closing the drawer just clears the selection - the drawer follows the selected card.
