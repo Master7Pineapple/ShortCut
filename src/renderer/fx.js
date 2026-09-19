@@ -280,6 +280,23 @@
     { value: 'settle', label: 'Scale towards the frame (can show the background)' },
     { value: 'push', label: 'Push in from the full frame (never shows the background)' },
   ];
+  /* The shapes a mask can be cut to. UP HERE, with the other option lists, and not
+     beside `fillMaskShape()` where the rest of the shape code lives: `DEFS` is an object
+     LITERAL and a schema row reads this while it is being built, so a `const` declared
+     after `DEFS` would be in its temporal dead zone and the whole module would throw on
+     load. `fillMaskShape()` itself is a function declaration and hoists, which is why
+     only the list had to move. */
+  const MASK_SHAPE_OPTIONS = [
+    { value: 'ellipse', label: 'Ellipse' },
+    { value: 'circle', label: 'Circle' },
+    { value: 'rect', label: 'Rounded rectangle' },
+    { value: 'diamond', label: 'Diamond' },
+    { value: 'triangle', label: 'Triangle' },
+    { value: 'pentagon', label: 'Pentagon' },
+    { value: 'hexagon', label: 'Hexagon' },
+    { value: 'star', label: 'Star' },
+  ];
+
   const SLIDE_FROM_OPTIONS = [
     { value: 'bottom', label: 'Bottom' }, { value: 'top', label: 'Top' },
     { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' },
@@ -1490,14 +1507,9 @@
         // 2. the mask: WHITE WITH ALPHA, feathered by blurring that alpha.
         const mask = clean(L.surface, 'fxSpM', W, H);
         mask.c.fillStyle = 'rgba(255,255,255,1)';
-        if (String(p.shape) === 'ellipse') {
-          mask.c.beginPath();
-          mask.c.ellipse(box.x + box.w / 2, box.y + box.h / 2, box.w / 2, box.h / 2, 0, 0, Math.PI * 2);
-          mask.c.fill();
-        } else {
-          roundRectPath(mask.c, box.x, box.y, box.w, box.h, pxMin(p.radius, W, H));
-          mask.c.fill();
-        }
+        // The shared shape - see `fillMaskShape()`. At no rotation its 'rect' and
+        // 'ellipse' are the two lines that used to be written out here, to the pixel.
+        fillMaskShape(mask.c, p.shape, box, pxMin(p.radius, W, H), 0);
         let maskCv = mask.cv;
         const fr = pxMin(p.feather, W, H);
         if (fr > 0.05) {
@@ -1537,6 +1549,115 @@
         reset(rest.c);
         L.c.drawImage(rest.cv, 0, 0);
         L.c.drawImage(hole.cv, 0, 0);
+      },
+    },
+
+    /*
+     * BLUR SURROUND. A vignette made of softness instead of shadow.
+     *
+     * A `round` vignette darkens the edges and a `spotlight` darkens AND blurs them; this
+     * one only ever blurs, which is the look that keeps a bright frame bright while still
+     * pulling the eye to the middle. Nothing here dims anything, deliberately - reaching
+     * for this and getting a darker picture is the reason it is a type of its own rather
+     * than a spotlight with `dim` at 0.
+     *
+     * INVERTED IT BLURS THE INSIDE, which is the other half of what it is for: a face, a
+     * name badge or a licence plate blurred out, and - because it takes the same binding
+     * the spotlight does - one that FOLLOWS. Bind it to a track and the blurred patch
+     * stays on the thing it is hiding.
+     *
+     * Every number on it keyframes, through `Anim`, exactly as every other effect's does:
+     * the shape can open up, drift, rotate and soften across a shot without any of that
+     * being written here. That falls out of `FX.paramAt()` reading `.keys` and is the
+     * reason adding a type is one entry in this table.
+     */
+    blursurround: {
+      label: 'Blur surround',
+      // The same binding a spotlight takes, and the same answer: the SHAPE follows the
+      // point and the picture stays still. `x`/`y` are the shape's top-left corner, so
+      // the tracked point is centred in it rather than sat in its corner.
+      bind: {
+        label: 'Follow a track',
+        hint: 'Centres the shape on the tracked point, plus the offset. Size, feather ' +
+          'and blur still come from the sliders - so a blurred-out face follows the face.',
+        apply(p, pos, off) {
+          p.x = pos.x + (Number(off.x) || 0) - (Number(p.w) || 0) / 2;
+          p.y = pos.y + (Number(off.y) || 0) - (Number(p.h) || 0) / 2;
+        },
+      },
+      params: {
+        shape: 'ellipse',
+        x: 0.08, y: 0.22, w: 0.84, h: 0.56,
+        radius: 0.04,
+        rotate: 0,
+        feather: 0.06,
+        amount: 0.035,
+        invert: 0,
+      },
+      schema: [
+        { path: 'params.shape', label: 'Shape', type: 'select', options: MASK_SHAPE_OPTIONS },
+        { path: 'params.x', label: 'X', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.y', label: 'Y', type: 'range', min: -0.5, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.w', label: 'Width', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.h', label: 'Height', type: 'range', min: 0.01, max: 1.5, step: 0.002, digits: 3 },
+        { path: 'params.radius', label: 'Corner radius', type: 'range', min: 0, max: 0.25, step: 0.002, digits: 3 },
+        { path: 'params.rotate', label: 'Rotation', type: 'range', min: -180, max: 180, step: 1, unit: '°', digits: 0 },
+        { path: 'params.feather', label: 'Feather', type: 'range', min: 0, max: 0.3, step: 0.002, digits: 3 },
+        { path: 'params.amount', label: 'Blur', type: 'range', min: 0, max: 0.25, step: 0.002, digits: 3 },
+        { path: 'params.invert', label: 'Blur the inside instead', type: 'check' },
+      ],
+      /**
+       * Three plates, and the mask is an ALPHA mask.
+       *
+       * That last part is the trap this file has now hit four times. `destination-in`
+       * composites on the ALPHA CHANNEL: a mask painted as opaque black-and-white is
+       * opaque everywhere, so it masks NOTHING and the sharp region comes out as the whole
+       * frame. The fill is rgba(255,255,255,1) and the feather is a blur of THAT ALPHA
+       * falling away to rgba(255,255,255,0), never a fade towards black - which would look
+       * correct on a white plate and mask nothing at all.
+       *
+       * The picture blur is edge-EXTENDED (`padBlur(..., true)`) because it is a
+       * full-frame picture and the surround would otherwise pull a soft dark rim in from
+       * the frame edge. The feather is not, because a feather has to fall away into
+       * transparency - that is the whole of what it is.
+       */
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const br = pxMin(p.amount, W, H);
+        if (!(br > 0.05)) return;                 // no blur asked for: a free no-op
+        const box = spotRect(p, W, H);
+        if (!(box.w > 0.5 && box.h > 0.5)) return;
+        const src = take(L, 'fxBsA');
+
+        // 1. the whole frame, blurred: what the surround will be.
+        const soft = clean(L.surface, 'fxBsB', W, H);
+        const b = padBlur(src, br, W, H, L.surface, 'fxBsP', true);
+        soft.c.drawImage(b.cv, b.pad, b.pad, W, H, 0, 0, W, H);
+
+        // 2. the shape, as alpha, feathered by blurring that alpha.
+        const mask = clean(L.surface, 'fxBsM', W, H);
+        mask.c.fillStyle = 'rgba(255,255,255,1)';
+        fillMaskShape(mask.c, p.shape, box, pxMin(p.radius, W, H), p.rotate);
+        let maskCv = mask.cv;
+        const fr = pxMin(p.feather, W, H);
+        if (fr > 0.05) {
+          const fb = padBlur(mask.cv, fr, W, H, L.surface, 'fxBsF', false);
+          const crop = clean(L.surface, 'fxBsM2', W, H);
+          crop.c.drawImage(fb.cv, fb.pad, fb.pad, W, H, 0, 0, W, H);
+          maskCv = crop.cv;
+        }
+
+        // 3. the sharp original, kept only where the mask says so - or only where it does
+        // NOT, which is the whole of the inverted mode. Same two plates either way, so
+        // the geometry is never derived twice.
+        const sharp = clean(L.surface, 'fxBsC', W, H);
+        sharp.c.drawImage(src, 0, 0);
+        sharp.c.globalCompositeOperation = Number(p.invert) ? 'destination-out' : 'destination-in';
+        sharp.c.drawImage(maskCv, 0, 0);
+        reset(sharp.c);
+
+        L.c.drawImage(soft.cv, 0, 0);
+        L.c.drawImage(sharp.cv, 0, 0);
       },
     },
 
@@ -2023,6 +2144,84 @@
       w: Math.max(0, Number(p.w) || 0) * W,
       h: Math.max(0, Number(p.h) || 0) * H,
     };
+  }
+
+  /**
+   * The unit outline of each polygon shape, in -1..1 about its own centre.
+   *
+   * Unit coordinates rather than pixels, so one table serves every size and aspect: the
+   * box's half-extents scale them, which is what makes a star in a wide box a wide star
+   * rather than a star with a wrong-shaped bounding box.
+   */
+  function regularPoly(n, rot) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a = rot + i * Math.PI * 2 / n;
+      out.push([Math.cos(a), Math.sin(a)]);
+    }
+    return out;
+  }
+  function starPoly(points, inner) {
+    const out = [];
+    for (let i = 0; i < points * 2; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / points;
+      const r = i % 2 ? inner : 1;
+      out.push([Math.cos(a) * r, Math.sin(a) * r]);
+    }
+    return out;
+  }
+  const MASK_SHAPES = {
+    rect: null,             // the rounded rect, which is not a polygon
+    ellipse: null,          // an arc, likewise
+    circle: null,
+    diamond: [[0, -1], [1, 0], [0, 1], [-1, 0]],
+    triangle: [[0, -1], [1, 1], [-1, 1]],
+    hexagon: regularPoly(6, 0),
+    pentagon: regularPoly(5, -Math.PI / 2),
+    star: starPoly(5, 0.45),
+  };
+
+  /**
+   * Fill the mask shape into `c`. ONE implementation, for every effect that cuts a hole.
+   *
+   * It FILLS rather than handing a path back, and that is not tidiness: the rotation is
+   * applied as a transform about the box's own centre, and a path built under a transform
+   * carries device coordinates that are easy to get wrong once the transform is gone.
+   * Building and filling inside the same save/restore is the version that cannot.
+   *
+   * At `rotate` 0 the two original shapes are byte-identical to the two lines `spotlight`
+   * drew before this existed, which is what lets the spotlight share it without changing
+   * a single pixel of what it already did.
+   */
+  function fillMaskShape(c, shape, box, radiusPx, rotateDeg) {
+    const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+    const rot = (Number(rotateDeg) || 0) * Math.PI / 180;
+    c.save();
+    if (rot) { c.translate(cx, cy); c.rotate(rot); c.translate(-cx, -cy); }
+    const name = String(shape || 'rect');
+    const pts = MASK_SHAPES[name];
+    if (pts) {
+      c.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const x = cx + pts[i][0] * box.w / 2, y = cy + pts[i][1] * box.h / 2;
+        if (i) c.lineTo(x, y); else c.moveTo(x, y);
+      }
+      c.closePath();
+      c.fill();
+    } else if (name === 'ellipse') {
+      c.beginPath();
+      c.ellipse(cx, cy, box.w / 2, box.h / 2, 0, 0, Math.PI * 2);
+      c.fill();
+    } else if (name === 'circle') {
+      const r = Math.min(box.w, box.h) / 2;
+      c.beginPath();
+      c.ellipse(cx, cy, r, r, 0, 0, Math.PI * 2);
+      c.fill();
+    } else {
+      roundRectPath(c, box.x, box.y, box.w, box.h, radiusPx);
+      c.fill();
+    }
+    c.restore();
   }
 
   /**
@@ -3031,6 +3230,7 @@
     MASTER_TYPES, normalizeStack, masterActive, renderMaster, renderOver,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
     CHROME, chromeGeom, spotRect, cutoutRect, fitDraw,
+    MASK_SHAPES, MASK_SHAPE_OPTIONS, fillMaskShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else if (typeof window !== 'undefined') window.FX = API;

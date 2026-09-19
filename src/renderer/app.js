@@ -52,6 +52,10 @@ const state = {
   /** Tighten's settings. Not timeline state: changing them snapshots no undo entry and
    *  dirties nothing, it only changes what the next Tighten would remove. */
   tighten: { threshold: 0.35, pad: 0.05, noise: -30 },
+  /** How far a J or an L cut slides the sound past the picture, in seconds. A setting
+   *  like Tighten's: changing it snapshots no undo entry, it only changes what the next
+   *  one would do. See `splitEdit()`. */
+  splitEdit: { len: 0.5 },
   /** Caption settings - the look and the phrasing, not the words. Settings like
    *  Tighten's: changing one snapshots no undo entry, it only changes what the next
    *  Generate would produce. Saved in the .scut so a project keeps its caption style. */
@@ -1000,6 +1004,93 @@ function addAdjustClip(len) {
   log('Added an adjustment layer at ' + fmtTc(start) + '. Effects on it apply to every ' +
     'clip underneath it.');
   return clip;
+}
+
+/**
+ * The J / L cut panel. Offered when there is a cut in reach with sound on both sides.
+ *
+ * It says what it WOULD do before either button is pressed - which cut it has found, how
+ * far it can go, and what is missing when it cannot - because "apply it to these two"
+ * needs the two to be named back to you. A cut-level operation reached from a clip panel
+ * is otherwise a guess about which cut.
+ */
+function splitEditPanel(clip) {
+  const r = splitEditTarget();
+  if (!r) return null;
+  /*
+   * With a clip in hand it is offered only on the two the cut belongs to, so it does not
+   * follow the selection around the timeline offering to edit somewhere else. With NO
+   * clip - which is what the multi-selection branch passes - the selection has already
+   * named the cut, and that is the gesture this whole panel is for: select the two clips
+   * either side and press J or L. That branch shows "2 clips selected." and nothing else,
+   * so without this the commonest way of asking for a split edit reached no panel at all.
+   */
+  if (clip) {
+    if (!isPictureClip(clip)) return null;
+    if (clip !== r.a && clip !== r.b && !linkGroup(clip).some((c) => c === r.a || c === r.b)) {
+      return null;
+    }
+  }
+  const el = TextUI.el;
+  const box = el('div', 'fx-az jl-box');
+  const head = el('div', 'fx-head');
+  head.appendChild(el('b', null, 'J / L cut'));
+  head.appendChild(el('span', 'tc-hint', fmtTc(r.cut)));
+  box.appendChild(head);
+  box.appendChild(el('div', 'tc-hint fx-note',
+    'A split edit: the sound and the picture stop changing at the same moment. ' +
+    'L runs ' + r.a.name + '’s sound on under ' + r.b.name + '’s picture; ' +
+    'J starts ' + r.b.name + '’s sound early, under ' + r.a.name + '. ' +
+    'Neither invents any audio - what runs past the cut is the handle either side of it.'));
+
+  const row = el('div', 'tc-row');
+  row.appendChild(el('label', 'tc-label', 'Slide by'));
+  const num = el('input', 'tc-num');
+  num.type = 'number';
+  num.min = '0.02'; num.max = '10'; num.step = '0.05';
+  num.value = String(state.splitEdit.len);
+  num.title = 'How far the sound runs past the picture, in seconds. Clamped to whatever ' +
+    'handle is actually there.';
+  // A setting, like Tighten's: it snapshots no undo entry and dirties nothing. It only
+  // changes what the next button press would do.
+  num.addEventListener('keydown', (e) => e.stopPropagation());
+  num.addEventListener('input', () => {
+    state.splitEdit.len = splitEditLen(num.value);
+    renderInspector();
+  });
+  row.appendChild(num);
+  TextUI.attachWheel(num, {
+    step: 0.05, min: 0.02, max: 10,
+    get: () => state.splitEdit.len,
+    set: (v) => { state.splitEdit.len = splitEditLen(v); renderInspector(); },
+  });
+  box.appendChild(row);
+
+  const btns = el('div', 'fx-add');
+  for (const kind of ['J', 'L']) {
+    const plan = splitEditPlan(kind);
+    const b = el('button', 'mini', kind + ' cut');
+    b.disabled = !!plan.why;
+    b.title = plan.why || (kind === 'L'
+      ? r.a.name + '’s sound runs on ' + plan.d.toFixed(2) + 's under ' + r.b.name
+      : r.b.name + '’s sound starts ' + plan.d.toFixed(2) + 's early');
+    b.addEventListener('click', () => splitEdit(kind));
+    btns.appendChild(b);
+  }
+  box.appendChild(btns);
+
+  // The reason it is refused, on screen rather than only in a tooltip: a disabled button
+  // with no sentence beside it is the shape people file a bug about.
+  const bad = ['J', 'L'].map((k) => splitEditPlan(k)).find((pl) => pl.why);
+  if (bad) box.appendChild(el('div', 'tc-hint fx-warn', bad.why));
+  else {
+    const pl = splitEditPlan('L');
+    if (pl.clamped) {
+      box.appendChild(el('div', 'tc-hint fx-warn',
+        'Only ' + pl.room.toFixed(2) + 's of handle is there, so that is as far as it goes.'));
+    }
+  }
+  return box;
 }
 
 /** The graphic clip the panel edits: the lead of the selection, or null. */
@@ -2273,6 +2364,11 @@ function renderInspector() {
       box.appendChild(audioFxPanel(fxTargets[0], lead ? lead.track.name : null, fxTargets.slice(1)));
     }
     if (sel.some((x) => tightenAudioFor(x.clip))) box.appendChild(tightenPanel());
+    // Two adjacent clips selected is the clearest way there is to say which cut a J or an
+    // L cut goes on, and it is the gesture people reach for - so it has to be answered
+    // here rather than only from a single clip's panel.
+    const jl = splitEditPanel(null);
+    if (jl) box.appendChild(jl);
     return;
   }
   const c = row.clip;
@@ -2352,6 +2448,9 @@ function renderInspector() {
       : 'none', audioFxPanel(fxTarget.clip, fxTarget.viaLink));
   }
   if (tightenAudioFor(c)) add('tighten', 'Tighten', 'remove silence', tightenPanel());
+  // Beside Tighten: both are operations on the SOUND against the picture, and both are
+  // reached from whichever clip happens to be selected rather than from a cut object.
+  add('jl', 'J / L cut', 'split edit', splitEditPanel(c));
   // Above the stack, because the stack READS it: a binding row on an effect is only
   // offered once something has been tracked, so the tracker is the first of the two.
   add('place', 'Size and position', null, imagePlacePanel(c));
@@ -2744,11 +2843,29 @@ function fxBindSection(clip, fx, d, rowHooks, edit) {
     msel.addEventListener('change', () => edit(() => { fx.bind.mode = msel.value; }));
     mrow.appendChild(msel);
     nodes.push(mrow);
-    if ((fx.bind.mode || d.bind.modes[0].value) === 'camera') {
+    const mode = fx.bind.mode || d.bind.modes[0].value;
+    if (mode === 'camera') {
       nodes.push(el('div', 'tc-hint',
         'Panning the frame moves everything in it the OTHER way - which is what you want ' +
         'for the footage the track was solved on, and not what you want for a logo or a ' +
         'callout sitting over it.'));
+    }
+    // WHAT CROP MODE REACHES depends on what it is sitting on, and it has to say so.
+    // On an adjustment layer it does not move the layer at all - it slides the crop of
+    // the clips underneath, which is the only place the spare source pixels are.
+    if (mode === 'crop' && isAdjustClip(clip)) {
+      const under = cropTargets(clip);
+      nodes.push(el('div', 'tc-hint' + (under.length ? '' : ' fx-warn'), under.length
+        ? 'This slides the crop window of the ' + under.length + ' clip' +
+          (under.length === 1 ? '' : 's') + ' underneath this layer (' +
+          under.map((c) => c.name).join(', ') + '), so the point stays centred with no ' +
+          'black edge. The layer itself draws nothing.'
+        : 'Nothing is underneath this layer, so there is no crop window to slide. Move it ' +
+          'over the footage you want re-framed, or put it on a track above it.'));
+    } else if (mode === 'crop' && !isPictureClip(clip)) {
+      nodes.push(el('div', 'tc-hint fx-warn',
+        'This clip has no source, so it has no crop window to slide. Use Move, or put the ' +
+        'binding on an adjustment layer above the footage instead.'));
     }
   }
 
@@ -4313,6 +4430,192 @@ function snapDetail(t, movingIds) {
     if (d < bestD) { bestD = d; best = p; hit = true; }
   }
   return { t: best, hit, d: hit ? bestD : Infinity };
+}
+
+// ---- J cuts and L cuts (split edits) ---------------------------------------
+/*
+ * A SPLIT EDIT IS A CUT WHERE THE SOUND AND THE PICTURE DO NOT CHANGE AT THE SAME MOMENT,
+ * and it is the single most useful thing in an interview edit: it stops every cut landing
+ * like a door closing.
+ *
+ *   L cut  the OUTGOING clip's sound runs ON under the incoming picture. You see the new
+ *          shot while still hearing the old one finish its sentence. (The shape of the
+ *          letter L: the picture ends, the audio carries on below it.)
+ *   J cut  the INCOMING clip's sound starts EARLY, under the outgoing picture. You hear
+ *          the next line begin before you see who is saying it.
+ *
+ * Both are the same operation with the sign flipped, and neither invents any audio: the
+ * sound that runs past the cut is the handle either side of it, which is why a clip with
+ * no handle is refused rather than stretched.
+ *
+ * THE A/V LINK IS KEPT. It is tempting to unlink, since the two halves no longer line up
+ * - but `startMove()` moves a whole link group by one delta and `startTrim()` measures
+ * each member against its OWN original edge, so the offset a split edit opens survives
+ * being dragged and survives being trimmed. Unlinking would throw that away and leave two
+ * clips that have to be selected together by hand for the rest of the edit.
+ */
+
+const SPLIT_EDIT_MINLEN = 0.08;      // what must be left of the clip being shortened
+
+function splitEditLen(v) {
+  const n = Number(v);
+  return isFinite(n) ? clamp(n, 0.02, 10) : 0.5;
+}
+
+/** The audio clip linked to a picture clip, or null. */
+function linkedAudio(clip) {
+  if (!clip || !clip.linkId) return null;
+  return linkGroup(clip).find((c) => c.kind === 'audio' && c.src) || null;
+}
+
+/**
+ * How much longer this clip's head or tail could be pulled, in TIMELINE seconds.
+ *
+ * Measured by asking `clipLen()` rather than by subtracting source times, because under a
+ * speed ramp those are different numbers: a second of handle at half rate is two seconds
+ * of timeline. The edge is moved to its limit, measured, and put straight back - the clip
+ * is never left changed, and nothing else runs in between.
+ */
+function handleRoom(c, edge) {
+  if (!c) return 0;
+  const now = clipLen(c);
+  if (edge === 'in') {
+    const i = c.in;
+    c.in = 0;
+    const max = clipLen(c);
+    c.in = i;
+    return Math.max(0, max - now);
+  }
+  const o = c.out;
+  c.out = Math.max(c.in + 0.001, Number(c.mediaDuration) || c.out);
+  const max = clipLen(c);
+  c.out = o;
+  return Math.max(0, max - now);
+}
+
+/** The gap on this clip's own track before/after it, ignoring `skip`. Infinity if clear. */
+function neighbourRoom(clip, dir, skip) {
+  const row = allClips().find((x) => x.clip === clip);
+  if (!row) return Infinity;
+  let room = Infinity;
+  for (const c of row.track.clips) {
+    if (c === clip || c === skip) continue;
+    if (dir > 0 && c.start >= clipEnd(clip) - 1e-6) room = Math.min(room, c.start - clipEnd(clip));
+    if (dir < 0 && clipEnd(c) <= clip.start + 1e-6) room = Math.min(room, clip.start - clipEnd(c));
+  }
+  return Math.max(0, room);
+}
+
+/**
+ * The cut a J or an L cut would land on: the one the SELECTION names, else the nearest to
+ * the playhead.
+ *
+ * Two adjacent clips selected is the unambiguous way to say which cut, and it is what
+ * "apply it to these two" means. The playhead fallback is the same fast grab dropping a
+ * transition uses, so the two cut-level operations are reached the same way.
+ */
+function splitEditTarget() {
+  const cuts = allCuts().filter((c) => !c.track.locked);
+  if (!cuts.length) return null;
+  const nearest = (list) => list.reduce((m, c) =>
+    Math.abs(c.cut - state.playhead) < Math.abs(m.cut - state.playhead) ? c : m);
+  const sel = new Set();
+  for (const x of selectedClips()) for (const g of linkGroup(x.clip)) sel.add(g.id);
+  if (sel.size) {
+    const named = cuts.filter((c) => sel.has(c.a.id) && sel.has(c.b.id));
+    if (named.length) return nearest(named);
+  }
+  return nearest(cuts);
+}
+
+/**
+ * What a J or an L cut could do here, and why not when it cannot.
+ *
+ * Separate from `splitEdit()` because the PANEL needs the same answer without doing it:
+ * a button that is enabled and then reports failure is worse than one that says what is
+ * missing before it is pressed.
+ */
+function splitEditPlan(kind, want) {
+  const r = splitEditTarget();
+  if (!r) return { why: 'There is no cut on a video track to put a J or an L cut on.' };
+  const audA = linkedAudio(r.a), audB = linkedAudio(r.b);
+  if (!audA || !audB) {
+    return { r, why: 'Both clips either side of the cut need linked audio. ' +
+      (audA ? r.b.name : r.a.name) + ' has none, so there is no sound to slide.' };
+  }
+  const rowA = allClips().find((x) => x.clip === audA);
+  const rowB = allClips().find((x) => x.clip === audB);
+  if ((rowA && rowA.track.locked) || (rowB && rowB.track.locked)) {
+    return { r, audA, audB, why: 'The audio track is locked.' };
+  }
+  const d = splitEditLen(want == null ? state.splitEdit.len : want);
+  /*
+   * WHICH EDGE MOVES WHICH WAY. In both cases the total occupancy of the audio track is
+   * unchanged - one clip gives up exactly what the other takes - so a split edit can
+   * never open a gap or an overlap, whichever track the two sit on.
+   *
+   *   L: B's audio head retreats by d, A's audio tail extends into the space.
+   *   J: A's audio tail retreats by d, B's audio head extends back into the space.
+   */
+  const grow = kind === 'L' ? audA : audB;
+  const give = kind === 'L' ? audB : audA;
+  const growEdge = kind === 'L' ? 'out' : 'in';
+  const room = Math.min(
+    handleRoom(grow, growEdge),
+    Math.max(0, clipLen(give) - SPLIT_EDIT_MINLEN),
+    // Only when the two are on DIFFERENT tracks: on the same one the clip in the way is
+    // the one stepping aside, and it is excluded.
+    neighbourRoom(grow, kind === 'L' ? 1 : -1, give));
+  if (!(room > 0.005)) {
+    const noHandle = handleRoom(grow, growEdge) <= 0.005;
+    return { r, audA, audB, grow, give, room: 0, why: noHandle
+      ? 'There is no audio handle past the cut on ' + grow.name + ' - the trimmed clip ' +
+        'already reaches the end of what was recorded, so there is nothing to run on.'
+      : 'There is no room here: ' + give.name + ' would be trimmed away to nothing.' };
+  }
+  return { r, audA, audB, grow, give, growEdge, d: Math.min(d, room), room,
+    clamped: d > room + 1e-6 };
+}
+
+/**
+ * Apply a J or an L cut. ONE undo entry, and nothing at all when it cannot be done.
+ *
+ * The edges are moved with the same arithmetic `startTrim()` uses - a wanted TIMELINE
+ * length converted to a source point through `Speed` - rather than by adding seconds to
+ * `in`/`out`. Under a ramp those are different numbers, and a split edit that drifted by
+ * the rate at the cut would be the exact preview/export mismatch this codebase is built
+ * to avoid.
+ */
+function splitEdit(kind, want) {
+  const plan = splitEditPlan(kind, want);
+  if (plan.why) { setStatus(plan.why, 'err'); return null; }
+  const { grow, give, d, r } = plan;
+  pushUndo();
+  const shift = (c, edge, delta) => {
+    const end0 = c.start + clipLen(c);
+    const wanted = Math.max(SPLIT_EDIT_MINLEN, clipLen(c) + delta);
+    if (edge === 'out') {
+      c.out = clamp(Speed.advance(c, c.in, wanted), c.in + 0.001, c.mediaDuration);
+    } else {
+      c.in = clamp(Speed.retreat(c, c.out, wanted), 0, c.out - 0.001);
+      // A head move keeps the clip's END where it was, so its start follows its length.
+      c.start = Math.max(0, end0 - clipLen(c));
+    }
+  };
+  if (kind === 'L') {
+    shift(give, 'in', -d);      // B's audio starts later
+    shift(grow, 'out', d);      // A's audio runs on into the space
+  } else {
+    shift(give, 'out', -d);     // A's audio ends earlier
+    shift(grow, 'in', d);       // B's audio starts early, into the space
+  }
+  markDirty();
+  renderAll();
+  setStatus((kind === 'L' ? 'L cut' : 'J cut') + ' at ' + fmtTc(r.cut) + ': ' +
+    (kind === 'L' ? r.a.name + '’s sound runs ' + d.toFixed(2) + 's under ' + r.b.name
+      : r.b.name + '’s sound starts ' + d.toFixed(2) + 's before its picture') +
+    (plan.clamped ? ' (shortened to the handle that was there)' : ''));
+  return { kind, d, cut: r.cut };
 }
 
 /** Every clip that must move with `clip` because of A/V linking. */
@@ -7223,6 +7526,7 @@ function newProject() {
   state.filePath = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
+  state.splitEdit = { len: 0.5 };
   state.captions = Object.assign({}, Captions.DEFAULTS);
   state.presetList = PresetList.defaults();
   state.sfx = SFX.defaultOpts();
@@ -8139,6 +8443,7 @@ function serialize() {
     outPoint: state.outPoint,
     markers: state.markers,
     tighten: state.tighten,
+    splitEdit: state.splitEdit,
     captions: state.captions,
     presetList: state.presetList,
     sfx: state.sfx,
@@ -8205,6 +8510,7 @@ async function openProject(filePath) {
   state.selTransition = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
+  state.splitEdit = { len: splitEditLen((d.splitEdit || {}).len) };
   state.captions = Object.assign({}, Captions.DEFAULTS, d.captions);
   state.presetList = PresetList.normalize(d.presetList);
   state.sfx = SFX.normalizeOpts(d.sfx);
@@ -10473,16 +10779,110 @@ FX.setBinder((clip, bind, tLocal, W, H) => {
  * off the side of the frame therefore stops being centred rather than dragging the
  * picture off its own edge, which is the right failure of the two.
  */
+/** Is this an enabled `transform` bound to a track in `crop` mode? */
+function isCropBind(f) {
+  return !!f && f.type === 'transform' && f.bind && f.bind.track && f.bind.mode === 'crop';
+}
+
+/**
+ * The crop-mode binding that decides how `clip` is framed at `tLocal`, or null.
+ *
+ * TWO PLACES ONE CAN COME FROM, and the second is what this function exists for.
+ *
+ *   1. The clip's OWN stack, bound to a track on itself. The original case.
+ *   2. An ADJUSTMENT LAYER above it, covering this instant.
+ *
+ * (2) had to be a special case rather than falling out, and the reason is worth stating
+ * because it is the whole shape of the bug it fixes. An adjustment clip has no source and
+ * no crop window - `drawClipTo()` is never called for it - so "slide the crop window"
+ * cannot mean "slide mine". And by the time the composite reaches an adjustment layer the
+ * crop of everything underneath has already been applied: the frame it is handed is
+ * already 9:16, with no source pixels either side left to slide over. Every other follow
+ * mode works there because they push the finished frame around; this one had nothing to
+ * push. It silently did nothing, which is the worst of the three possible answers.
+ *
+ * So a crop binding on an adjustment layer reaches DOWN: it slides the crop of the clips
+ * beneath it, before they are drawn. That is the only place the spare source pixels exist,
+ * and it is what the mode promises - follow the point with no black edge.
+ *
+ * The NEAREST adjustment layer above wins. A crop has one answer, and two of them stacked
+ * is not a picture, it is a question.
+ *
+ * The tracked point comes back in the OWNER's source fractions, and they are used against
+ * the drawn clip's own source directly. That is exact when the two are the same footage,
+ * which is the case this is for - an adjustment layer over the shot whose track it follows
+ * - and a defined proportional position otherwise, which is the same thing every other
+ * cross-clip binding already does with a point measured somewhere else.
+ */
+function cropBindFor(clip, tLocal) {
+  if (!clip) return null;
+  // The clip's own, first: a binding on the picture beats one hanging over it, because it
+  // is the more specific of the two and it is the one the author put on this clip.
+  if (Tracker.hasTracks(clip)) {
+    const own = FX.active(clip).find(isCropBind);
+    // Same clip only for this route. A crop is a window onto THIS clip's source, and the
+    // cross-clip case now has a route of its own - an adjustment layer - which is where
+    // it belongs: something that follows another clip's track is not this clip's effect.
+    if (own && (!own.bind.clip || own.bind.clip === clip.id)) {
+      return { entry: own, owner: clip, tSrc: srcAt(clip, tLocal), tKeys: tLocal };
+    }
+  }
+  // An adjustment layer above it. `state.tracks` is display order, so index 0 is the top
+  // and anything with a LOWER index than this clip's track is over it.
+  const mine = state.tracks.findIndex((t) => t.clips.indexOf(clip) >= 0);
+  if (mine <= 0) return null;
+  const tl = clip.start + tLocal;
+  for (let i = mine - 1; i >= 0; i--) {
+    const t = state.tracks[i];
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const a of t.clips) {
+      if (!isAdjustClip(a)) continue;
+      if (tl < a.start - 1e-6 || tl >= clipEnd(a) - 1e-6) continue;
+      const e = FX.active(a).find(isCropBind);
+      if (!e) continue;
+      const owner = bindOwner(a, e.bind);
+      // A binding to a clip that has been deleted degrades to the sliders, exactly as it
+      // does everywhere else - it does not stop the search finding a working one higher up.
+      if (!owner || !Tracker.trackById(owner, e.bind.track)) continue;
+      // The keys live on the ADJUSTMENT clip's own local time, and the samples live on the
+      // OWNER's source time. They are different numbers here and that is why `bindPos()`
+      // takes them separately.
+      return { entry: e, owner, tSrc: srcAt(owner, tl - owner.start), tKeys: tl - a.start };
+    }
+  }
+  return null;
+}
+
+/**
+ * The picture clips an adjustment layer's crop binding would re-frame, right now.
+ *
+ * The panel's readout only - the draw asks the question the other way round, per clip, in
+ * `cropBindFor()`. Two answers derived from one rule would be the pair that drifts, so
+ * this one is deliberately about SAYING what is underneath rather than about deciding it.
+ */
+function cropTargets(adj) {
+  if (!isAdjustClip(adj)) return [];
+  const mine = state.tracks.indexOf(state.tracks.find((t) => t.clips.indexOf(adj) >= 0));
+  if (mine < 0) return [];
+  const out = [];
+  for (let i = mine + 1; i < state.tracks.length; i++) {
+    const t = state.tracks[i];
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c)) continue;
+      if (clipEnd(c) <= adj.start + 1e-6 || c.start >= clipEnd(adj) - 1e-6) continue;
+      if (out.indexOf(c) < 0) out.push(c);
+    }
+  }
+  return out;
+}
+
 function trackCropPan(clip, tLocal) {
-  // The cheap test first: this runs per clip per frame, and almost no clip has a track.
-  if (!clip || !Tracker.hasTracks(clip)) return null;
-  const entry = FX.active(clip).find((f) =>
-    f.type === 'transform' && f.bind && f.bind.track && f.bind.mode === 'crop');
-  if (!entry) return null;
-  // SAME CLIP ONLY. A crop is a window onto THIS clip's source, and a point measured on
-  // another clip's source is not a place on it - there is nothing to slide towards. A
-  // cross-clip crop binding degrades to the sliders, exactly as a deleted track does.
-  if (entry.bind.clip && entry.bind.clip !== clip.id) return null;
+  // The cheap test first: this runs per clip per frame. A clip with no source has no crop
+  // window to slide, which rules out adjustment clips, cards and graphics in one line.
+  if (!clip || !isPictureClip(clip)) return null;
+  const g = cropBindFor(clip, tLocal);
+  if (!g) return null;
   const f = framingOf(clip);
   // A 'contain' still has no crop window: the whole picture is already inside the frame.
   if (f.fit === 'contain') return null;
@@ -10490,7 +10890,7 @@ function trackCropPan(clip, tLocal) {
   if (!(sw > 0) || !(sh > 0)) return null;
   const o = outSize();
   const A = o.w / o.h;
-  const pos = Tracker.bindPos(clip, entry.bind, srcAt(clip, tLocal), A, tLocal);
+  const pos = Tracker.bindPos(g.owner, g.entry.bind, g.tSrc, A, g.tKeys);
   if (!pos || !isFinite(pos.sx) || !isFinite(pos.sy)) return null;
   const zoom = Math.max(0.01, Number(f.zoom) || 1);
   // The crop rectangle as a fraction of the source - the same two lines `drawClipTo()`
@@ -12165,6 +12565,7 @@ const SHORTCUTS = [
   ['B', 'Show / hide the QuickBin'],
   ['Double-click in the bin', 'Put that clip on the timeline at the playhead'],
   ['E', 'Add an adjustment layer: effects that apply to everything below it'],
+  ['Shift+J / Shift+L', 'J cut / L cut on the selected pair, or the nearest cut'],
   ['M', 'Drop a marker at the playhead'],
   ['Shift+M / Alt+Shift+M', 'Go to the next / previous marker'],
   ['Alt+Delete', 'Remove the marker at the playhead'],
@@ -12201,6 +12602,9 @@ document.addEventListener('keydown', (e) => {
   else if (ctrl && e.key.toLowerCase() === 'g') { addGraphicClip(lastGraphicType); }
   else if (ctrl && e.key.toLowerCase() === 'd') { duplicateSelected(); }
   else if (e.key === ' ' || e.key.toLowerCase() === 'k') { togglePlay(); }
+  // BEFORE the bare j/l seeks, which match on the letter alone and would swallow these.
+  else if (e.shiftKey && e.key.toLowerCase() === 'j') { splitEdit('J'); }
+  else if (e.shiftKey && e.key.toLowerCase() === 'l') { splitEdit('L'); }
   else if (e.key.toLowerCase() === 'j') { seek(state.playhead - 1); }
   else if (e.key.toLowerCase() === 'l') { seek(state.playhead + 1); }
   else if (e.key === 'ArrowLeft') { seek(state.playhead - (e.shiftKey ? 1 : frame)); scrubAudio(); }
@@ -12325,6 +12729,8 @@ $('#btnAddText').addEventListener('click', () => addTextCard());
 $('#btnAddTransition').addEventListener('click', () => addTransition(state.lastTransitionType));
 $('#btnAddMarker').addEventListener('click', () => addMarker());
 $('#btnAddAdjust').addEventListener('click', () => addAdjustClip());
+$('#btnJCut').addEventListener('click', () => splitEdit('J'));
+$('#btnLCut').addEventListener('click', () => splitEdit('L'));
 $('#btnDelTransition').addEventListener('click', () => deleteTransition());
 
 // Closing the drawer just clears the selection - the drawer follows the selected card.

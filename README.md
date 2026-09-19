@@ -758,7 +758,7 @@ Plain JSON, ordered, and **absent by default** — `FX.normalizeClip()` deletes 
 again once the last effect goes, so a project that uses no effects serialises exactly as
 it did before this existed.
 
-Sixteen types ship so far, and each one is **one function**:
+Seventeen types ship so far, and each one is **one function**:
 
 | Type | What it draws |
 | --- | --- |
@@ -773,6 +773,7 @@ Sixteen types ship so far, and each one is **one function**:
 | `chrome` | the clip drawn inside a browser, laptop or phone frame |
 | `background` | a gradient, a solid or a blurred copy of the clip, drawn behind it |
 | `spotlight` | darken and blur everything outside a rounded rect or an ellipse |
+| `blursurround` | blur everything outside one of eight shapes — a vignette made of softness, and inverted, a tracked face blur |
 | `cutout` | a region lifted out, scaled up and floated with its own shadow |
 | `matte` | the clip cut to a matte imported from DaVinci Resolve, with feather, grow/choke and invert |
 | `lut` | a .cube LUT, trilinear, at any amount |
@@ -879,6 +880,36 @@ parameter this build knows that the copied entry did not.
 Pasting onto the **master finish** is a normal thing to want and most clip stacks carry
 something the master pass cannot run, so an entry of a disallowed type is **dropped and
 counted** rather than pasted and left drawing nothing — and the status line says how many.
+
+#### `blursurround`: a vignette made of softness
+
+`round` darkens the frame's edges and `spotlight` darkens **and** blurs outside a shape.
+This one only ever blurs. Nothing on it dims anything, deliberately — reaching for a blurred
+surround and getting a darker picture is exactly why it is a type of its own rather than a
+spotlight with `dim` at 0.
+
+Eight shapes: ellipse, circle, rounded rectangle, diamond, triangle, pentagon, hexagon and
+star, each with its own `rotate`. **Inverted it blurs the inside**, which is the other half
+of what it is for: a face, a name badge or a licence plate blurred out — and because it
+takes the same binding a spotlight does, one that *follows*. Bind it to a track and the
+blurred patch stays on the thing it is hiding.
+
+Every number on it keyframes, through `Anim`, with nothing written here to make that true:
+`FX.paramAt()` reads `.keys` and the panel builds the strips from the schema, so the shape
+can open up, drift, rotate and soften across a shot for free. That is the whole point of
+adding a type being one entry in `FX.DEFS`.
+
+`fillMaskShape()` is the one shape implementation, and `spotlight` now shares it. At
+`rotate` 0 its rounded rect and its ellipse are byte-identical to the two lines the
+spotlight used to write out itself, which is what let it share them without changing a
+pixel. It **fills** rather than handing a path back, because the rotation is a transform
+about the box's own centre and a path built under a transform carries device coordinates
+that are easy to get wrong once the transform is gone — building and filling inside one
+save/restore is the version that cannot.
+
+The mask is an **alpha** mask, which is the trap this file has now hit four times. See the
+note under "The framing four": a mask painted as opaque black-and-white is opaque
+everywhere, so `destination-in` keeps everything and the mask masks nothing.
 
 #### Binding a position to a motion track
 
@@ -2521,9 +2552,38 @@ frame that was never painted. The copy drops `frames`: `framingOf()` reads the p
 override off the clip and it would otherwise win, so the override is folded in first and
 then removed.
 
-A `crop` binding is **same-clip only**. A crop is a window onto *this* clip's source, and a
-point measured on another clip's source is not a place on it — there is nothing to slide
-towards, so it degrades to the sliders exactly as a deleted track does.
+A `crop` binding on a **clip** is same-clip only. A crop is a window onto *this* clip's
+source, and a point measured on another clip's source is not a place on it.
+
+**On an adjustment layer it reaches down instead**, and that had to be a special case
+rather than falling out. An adjustment clip has no source and no crop window —
+`drawClipTo()` is never called for it — so "slide the crop window" cannot mean "slide
+mine". And by the time the composite reaches an adjustment layer the crop of everything
+underneath has already been applied: the frame it is handed is already 9:16, with no source
+pixels either side left to slide over. Every *other* follow mode works there because they
+push the finished frame around; this one had nothing to push, so it silently did nothing —
+the worst of the three possible answers.
+
+So `cropBindFor(clip, t)` asks the question from the other end. A picture clip about to be
+drawn looks for a crop binding in two places: its own stack, and the **nearest adjustment
+layer above it** that covers this instant. The adjustment layer's binding is resolved
+against the clip that owns the track (through `bindOwner()`, so a cross-clip bind is the
+normal case here rather than the exception), and the resulting **source** fractions are
+used against the drawn clip's own source. That is exact when the two are the same footage —
+which is what this is for, an adjustment layer over the shot whose track it follows — and a
+defined proportional position otherwise, which is what every cross-clip binding already does
+with a point measured somewhere else.
+
+The nearest layer above wins: a crop has one answer, and two of them stacked is not a
+picture, it is a question. The panel names the clips it would re-frame, and says so when
+there is nothing underneath. A crop binding on anything with no source at all — a graphic, a
+card — is refused with a sentence rather than doing nothing.
+
+The render key needs nothing extra: the adjustment clip's own job entry already carries its
+`fx`, and `trackDigests()` already puts the owner's track digest **and the offset between
+them** in for a cross-clip bind. Moving a picture clip underneath does change its pixels,
+and that is covered too — `start` is in the job and the job is hashed, so the span's cached
+render goes with it.
 
 The clip leaves the fast path for the ordinary reason (`clipNeedsBake()` — it has an
 effect), and the render key is already complete: the mode is in `fx` and the samples are in
@@ -4285,6 +4345,52 @@ does — `s` splits and `m` drops another marker otherwise.
 thing in the shortcut list nothing else could reach for, so mute moved to **`Alt+M`** and the
 letter went where every other editor puts it.
 
+### J cuts and L cuts
+
+A **split edit** is a cut where the sound and the picture do not change at the same moment,
+and it is the single most useful thing in an interview edit: it stops every cut landing like
+a door closing.
+
+| | What it does |
+| --- | --- |
+| **L cut** | The **outgoing** clip's sound runs on under the incoming picture. You see the new shot while still hearing the old one finish its sentence — the shape of the letter L: the picture ends, the audio carries on below it |
+| **J cut** | The **incoming** clip's sound starts **early**, under the outgoing picture. You hear the next line begin before you see who is saying it |
+
+`Shift+L` / `Shift+J`, the two toolbar buttons, or the **J / L cut** section in the clip
+inspector, which carries the length and says what it would do before either button is
+pressed. It lands on the cut the **selection** names — two adjacent clips selected is the
+clearest way there is to say which one — and falls back to the cut nearest the playhead,
+the same fast grab dropping a transition uses. Selecting the two clips shows the panel in
+the multi-selection branch, which is the gesture people reach for and which otherwise
+reached no panel at all.
+
+**Neither invents any audio.** What runs past the cut is the handle either side of it, so a
+clip trimmed to the end of what was recorded is refused with that sentence rather than
+stretched. The amount asked for is clamped to whatever handle is actually there, and the
+panel says when it has been.
+
+Both are the same operation with the sign flipped, and in both the **total occupancy of the
+audio track is unchanged** — one clip gives up exactly what the other takes — so a split
+edit can never open a gap or leave an overlap, whichever tracks the two sit on:
+
+- **L**: B's audio head retreats by `d`, A's audio tail extends into the space.
+- **J**: A's audio tail retreats by `d`, B's audio head extends back into the space.
+
+The edges move with the same arithmetic `startTrim()` uses — a wanted **timeline** length
+converted to a source point through `Speed` — rather than by adding seconds to `in`/`out`.
+Under a ramp those are different numbers, and a split edit that drifted by the rate at the
+cut would be the exact preview/export mismatch this codebase is built to avoid.
+
+**The A/V link is kept.** It is tempting to unlink, since the two halves no longer line up —
+but `startMove()` moves a whole link group by one delta and `startTrim()` measures each
+member against its *own* original edge, so the offset a split edit opens survives being
+dragged and survives being trimmed. Unlinking would throw that away and leave two clips that
+have to be selected together by hand for the rest of the edit.
+
+One undo entry, and nothing at all when it cannot be done. `state.splitEdit.len` is a
+setting like Tighten's: changing it snapshots no undo entry and dirties nothing, it only
+changes what the next one would do.
+
 ### Waveforms
 
 Audio clips draw a waveform, and the peaks belong to the **source file**, not to the clip:
@@ -4882,6 +4988,7 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `Ctrl+Shift+F9` | Start / stop recording the screen (works while another app has focus) |
 | `P` | Play rendered spans / composite live |
 | `E` | Add an adjustment layer: a clip whose effects apply to everything below it |
+| `Shift+J` / `Shift+L` | J cut / L cut on the selected pair, or the nearest cut |
 | `M` | Drop a marker at the playhead |
 | `Shift+M` / `Alt+Shift+M` | Go to the next / previous marker |
 | `Alt+Delete` | Remove the marker at the playhead |
