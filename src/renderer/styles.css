@@ -198,7 +198,10 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
   gap: 3px; padding: 0 8px; border-right: 1px solid var(--line);
 }
 #headSpacer button { min-width: 26px; }
-#rulerScroll { flex: 1; overflow: hidden; }
+/* `relative` so the marker rename field can be absolutely positioned over the ruler and
+   still scroll with it - an absolutely positioned child of a scroll container moves with
+   the content, which is exactly what a field pinned to a moment in time has to do. */
+#rulerScroll { flex: 1; overflow: hidden; position: relative; }
 #ruler { display: block; height: 26px; cursor: pointer; }
 
 #tracksScroll { flex: 1; display: flex; overflow: auto; position: relative; }
@@ -555,8 +558,21 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
 
 .cache-info { color: var(--dim); font-size: 10px; align-self: center; }
 
-/* ---- in/out marks and the cached-render bar ---------------------------- */
-#ruler { height: 38px; }
+/* ---- in/out marks, markers and the cached-render bar -------------------- */
+/* Three strips share this canvas: the ticks, the marker lane and the cache bar. The
+   height here and `RULER_H` in app.js are the same number and must stay that way - the
+   canvas is sized from the constant, and this is what gives it room on the page. */
+#ruler { height: 50px; }
+
+/* The marker rename field, sitting exactly where the name is drawn. */
+.mark-rename {
+  position: absolute; z-index: 5;
+  width: 150px; padding: 0 4px;
+  font: 10px system-ui, sans-serif; line-height: 13px;
+  color: #eaf2ff; background: #10131a;
+  border: 1px solid var(--accent, #4da3ff); border-radius: 2px;
+  outline: none;
+}
 
 #rangeOverlay { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
 #rangeOverlay .dim { position: absolute; top: 0; bottom: 0; background: rgba(10, 11, 14, .55); }

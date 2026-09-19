@@ -51,7 +51,7 @@ Five environment variables hook into the main process (all in `createWindow()`):
 | `SHORTCUT_AGENT=<file.json>` | Runs one agent batch or short spec headless, prints the JSON result, exits (see "Driving ShortCut from an AI agent") |
 | `SHORTCUT_AGENT_PORT=<port>` | Starts the agent's localhost server with the editor - the same as `--agent` |
 
-There are thirty suites:
+There are thirty-one suites:
 
 - `tools/smoke.js` — timeline logic, no decoding involved.
 - `tools/smoke-preview.js` — playback and compositing: verifies the preview never goes
@@ -107,6 +107,21 @@ There are thirty suites:
   key, and — the load-bearing one — that moving the clip does not change what
   the binding contributes to the render key while changing a sample does. It needs no
   fixture: every frame is painted by the suite.
+- `tools/smoke-marks.js` — timeline markers, the tracked crop, the zoom direction and the
+  tracker-marker drag. The marker model (sorted, a duplicate refused, a nonsense time
+  dropped rather than repaired), that a clip edge **snaps** to one and that a marker being
+  dragged cannot snap to itself, one undo entry per gesture and none at all for a press that
+  never moved, the save/reload round trip, and that the lane paints a pennant in the
+  marker's own column and nothing in the next one. Then `crop` mode: that the pan solves
+  `drawClipTo()`'s offset exactly, that it **clamps** at the source's edge, that it leaves
+  the clip on the timeline untouched, and — the load-bearing one — that a 16:9 clip framed
+  to 9:16 paints an **opaque** frame in `crop` mode while the same clip in `camera` mode
+  paints the transparent band that was the bug. Then the `animate` zoom: that `settle` is
+  unchanged for a project saved before the control existed, that `push` covers the frame at
+  t = 0, is genuinely growing, and **holds** what it reached. And the drag: that pressing a
+  tracker marker does **not** also start a framing drag, that the grab offset is kept, and
+  that a click which never moved commits nothing. It needs **no fixture**: every clip is
+  synthetic and every frame is painted by the suite.
 - `tools/smoke-mockup.js` — the framing four: a device's layout at four presets, five
   source aspect ratios and four output shapes with no pixel painted, the spotlight mask's
   alpha (specifically that a corner is dark while the middle is not, which is the
@@ -900,6 +915,35 @@ composited over blue arithmetically, and it does, exactly.
 A clip with **no** effects skips all of this: `FX.render()` hands the target straight to
 the painter and allocates nothing, so the compositing loop stays the single `drawImage`
 it has always been.
+
+#### `animate`: which end of the zoom the full frame is at
+
+`animate` has an in phase and an out phase, and each can be a fade, a slide, a **zoom**, a
+pop or a flicker. The zoom had one direction, and it was the wrong one for a video clip.
+
+`settle` (the default, and what the effect always did) runs the scale **towards 1**, so a
+positive zoom amount starts the picture *smaller* than the frame. On a text card or a logo
+that is exactly right — the transparency around it is the picture underneath showing
+through. On a full-frame video clip there is nothing underneath, so it reads as the clip
+shrinking inside a black border and then growing out to fill it. And there was no way to
+ask for the other direction: the scale **ended at 1 whatever the amount was**, so a push
+that *starts* at the full frame simply could not be expressed.
+
+`push` is that direction. The scale starts at exactly 1 and runs to `1 + amount` across the
+phase, so the frame is covered from the first frame onwards and stays covered. On the way in
+it then **holds** what it reached, and that falls out of the maths rather than being a
+special case: past the end of the phase the eased progress is pinned at 1, so the scale is
+pinned at `1 + amount` and the clip does not snap back to where it started.
+
+The two differ by which number they read. `k` is the eased progress *through* the phase and
+`on` is how much of the picture the phase is letting through — the same number on the way in
+and opposite numbers on the way out. `push` wants the first, because it grows for as long as
+the phase runs at either end; `settle` wants the second, because what it does is arrive at,
+or leave, the resting scale of 1.
+
+`inZoomMode`/`outZoomMode` default to `settle`, so every project saved before the control
+existed fills in as what it already was and paints the same pixels. `smoke-marks.js` asserts
+that, the hold, and that `push` covers the whole frame at t = 0.
 
 #### Keyframes live on the effect
 
@@ -2280,6 +2324,31 @@ last trusted is exactly how a tracker recovers from an occlusion by leaping.
   viewer, after `drawPreview()`, on the same terms as the mouse take's rubber band: an
   affordance, never a layer, never baked, never in a cache key.
 
+Three things make that drag a drag rather than a teleport, and all three were missing:
+
+- **The press must not also start a framing drag.** The tracker's handlers are
+  `pointerdown`/`pointermove`/`pointerup`; the framing drag is on `mousedown`. For a
+  **mouse** pointer Chromium fires the compatibility mouse event whatever the pointer event
+  did with it, and propagation never reaches a different event type on the same element — so
+  `stopPropagation()` could not have stopped it and never did. Grabbing a marker slid the
+  crop across the picture underneath it and took an undo entry of its own on the way in. The
+  framing `mousedown` now tests `Trk.drag`, which the pointer handler has always set first.
+- **The grab offset is kept.** A marker is catchable from `TRK_GRAB` (16) canvas pixels
+  away, and setting its position straight to the pointer's snatched it sideways by however
+  far off-centre the press landed — a jump at the start of every drag, on a control whose
+  entire job is to be put on an exact pixel. The pointer now moves it *by* the distance it
+  travels.
+- **The marker itself follows the cursor.** It used to be drawn at its solved position
+  throughout, with a dashed ghost following the pointer, so the thing being dragged sat
+  perfectly still and jumped the instant the button came up. The samples still do not move
+  until `pointerup` — the re-anchor is what undo goes back to — but the marker is *drawn*
+  under the pointer and the dashed ring is drawn where it started, so the distance being
+  moved is visible while it is happening.
+
+A press that never moved now commits nothing. It used to re-anchor the track to the pixel
+it was already on and re-solve the rest of the clip for it — a seek per frame, for nothing,
+every time somebody clicked a marker to see which one it was.
+
 #### Binding, and what each type does with the point
 
 A solved track does nothing until something reads it. `FX` entries of three types can bind
@@ -2287,12 +2356,62 @@ a position to one:
 
 | Type | What follows |
 | --- | --- |
-| `transform` | **two modes.** *Move* (the default) travels the clip with the point: it keeps the position you gave it and adds the distance the point has moved since it was anchored — what a logo, badge or callout wants. *Pan* is the camera: the frame pans so the tracked pixel sits at the centre, solved through the effect's own scale and anchor — for the footage the track was solved on |
+| `transform` | **three modes.** *Move* (the default) travels the clip with the point: it keeps the position you gave it and adds the distance the point has moved since it was anchored — what a logo, badge or callout wants. *Crop* slides the **crop window** across the source so the point stays centred — for 16:9 footage framed to 9:16, and it cannot show a black edge. *Pan* pushes the whole picture around the frame instead |
 | `spotlight` | the **lit shape**, centred on the point; the picture stays still |
 | `cutout` | the **source region** being lifted; the magnified float stays where it was placed |
 
 Those are different answers on purpose, which is why each type owns its `apply()` rather
 than sharing one "set x and y".
+
+#### `crop`: the tracker moves the crop window, not the picture
+
+*Pan* translates the layer the stack is painting, and that layer has **already been
+cropped to the output shape**. Push it sideways and its own edge slides into frame with
+black behind it — which is correct for a logo on a transparent layer and completely wrong
+for the commonest clip in this app: 16:9 footage framed to 9:16, where there are hundreds
+of source pixels either side of the crop doing nothing at all. Sliding the **crop** across
+those is what "follow" means for that clip, and there is no edge to expose.
+
+So the crop is decided **before the stack runs**, because the crop is what the stack
+paints. `trackCropPan()` in `app.js` — where the framing lives — solves `drawClipTo()`'s
+own offset for `pan`:
+
+```
+pan = (point − want × crop) / (1 − crop)
+```
+
+`point` and `crop` are **source** fractions throughout, never frame ones. A frame position
+is a position *after* the crop, and reading one to decide where to put the crop is
+circular — which is why `Tracker.bindPos()` hands back `sx`/`sy` (the damped point in
+source fractions) alongside `x`/`y`. `FX.DEFS.transform.bind.apply()` in `crop` mode
+therefore writes `x = 0, y = 0` and draws nothing: the movement already happened.
+
+The pan is **clamped to 0..1**, and that clamp is the promise the mode makes rather than a
+safety net. The crop cannot leave the source, so a black edge is unreachable rather than
+merely unlikely; a tracked point that walks off the side of the frame stops being centred
+instead of dragging the picture off its own edge, which is the better of the two failures.
+On 16:9 into 9:16 there is no *vertical* slack at zoom 1, so `panY` does not move — the
+point tracks across the 16:9 range, which is exactly what the shape has to give.
+
+`trackFramed(clip, tLocal)` is the one door: it answers `framedCopy(clip)` for every clip
+that is not bound this way (so almost every clip in almost every project costs one property
+check), and a **copy** wearing the tracked pan for one that is. The viewer's `layerFor()`,
+the baker's `compositeLayers()`, a transition's `transPlate()`, the markers drawn on the
+viewer, the drag that reads a pixel back, and every *other* binding on the same clip all go
+through it — or a spotlight bound to the same footage would be told where the point is in a
+frame that was never painted. The copy drops `frames`: `framingOf()` reads the per-format
+override off the clip and it would otherwise win, so the override is folded in first and
+then removed.
+
+A `crop` binding is **same-clip only**. A crop is a window onto *this* clip's source, and a
+point measured on another clip's source is not a place on it — there is nothing to slide
+towards, so it degrades to the sliders exactly as a deleted track does.
+
+The clip leaves the fast path for the ordinary reason (`clipNeedsBake()` — it has an
+effect), and the render key is already complete: the mode is in `fx` and the samples are in
+`trackDigests()`. `smoke-marks.js` asserts the arithmetic, the clamp, and — the load-bearing
+one — that the crop-bound clip paints an **opaque** frame while the same clip in `camera`
+mode paints the transparent band that was the bug.
 
 **The two transform modes move in OPPOSITE directions, and that is the whole reason the
 mode is a control rather than a guess.** Panning a camera up makes everything in the frame
@@ -3983,9 +4102,11 @@ undo entry that restores an identical timeline is worse than no button at all.
 ### Snapping
 
 `snapDetail(t, movingIds)` is the single source of truth: 0, the playhead, the in/out
-marks, and every clip edge on **every** track that is not part of the group being dragged
-— audio and video alike, so an audio clip snaps to a video cut exactly as a video clip
-does. `snapTime()` is a thin wrapper for callers that only want the time.
+marks, **every marker** (see "Markers"), and every clip edge on **every** track that is not
+part of the group being dragged — audio and video alike, so an audio clip snaps to a video
+cut exactly as a video clip does. `snapTime()` is a thin wrapper for callers that only want
+the time. `movingIds` carries the marker being dragged as well as the clips being dragged,
+which is what stops a marker snapping to itself.
 
 **A caller must look at `hit`, not just the distance.** A miss returns the raw time, so
 its "distance" is zero. `startMove()` compares two candidates — the head of the dragged
@@ -3995,6 +4116,56 @@ snapping quietly did nothing while looking like it was on. That was the "audio c
 don't snap" bug (it hit every clip; audio is just where it was noticed, since an audio
 clip is usually the one being lined up against a cut). `tools/smoke-bin.js` drags a clip
 through the real handlers and asserts both edges snap.
+
+### Markers
+
+A marker is a **named moment**. `M` drops one at the playhead, `+ Mark` in the toolbar does
+the same, and they live in their own lane along the bottom of the ruler — a pennant with the
+name beside it, and a stem running up through the ticks so something can be lined up against
+it by eye.
+
+They bound nothing, render nothing and are in no cache key. What makes them worth having is
+the other half: **they are snap targets.** Mark the beat, the word, or the frame the demo
+clicks the button, and every clip edge dragged near it lands on it exactly — `snapDetail()`
+reads them alongside 0, the playhead, the in/out marks and every clip edge.
+
+`state.markers` is `[{ id, t, name }]`, **kept sorted by `t`** because two things read it in
+order: the lane draws each name in the room between one marker and the next (so a long name
+cannot paint over its neighbour and leave two unreadable names instead of one), and stepping
+to the next marker is a walk rather than a search. They are saved in the `.scut` and they are
+in the **undo snapshot** — dropping, moving or renaming one is an edit, the same as moving a
+clip, and an undo that left a stale one behind would keep pulling clips onto a moment that no
+longer exists.
+
+`normalizeMarkers()` **drops** anything without a finite, non-negative time rather than
+repairing it. A marker at `NaN` would poison snapping for the whole timeline very quietly:
+`Math.abs(NaN - t)` is `NaN` and every comparison against it is false, so it would not lose
+the contest — it would make every other candidate lose it, and snapping would look as though
+it had simply stopped working.
+
+| Gesture | What it does |
+| --- | --- |
+| `M` | Drop one at the playhead. A second one on a moment that already has one is refused, not duplicated — two markers a thousandth of a second apart are one marker nobody can grab |
+| `Shift+M` / `Alt+Shift+M` | Go to the next / previous marker |
+| `Alt+Delete` | Remove the one at the playhead |
+| Drag in the lane | Move it. It **snaps**, to everything a clip snaps to — a mark one frame off the cut it was meant to be on is worse than no mark, because everything afterwards then snaps to the wrong place with total confidence. It cannot snap to itself, or it could never move |
+| Double-click the lane | Rename the marker there, or drop and name a new one |
+| Right-click one | Remove it. No menu: there is exactly one thing to do to a marker |
+
+The lane is a **separate surface** from the rest of the ruler, and it has to be: every press
+on the ruler scrubs, which is the right default, so a marker cannot be grabbed "anywhere near
+its time" — the whole ruler is near something. The bottom strip is the marker's and the rest
+is the scrub's.
+
+Renaming uses a real `<input>` positioned over the lane. `prompt()` is not available in an
+Electron renderer, and a modal for one short string is heavier than the thing it is editing;
+`#rulerScroll` is `position: relative` so the field scrolls with the content, and the field
+calls `stopPropagation()` on `keydown` for the same reason every text field in the inspector
+does — `s` splits and `m` drops another marker otherwise.
+
+`M` used to mute the first audio track. That is a track-head button away and was the one
+thing in the shortcut list nothing else could reach for, so mute moved to **`Alt+M`** and the
+letter went where every other editor puts it.
 
 ### Waveforms
 
@@ -4592,6 +4763,10 @@ Press **Shortcuts** in the toolbar for the live list. The main ones:
 | `Ctrl+Shift+R` | Export a file to disk |
 | `Ctrl+Shift+F9` | Start / stop recording the screen (works while another app has focus) |
 | `P` | Play rendered spans / composite live |
+| `M` | Drop a marker at the playhead |
+| `Shift+M` / `Alt+Shift+M` | Go to the next / previous marker |
+| `Alt+Delete` | Remove the marker at the playhead |
+| `Alt+M` | Mute / unmute the first audio track |
 | `N` | Toggle snapping |
 | `B` | Show / hide the QuickBin |
 | Double-click in the bin | Put that clip on the timeline at the playhead |

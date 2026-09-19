@@ -259,6 +259,27 @@
     { value: 'slide', label: 'Slide' }, { value: 'zoom', label: 'Zoom' },
     { value: 'pop', label: 'Pop' }, { value: 'flicker', label: 'Flicker' },
   ];
+  /*
+   * WHICH END OF THE ZOOM THE FULL FRAME IS AT.
+   *
+   * 'settle' is what the effect always did: the scale runs towards 1, so a positive zoom
+   * amount starts the picture SMALLER than the frame. On a text card or a logo that is
+   * exactly right - the transparency around it is the picture underneath showing through.
+   * On a full-frame video clip there is nothing underneath, so it reads as the clip
+   * shrinking inside a black border and then growing out to fill it, and there was no way
+   * to ask for the other direction: the scale ended at 1 whatever the amount was, so a
+   * push that STARTS full frame simply could not be expressed.
+   *
+   * 'push' is that direction. The scale starts at exactly 1 and runs to 1 + amount over
+   * the phase, so the frame is covered from the first frame onwards and stays covered.
+   * On the way in it then HOLDS the value it reached, which falls out of the maths rather
+   * than being a special case - past the end of the phase the eased progress is pinned at
+   * 1, so the scale is pinned at 1 + amount and the clip does not snap back.
+   */
+  const ZOOM_MODE_OPTIONS = [
+    { value: 'settle', label: 'Scale towards the frame (can show the background)' },
+    { value: 'push', label: 'Push in from the full frame (never shows the background)' },
+  ];
   const SLIDE_FROM_OPTIONS = [
     { value: 'bottom', label: 'Bottom' }, { value: 'top', label: 'Top' },
     { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' },
@@ -305,14 +326,33 @@
        */
       bind: {
         label: 'Follow a track',
-        hint: 'Move: the clip travels with the tracked point. Pan: the frame moves so the ' +
-          'point stays centred - for footage the track was solved on.',
+        hint: 'Move: the clip travels with the tracked point. Crop: the 16:9 crop window ' +
+          'slides inside the source so the point stays centred and no black edge can ' +
+          'appear. Pan: the whole picture is pushed around the frame.',
         modes: [
           { value: 'move', label: 'Move this clip with the point' },
-          { value: 'camera', label: 'Pan the frame to keep the point centred' },
+          { value: 'crop', label: 'Slide the crop window (stays inside the source)' },
+          { value: 'camera', label: 'Pan the whole picture to keep the point centred' },
         ],
         apply(p, pos, off, mode) {
           const ox = Number(off.x) || 0, oy = Number(off.y) || 0;
+          /*
+           * 'crop' IS NOT DRAWN HERE, AND THAT IS THE WHOLE POINT OF IT.
+           *
+           * 'camera' translates the layer this stack is painting, and that layer is
+           * already cropped to the output shape: pushing it sideways slides its edge into
+           * frame and black in behind it. On 16:9 footage framed to 9:16 there are
+           * hundreds of source pixels either side of the crop doing nothing, and sliding
+           * the CROP over them is both what the author means by "follow" and free of any
+           * edge to expose.
+           *
+           * The crop is decided before the stack runs - `trackCrop()` in app.js, which is
+           * where the framing lives - so all this mode does here is take the position
+           * parameters over and leave the picture alone. Writing them is what tells
+           * `boundParams()` the two sliders are no longer live, which is the only thing
+           * the panel needs from this branch.
+           */
+          if (mode === 'crop') { p.x = 0; p.y = 0; return; }
           if (mode === 'camera') {
             const s = clamp(p.scale, 0.001, 64);
             p.x = (0.5 + ox) - clamp(p.anchorX, -4, 5) * (1 - s) - s * pos.x;
@@ -585,7 +625,9 @@
       timeVarying: true,
       params: {
         inType: 'fade', inDur: 0.5, inEase: 'easeOut', inFrom: 'bottom', inDistance: 0.2, inZoom: 0.3,
+        inZoomMode: 'settle',
         outType: 'none', outDur: 0.4, outEase: 'easeIn', outFrom: 'bottom', outDistance: 0.2, outZoom: 0.3,
+        outZoomMode: 'settle',
         flickerHz: 9,
       },
       schema: [
@@ -595,18 +637,20 @@
         { path: 'params.inFrom', label: 'In slides from', type: 'select', options: SLIDE_FROM_OPTIONS },
         { path: 'params.inDistance', label: 'In slide distance', type: 'range', min: 0, max: 1.5, step: 0.01, digits: 2 },
         { path: 'params.inZoom', label: 'In zoom amount', type: 'range', min: -2, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.inZoomMode', label: 'In zoom starts', type: 'select', options: ZOOM_MODE_OPTIONS },
         { path: 'params.outType', label: 'Out', type: 'select', options: ANIM_KIND_OPTIONS },
         { path: 'params.outDur', label: 'Out length', type: 'range', min: 0, max: 5, step: 0.02, unit: 's', digits: 2 },
         { path: 'params.outEase', label: 'Out easing', type: 'select', options: EASE_OPTIONS },
         { path: 'params.outFrom', label: 'Out slides to', type: 'select', options: SLIDE_FROM_OPTIONS },
         { path: 'params.outDistance', label: 'Out slide distance', type: 'range', min: 0, max: 1.5, step: 0.01, digits: 2 },
         { path: 'params.outZoom', label: 'Out zoom amount', type: 'range', min: -2, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.outZoomMode', label: 'Out zoom starts', type: 'select', options: ZOOM_MODE_OPTIONS },
         { path: 'params.flickerHz', label: 'Flicker rate', type: 'range', min: 1, max: 30, step: 0.5, unit: 'Hz', digits: 1 },
       ],
       draw(L, p, t, e, clip) {
         const dur = clipDuration(clip);
         const st = { a: 1, dx: 0, dy: 0, s: 1 };
-        const phase = (type, len, ease, from, dist, zoom, isIn) => {
+        const phase = (type, len, ease, from, dist, zoom, zmode, isIn) => {
           type = String(type || 'none');
           len = Number(len) || 0;
           if (type === 'none' || !(len > 0)) return;
@@ -622,7 +666,15 @@
             else if (from === 'top') st.dy -= off;
             else st.dy += off;
           } else if (type === 'zoom') {
-            st.s *= Math.max(0.001, 1 - (1 - on) * (Number(zoom) || 0));
+            const amt = Number(zoom) || 0;
+            // `k` is the eased progress THROUGH the phase and `on` is how much of the
+            // picture the phase is letting through, which are the same number on the way
+            // in and opposite numbers on the way out. 'push' wants the first - it grows
+            // for as long as the phase runs, either end - and 'settle' wants the second,
+            // because what it does is arrive at, or leave, the resting scale of 1.
+            st.s *= zmode === 'push'
+              ? Math.max(0.001, 1 + k * amt)
+              : Math.max(0.001, 1 - (1 - on) * amt);
           } else if (type === 'pop') {
             st.s *= Math.max(0.001, 0.3 + 0.7 * on);
             st.a *= clamp(on * 3, 0, 1);
@@ -631,8 +683,8 @@
             else if (isIn ? raw <= 0 : raw >= 1) st.a = 0;
           }
         };
-        phase(p.inType, p.inDur, p.inEase, p.inFrom, p.inDistance, p.inZoom, true);
-        phase(p.outType, p.outDur, p.outEase, p.outFrom, p.outDistance, p.outZoom, false);
+        phase(p.inType, p.inDur, p.inEase, p.inFrom, p.inDistance, p.inZoom, p.inZoomMode, true);
+        phase(p.outType, p.outDur, p.outEase, p.outFrom, p.outDistance, p.outZoom, p.outZoomMode, false);
         if (st.a >= 0.9999 && !st.dx && !st.dy && Math.abs(st.s - 1) < 1e-6) return;
         const src = take(L, 'fxA');
         if (!(st.a > 0)) return;
@@ -2902,12 +2954,27 @@
   function boundParams(type, mode) {
     const d = DEFS[type];
     if (!d || !d.bind) return [];
-    const probe = Object.assign({}, d.params);
+    /*
+     * The numeric probe values are NUDGED OFF THE DEFAULTS, because a mode that takes a
+     * parameter over by writing a CONSTANT into it is invisible against a probe that
+     * started at that constant. The transform's 'crop' mode writes x = 0 and y = 0, and
+     * the defaults are 0 and 0 - so a plain copy of the defaults came back reporting that
+     * nothing was bound, and the panel left two dead sliders looking live.
+     */
+    const MARK = 0.123456789;
+    const probe = {};
+    for (const k of Object.keys(d.params)) {
+      const v = d.params[k];
+      probe[k] = typeof v === 'number' ? v + MARK : v;
+    }
     // The probe carries an anchor as a real binding does, so a 'move' apply measures a
     // travel of 0.37 - 0.5 rather than against an undefined and writing NaN.
-    d.bind.apply(probe, { x: 0.37, y: 0.61, ax: 0.5, ay: 0.5 }, { x: 0, y: 0 },
-      mode || (d.bind.modes ? d.bind.modes[0].value : undefined));
-    return Object.keys(d.params).filter((k) => probe[k] !== d.params[k]);
+    d.bind.apply(probe, { x: 0.37, y: 0.61, ax: 0.5, ay: 0.5, sx: 0.37, sy: 0.61, asx: 0.5, asy: 0.5 },
+      { x: 0, y: 0 }, mode || (d.bind.modes ? d.bind.modes[0].value : undefined));
+    return Object.keys(d.params).filter((k) => {
+      const v = d.params[k];
+      return typeof v === 'number' ? probe[k] !== v + MARK : probe[k] !== v;
+    });
   }
 
   const API = {

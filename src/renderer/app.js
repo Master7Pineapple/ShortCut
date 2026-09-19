@@ -32,6 +32,10 @@ const state = {
   /** In/out marks, in seconds. Null when unset. They bound a ranged render. */
   inPoint: null,
   outPoint: null,
+  /** Markers: `[{ id, t, name }]`, kept sorted by `t`. Notes on the timeline, and snap
+   *  targets - see `snapDetail()`. Unlike the in/out marks there can be any number of
+   *  them and they bound nothing; they are the answer to "come back to this moment". */
+  markers: [],
   /** Rendered spans still matching the project: [{ from, to, key, file }]. The ruler
    *  draws these, and the viewer plays them back instead of compositing live. */
   cacheBands: [],
@@ -1209,7 +1213,7 @@ function renderHeads() {
       '<div class="ctrls">' +
       (isV
         ? '<button data-act="hide" class="' + (t.hidden ? 'off' : '') + '" title="Hide track">' + (t.hidden ? 'Hidden' : 'Shown') + '</button>'
-        : '<button data-act="mute" class="' + (t.muted ? 'off' : '') + '" title="Mute track (M)">' + (t.muted ? 'Muted' : 'Audible') + '</button>') +
+        : '<button data-act="mute" class="' + (t.muted ? 'off' : '') + '" title="Mute track (Alt+M)">' + (t.muted ? 'Muted' : 'Audible') + '</button>') +
       '<button data-act="lock" class="' + (t.locked ? 'on' : '') + '" title="Lock track against editing">' + (t.locked ? 'Locked' : 'Lock') + '</button>' +
       '<button data-act="del" title="Delete this track and its clips">Del</button>' +
       '</div>';
@@ -1422,13 +1426,21 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
 }
 
-const RULER_H = 38;
+const RULER_H = 50;
 const CACHE_BAR_H = 6;
+// The marker lane: its own strip between the ticks and the cache bar, rather than flags
+// drawn over the ticks. A marker has a NAME, and a name needs somewhere to be read.
+const MARK_BAR_H = 13;
+const MARK_LANE_Y = RULER_H - CACHE_BAR_H - MARK_BAR_H;
 
 function renderRuler() {
   const cv = $('#ruler');
   const w = timelineWidthPx();
+  // The HEIGHT is set here as well as the width: it is the one number the lane layout is
+  // built from, and leaving it on the element's attribute in index.html meant adding a
+  // lane silently drew it off the bottom of the canvas.
   cv.width = w; cv.style.width = w + 'px';
+  if (cv.height !== RULER_H) cv.height = RULER_H;
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, w, RULER_H);
   ctx.fillStyle = '#22262f'; ctx.fillRect(0, 0, w, RULER_H);
@@ -1451,6 +1463,7 @@ function renderRuler() {
   }
 
   drawCacheBar(ctx, w);
+  drawMarkerLane(ctx, w);
   drawRangeMarks(ctx, w);
 }
 
@@ -1480,7 +1493,9 @@ function drawRangeMarks(ctx, w) {
   const mark = (t, isIn) => {
     const x = Math.round(t * state.pxPerSec) + 0.5;
     ctx.fillStyle = '#ffd166';
-    ctx.fillRect(x - (isIn ? 0 : 2), 0, 2, RULER_H - CACHE_BAR_H);
+    // Down to the top of the marker lane, not through it: two different kinds of mark
+    // drawn over each other is two things neither of which can be read.
+    ctx.fillRect(x - (isIn ? 0 : 2), 0, 2, MARK_LANE_Y);
     ctx.beginPath();
     if (isIn) { ctx.moveTo(x, 0); ctx.lineTo(x + 9, 0); ctx.lineTo(x, 9); }
     else { ctx.moveTo(x, 0); ctx.lineTo(x - 9, 0); ctx.lineTo(x, 9); }
@@ -1489,6 +1504,175 @@ function drawRangeMarks(ctx, w) {
   };
   if (state.inPoint != null) mark(state.inPoint, true);
   if (state.outPoint != null) mark(state.outPoint, false);
+}
+
+// ---- timeline markers ------------------------------------------------------
+/*
+ * A marker is a named moment. It bounds nothing, renders nothing and is in no cache key:
+ * it is a note to the person editing, and a SNAP TARGET, which is the half that makes it
+ * worth having at all. Mark the beat, the word, or the frame the demo clicks the button,
+ * and every clip edge dragged near it lands on it exactly - see `snapDetail()`.
+ *
+ * Kept SORTED by time, always, because two things read the array in order: the lane draws
+ * each name in the room between one marker and the next, and stepping to the next marker
+ * is a walk rather than a search.
+ */
+
+const MARK_COL = '#7fd1ff';
+// How near, in pixels, a press has to be to grab one. The same reach the tracker's
+// markers use on the viewer, and for the same reason: it is a small target on purpose.
+const MARK_GRAB = 7;
+
+function markers() {
+  if (!Array.isArray(state.markers)) state.markers = [];
+  return state.markers;
+}
+
+/**
+ * A marker list from anywhere - a file, an undo entry, an agent op - made safe.
+ *
+ * Anything without a finite, non-negative time is DROPPED rather than repaired. A marker
+ * at NaN would quietly poison `snapDetail()` for every clip on the timeline: `Math.abs(
+ * NaN - t)` is NaN and every comparison against it is false, so the winner would be
+ * whatever came first and snapping would look like it had simply stopped working.
+ */
+function normalizeMarkers(list) {
+  const out = [];
+  if (Array.isArray(list)) {
+    for (const m of list) {
+      if (!m || typeof m !== 'object') continue;
+      const t = Number(m.t);
+      if (!isFinite(t) || t < 0) continue;
+      out.push({
+        id: m.id ? String(m.id) : nextId(),
+        t,
+        name: String(m.name == null ? '' : m.name),
+      });
+    }
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out;
+}
+
+/** The marker nearest `t` within `tol` seconds, or null. */
+function markerNear(t, tol) {
+  let best = null, bestD = tol;
+  for (const m of markers()) {
+    const d = Math.abs(m.t - t);
+    if (d <= bestD) { bestD = d; best = m; }
+  }
+  return best;
+}
+
+/** A name that says which one it is without asking anybody to type. */
+function nextMarkerName() {
+  let n = 0;
+  for (const m of markers()) {
+    const hit = /^Mark (\d+)$/.exec(m.name || '');
+    if (hit) n = Math.max(n, Number(hit[1]));
+  }
+  return 'Mark ' + (n + 1);
+}
+
+/**
+ * Drop a marker. At the playhead with no argument, which is what `M` does.
+ *
+ * A second one on a moment that already has one is a NO-OP rather than a duplicate: two
+ * markers a thousandth of a second apart are one marker nobody can grab, drag or delete,
+ * and pressing `M` twice is a thing that happens.
+ */
+function addMarker(t, name) {
+  const at = Math.max(0, t == null ? state.playhead : t);
+  const dup = markerNear(at, 0.5 / Math.max(1, state.pxPerSec));
+  if (dup) { setStatus('There is already a marker here - "' + dup.name + '".'); return dup; }
+  pushUndo();
+  const m = { id: nextId(), t: at, name: name == null ? nextMarkerName() : String(name) };
+  markers().push(m);
+  markers().sort((a, b) => a.t - b.t);
+  markDirty();
+  renderRuler();
+  setStatus('Marker "' + m.name + '" at ' + fmtTc(at) + '. Clips snap to it.');
+  return m;
+}
+
+function removeMarker(id) {
+  const list = markers();
+  const i = list.findIndex((m) => m.id === id);
+  if (i < 0) return false;
+  pushUndo();
+  const gone = list.splice(i, 1)[0];
+  markDirty();
+  renderRuler();
+  setStatus('Removed marker "' + gone.name + '".');
+  return true;
+}
+
+/** The one under the playhead, within a grab's reach. What Shift+M deletes. */
+function removeMarkerAtPlayhead() {
+  const m = markerNear(state.playhead, MARK_GRAB / Math.max(1, state.pxPerSec));
+  if (!m) { setStatus('No marker at the playhead.'); return false; }
+  return removeMarker(m.id);
+}
+
+/** The next marker after `t`, or the previous one. Null at either end of the walk. */
+function markerStep(t, dir) {
+  const list = markers();
+  const eps = 1e-4;
+  if (dir > 0) return list.find((m) => m.t > t + eps) || null;
+  for (let i = list.length - 1; i >= 0; i--) if (list[i].t < t - eps) return list[i];
+  return null;
+}
+
+/** As much of `text` as fits in `room` pixels, with an ellipsis when it does not. */
+function fitText(c, text, room) {
+  if (c.measureText(text).width <= room) return text;
+  let out = text;
+  while (out.length > 1 && c.measureText(out + '…').width > room) out = out.slice(0, -1);
+  return out + '…';
+}
+
+/** The marker lane: a pennant per marker, and its name in the room before the next one. */
+function drawMarkerLane(ctx, w) {
+  const y = MARK_LANE_Y;
+  ctx.save();
+  ctx.fillStyle = '#1d212a';
+  ctx.fillRect(0, y, w, MARK_BAR_H);
+  ctx.strokeStyle = '#2f343f';
+  ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(w, y + 0.5); ctx.stroke();
+
+  const list = markers();
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    const x = Math.round(m.t * state.pxPerSec) + 0.5;
+    if (x < -200 || x > w + 200) continue;
+    const held = markerDrag && markerDrag.id === m.id;
+    // The stem runs up through the ticks, because the lane on its own is thirteen pixels
+    // and most of what a marker is for is lining something up against it by eye.
+    ctx.strokeStyle = held ? '#ffffff' : MARK_COL;
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, y); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = held ? '#ffffff' : MARK_COL;
+    ctx.beginPath();
+    ctx.moveTo(x - 0.5, y + 1);
+    ctx.lineTo(x + 9, y + 1);
+    ctx.lineTo(x + 6, y + MARK_BAR_H / 2);
+    ctx.lineTo(x + 9, y + MARK_BAR_H - 1);
+    ctx.lineTo(x - 0.5, y + MARK_BAR_H - 1);
+    ctx.closePath();
+    ctx.fill();
+    // The name gets the room up to the next marker and no more, so a long one cannot
+    // paint over its neighbour and leave two unreadable names instead of one.
+    const next = list[i + 1] ? list[i + 1].t * state.pxPerSec : Infinity;
+    const room = Math.min(next - x - 16, 180);
+    if (m.name && room > 12) {
+      ctx.fillStyle = held ? '#ffffff' : '#c7cddb';
+      ctx.fillText(fitText(ctx, m.name, room), x + 12, y + MARK_BAR_H / 2 + 0.5);
+    }
+  }
+  ctx.restore();
 }
 
 /** Shade the parts of the timeline a ranged render would ignore. */
@@ -3790,6 +3974,14 @@ function snapDetail(t, movingIds) {
   const pts = [0, state.playhead];
   if (state.inPoint != null) pts.push(state.inPoint);
   if (state.outPoint != null) pts.push(state.outPoint);
+  // Markers, which is most of what they are FOR: a mark on the beat, on the word or on
+  // the moment the demo clicks the button is only worth dropping if the next clip can be
+  // pulled onto it. `movingIds` carries the marker being dragged as well as the clips
+  // being dragged, so a marker cannot snap to itself - it would never move again.
+  for (const m of markers()) {
+    if (movingIds && movingIds.has(m.id)) continue;
+    pts.push(m.t);
+  }
   for (const { clip } of allClips()) {
     if (movingIds && movingIds.has(clip.id)) continue;
     pts.push(clip.start, clipEnd(clip));
@@ -4128,6 +4320,119 @@ function startTrim(e, anchor, edge) {
   document.addEventListener('mouseup', onUp);
 }
 
+// ---- the marker lane's gestures --------------------------------------------
+/*
+ * THE LANE IS A SEPARATE SURFACE FROM THE REST OF THE RULER, and it has to be.
+ *
+ * Every press on the ruler scrubs the playhead. That is the right default and it is what
+ * people reach for, so a marker cannot be grabbed "anywhere near its time" - the whole
+ * ruler is near something. The bottom strip is the marker's, the rest is the scrub's, and
+ * the stem drawn up through the ticks is what says the two belong to each other.
+ */
+
+let markerDrag = null;   // { id, grab } while one is being dragged
+
+/** Is this event inside the marker lane? */
+function inMarkerLane(e) {
+  const r = $('#ruler').getBoundingClientRect();
+  const y = (e.clientY - r.top) / Math.max(1, r.height) * RULER_H;
+  return y >= MARK_LANE_Y;
+}
+
+/** The marker under a ruler event, or null. The pennant hangs to the RIGHT of its time. */
+function markerAtEvent(e) {
+  const t = xToTime(e.clientX);
+  const tol = MARK_GRAB / Math.max(1, state.pxPerSec);
+  // The flag is drawn from the marker's own x out to +9px, so a press on the flag is a
+  // press a few pixels AFTER the time it marks. Reaching further forward than back is
+  // what makes the thing you can see the thing you can grab.
+  let best = null, bestD = Infinity;
+  for (const m of markers()) {
+    const d = m.t <= t ? (t - m.t) / 1.6 : (m.t - t);
+    if (d <= tol && d < bestD) { bestD = d; best = m; }
+  }
+  return best;
+}
+
+/**
+ * Drag a marker along the ruler. It SNAPS, to everything else a clip snaps to.
+ *
+ * A marker is usually being put on something - a cut, another marker, the playhead - and
+ * a mark one frame off the cut it was meant to be on is worse than no mark at all,
+ * because everything afterwards snaps to the wrong place with total confidence.
+ */
+function startMarkerDrag(e, m) {
+  const grab = m.t - xToTime(e.clientX);
+  const t0 = m.t;
+  markerDrag = { id: m.id, grab };
+  // The undo entry is pushed at the START, so one drag is one entry and undo goes back to
+  // where the marker was rather than to somewhere it passed through.
+  pushUndo();
+  const self = new Set([m.id]);
+  const move = (ev) => {
+    m.t = Math.max(0, snapTime(Math.max(0, xToTime(ev.clientX) + grab), self));
+    markers().sort((a, b) => a.t - b.t);
+    renderRuler();
+  };
+  const up = () => {
+    document.removeEventListener('mousemove', move);
+    document.removeEventListener('mouseup', up);
+    markerDrag = null;
+    if (Math.abs(m.t - t0) < 1e-6) {
+      // It never moved. Undo must not grow an entry for a press, so the one pushed on the
+      // way in is taken back off - a click on a marker is a click, not an edit.
+      undoStack.pop();
+      seek(m.t);
+    } else {
+      markDirty();
+      setStatus('Marker "' + m.name + '" at ' + fmtTc(m.t) + '.');
+    }
+    renderRuler();
+  };
+  document.addEventListener('mousemove', move);
+  document.addEventListener('mouseup', up);
+}
+
+/**
+ * Rename a marker in place, with a real input over the lane.
+ *
+ * `prompt()` is not available in an Electron renderer, and a modal for one short string
+ * is heavier than the thing it is editing. The field is positioned where the name is
+ * already drawn, so the edit happens where the reader is looking.
+ */
+function renameMarkerAt(m) {
+  const host = $('#rulerScroll');
+  const stale = host.querySelector('.mark-rename');
+  if (stale) stale.remove();
+  const inp = document.createElement('input');
+  inp.className = 'mark-rename';
+  inp.type = 'text';
+  inp.value = m.name || '';
+  inp.style.left = (m.t * state.pxPerSec + 11) + 'px';
+  inp.style.top = MARK_LANE_Y + 'px';
+  inp.style.height = MARK_BAR_H + 'px';
+  host.appendChild(inp);
+  inp.focus();
+  inp.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const v = inp.value.trim();
+    inp.remove();
+    if (save && v !== m.name) { pushUndo(); m.name = v; markDirty(); }
+    renderRuler();
+  };
+  // The editor's single-key shortcuts would otherwise fire on every letter typed - `s`
+  // splits, `m` drops another marker. Same guard every text field in the panel carries.
+  inp.addEventListener('keydown', (ev) => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') finish(true);
+    else if (ev.key === 'Escape') finish(false);
+  });
+  inp.addEventListener('blur', () => finish(true));
+}
+
 // Scrubbing: ruler drag, and ctrl-drag anywhere in the tracks area.
 function scrubFrom(e) {
   const set = (ev) => { seek(xToTime(ev.clientX)); };
@@ -4156,7 +4461,44 @@ $('#tracks').addEventListener('dblclick', (e) => {
   if (best) addTransition(state.lastTransitionType || 'swipe', best);
 });
 
-$('#ruler').addEventListener('mousedown', scrubFrom);
+/**
+ * One press on the ruler: a marker grab in the lane, a scrub everywhere else.
+ *
+ * The lane test comes first and returns, so a press on a marker never also moves the
+ * playhead. Dragging the thing you grabbed while something else moves underneath is the
+ * same fault the tracker's markers had on the viewer, and it reads as a broken control
+ * rather than as two controls.
+ */
+$('#ruler').addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (inMarkerLane(e)) {
+    const m = markerAtEvent(e);
+    if (m) { e.preventDefault(); startMarkerDrag(e, m); return; }
+  }
+  scrubFrom(e);
+});
+
+// Double-click in the lane: rename the marker there, or drop one where there is none.
+$('#ruler').addEventListener('dblclick', (e) => {
+  if (!inMarkerLane(e)) return;
+  e.preventDefault();
+  const m = markerAtEvent(e);
+  if (m) renameMarkerAt(m);
+  else {
+    const made = addMarker(state.snap ? snapTime(xToTime(e.clientX), null) : xToTime(e.clientX));
+    if (made) renameMarkerAt(made);
+  }
+});
+
+// Right-click a marker to remove it. No menu: there is exactly one thing to do to one.
+$('#ruler').addEventListener('contextmenu', (e) => {
+  if (!inMarkerLane(e)) return;
+  const m = markerAtEvent(e);
+  if (!m) return;
+  e.preventDefault();
+  removeMarker(m.id);
+});
+
 $('#tracksArea').addEventListener('mousedown', (e) => { if (e.ctrlKey) scrubFrom(e); });
 
 $('#tracksScroll').addEventListener('scroll', () => {
@@ -4366,7 +4708,11 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
     // directly onto the frame would behave differently over video than over transparency.
     FX.render(cctx, W, H, c, local, fxSurface, (tc) => {
       if (layer.tagName === 'CANVAS') tc.drawImage(layer, 0, 0, W, H);
-      else drawClipTo(c, layer, tc, W, H);
+      // `trackFramed` rather than the clip: a `crop`-mode binding moves the crop window
+      // instead of the picture, so the framing this frame is drawn with is not the one
+      // on the clip. It answers the clip itself for everything that is not bound that
+      // way, which is every clip in almost every project.
+      else drawClipTo(trackFramed(c, local), layer, tc, W, H);
     }, frameDur);
     painted = true;
   }
@@ -4570,7 +4916,9 @@ function layerFor(clip, P) {
   if (frameReady(el)) {
     const c2 = cv.getContext('2d');
     c2.clearRect(0, 0, P.w, P.h);
-    drawClip(clip, el, c2);
+    // Framed for THIS instant - see `trackFramed()`. The viewer crops here and the baker
+    // crops inside `compositeLayers()`, so both have to ask the same question.
+    drawClip(trackFramed(clip, state.playhead - clip.start), el, c2);
     cv.dataset.held = '1';
   }
   return cv.dataset.held ? cv : null;
@@ -4675,7 +5023,7 @@ function transPlate(clip, atTime, name, W, H, fps) {
   const el = mediaFor(clip);
   if (!frameReady(el)) return null;
   paint();
-  drawClipTo(clip, el, c2, W, H);
+  drawClipTo(trackFramed(clip, atTime - clip.start), el, c2, W, H);
   heldFrames[name] = clip.id;
   return cv;
 }
@@ -5228,6 +5576,19 @@ canvas.addEventListener('pointerup', (e) => {
 
 canvas.addEventListener('mousedown', (e) => {
   if (Mouse.recording) return;
+  /*
+   * A MARKER GRAB IS NOT A FRAMING DRAG, and `stopPropagation()` on the pointer event
+   * could never say so.
+   *
+   * The tracker's handlers are `pointerdown`/`pointermove`/`pointerup` and this one is
+   * `mousedown`. For a MOUSE pointer Chromium fires the compatibility mouse events
+   * whatever the pointer event did - a different event type on the same element is not
+   * something propagation reaches - so grabbing a marker started a framing drag
+   * underneath it: the crop slid across the picture while the tracker was being placed,
+   * and it took an undo entry of its own on the way in. The test has to be for the state
+   * the pointer handler set, and the pointer handler always runs first.
+   */
+  if (Trk.drag) return;
   const c = activeVideoClip();
   if (!c) return;
   canvas.classList.add('dragging');
@@ -5236,7 +5597,7 @@ canvas.addEventListener('mousedown', (e) => {
   pushUndo();
 });
 document.addEventListener('mousemove', (e) => {
-  if (!framingDrag) return;
+  if (!framingDrag || Trk.drag) return;
   const rect = canvas.getBoundingClientRect();
   const c = framingDrag.c;
   // Full pan range across roughly one canvas width of mouse travel.
@@ -5391,6 +5752,11 @@ function snapshot() {
     tracks: state.tracks,
     selection: [...state.selection],
     master: state.master,
+    // Markers are EDITS, not settings: dropping one, moving one or renaming one changes
+    // the project and has to be undoable, the same as moving a clip. They are also snap
+    // targets, so an undo that left a stale one behind would keep pulling clips onto a
+    // moment that no longer exists.
+    markers: state.markers,
   });
 }
 function pushUndo() {
@@ -5406,6 +5772,10 @@ function restore(snap) {
   // and reloaded is not a thing, but an entry pushed earlier in THIS session by code that
   // did not know about it would be, so it reads as an empty stack rather than undefined.
   state.master = FX.normalizeStack(s.master);
+  // Absent in an entry pushed earlier in this session by code that predates markers,
+  // which reads as "there were none" rather than as undefined - the same guard the
+  // master stack above carries, for the same reason.
+  state.markers = normalizeMarkers(s.markers);
   renderAll();
 }
 function undo() {
@@ -6487,6 +6857,7 @@ function newProject() {
   state.playhead = 0;
   state.selTransition = null;
   state.inPoint = state.outPoint = null;
+  state.markers = [];
   state.filePath = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS);
@@ -7373,6 +7744,7 @@ function serialize() {
     playhead: state.playhead,
     inPoint: state.inPoint,
     outPoint: state.outPoint,
+    markers: state.markers,
     tighten: state.tighten,
     captions: state.captions,
     presetList: state.presetList,
@@ -7436,6 +7808,7 @@ async function openProject(filePath) {
   state.playhead = d.playhead || 0;
   state.inPoint = d.inPoint == null ? null : d.inPoint;
   state.outPoint = d.outPoint == null ? null : d.outPoint;
+  state.markers = normalizeMarkers(d.markers);
   state.selTransition = null;
   state.out.loudness = Object.assign({}, AudioFX.LOUD_DEFAULTS, (d.out || {}).loudness);
   state.tighten = Object.assign({}, TIGHTEN_DEFAULTS, d.tighten);
@@ -9319,7 +9692,10 @@ $('#btnImportFolder').addEventListener('click', async () => importPaths(await wi
 const Trk = {
   busy: false,
   cancel: false,
-  drag: null,      // { clip, track, x, y } while a marker is being dragged
+  // { clip, track, x, y, gx, gy, x0, y0, fixOnly, moved } while a marker is dragged.
+  // `gx`/`gy` are the GRAB OFFSET - where in the marker the pointer took hold - and
+  // `x0`/`y0` are where it started, which is what the ghost ring is drawn at.
+  drag: null,
   worker: null,    // the Worker, built once
   job: 0,
 };
@@ -9518,7 +9894,8 @@ function trkSourcePoint(clip, fx, fy) {
   // own on the master format and its override on any other. A copy rather than the clip
   // itself: `frameMap` reads pan/zoom off whatever it is handed, and nothing here is
   // allowed to write a view mode's framing back onto the timeline.
-  const crop = Tracker.frameMap(framedCopy(clip), outSize().w / outSize().h).crop;
+  const crop = Tracker.frameMap(
+    trackFramed(clip, state.playhead - clip.start), outSize().w / outSize().h).crop;
   return {
     x: clamp(crop.x + fx * crop.w, 0, 1),
     y: clamp(crop.y + fy * crop.h, 0, 1),
@@ -9653,11 +10030,98 @@ FX.setBinder((clip, bind, tLocal, W, H) => {
   const owner = bindOwner(clip, bind);
   if (!owner) return null;
   const A = (Number(W) || 9) / (Number(H) || 16);
-  if (owner === clip) return Tracker.bindPos(clip, bind, srcAt(clip, tLocal), A, tLocal);
+  // Mapped through the crop the picture is actually DRAWN with at this instant, which on
+  // a clip carrying a `crop`-mode binding is not the one sitting on the clip - it slides
+  // every frame. A spotlight bound on the same clip has to be told where the point landed
+  // in the frame that was painted, not in the one the sliders describe.
+  if (owner === clip) {
+    return Tracker.bindPos(trackFramed(clip, tLocal), bind, srcAt(clip, tLocal), A, tLocal);
+  }
   // Across clips: this clip's local time -> the timeline -> the owner's source time.
-  const tOwner = srcAt(owner, (clip.start + tLocal) - owner.start);
-  return Tracker.bindPos(owner, bind, tOwner, A, tLocal);
+  const tOwn = (clip.start + tLocal) - owner.start;
+  const tOwner = srcAt(owner, tOwn);
+  return Tracker.bindPos(trackFramed(owner, tOwn), bind, tOwner, A, tLocal);
 });
+
+/**
+ * The pan a `crop`-mode binding wants at this instant, or null when nothing asks for one.
+ *
+ * WHY THIS IS NOT AN EFFECT'S `draw()`. A bound `transform` in 'camera' mode translates
+ * the layer the stack is painting, and that layer has already been cropped to the output
+ * shape - so pushing it sideways slides its own edge into view and lets black in behind
+ * it. That is correct for a logo on a transparent layer and completely wrong for 16:9
+ * footage framed to 9:16, which is the commonest shape in this app: there are hundreds of
+ * source pixels either side of the crop doing nothing, and sliding the CROP across them
+ * follows the point with no edge to expose at all. The crop is decided before the stack
+ * runs, because the crop is what the stack paints, so it cannot be one of the effects in
+ * it - `FX.DEFS.transform.bind.apply()` takes the two position parameters over and draws
+ * nothing, and this is where the movement actually happens.
+ *
+ * It works in SOURCE fractions from end to end (`pos.sx`/`pos.sy`), never in frame ones.
+ * A frame position is a position after the crop, and reading one to decide where to put
+ * the crop is circular.
+ *
+ * Clamped to 0..1, which is the promise the mode makes: the crop cannot leave the source,
+ * so a black edge is unreachable rather than merely unlikely. A tracked point that walks
+ * off the side of the frame therefore stops being centred rather than dragging the
+ * picture off its own edge, which is the right failure of the two.
+ */
+function trackCropPan(clip, tLocal) {
+  // The cheap test first: this runs per clip per frame, and almost no clip has a track.
+  if (!clip || !Tracker.hasTracks(clip)) return null;
+  const entry = FX.active(clip).find((f) =>
+    f.type === 'transform' && f.bind && f.bind.track && f.bind.mode === 'crop');
+  if (!entry) return null;
+  // SAME CLIP ONLY. A crop is a window onto THIS clip's source, and a point measured on
+  // another clip's source is not a place on it - there is nothing to slide towards. A
+  // cross-clip crop binding degrades to the sliders, exactly as a deleted track does.
+  if (entry.bind.clip && entry.bind.clip !== clip.id) return null;
+  const f = framingOf(clip);
+  // A 'contain' still has no crop window: the whole picture is already inside the frame.
+  if (f.fit === 'contain') return null;
+  const sw = Number(clip.srcW) || 0, sh = Number(clip.srcH) || 0;
+  if (!(sw > 0) || !(sh > 0)) return null;
+  const o = outSize();
+  const A = o.w / o.h;
+  const pos = Tracker.bindPos(clip, entry.bind, srcAt(clip, tLocal), A, tLocal);
+  if (!pos || !isFinite(pos.sx) || !isFinite(pos.sy)) return null;
+  const zoom = Math.max(0.01, Number(f.zoom) || 1);
+  // The crop rectangle as a fraction of the source - the same two lines `drawClipTo()`
+  // computes in pixels, and they must stay in agreement for the point to land anywhere.
+  const cw = Math.min(sw, sh * A) / zoom / sw;
+  const ch = Math.min(sh, sw / A) / zoom / sh;
+  // pan = (point - want * crop) / slack, which is `drawClipTo()`'s offset solved for pan.
+  const pan = (pt, c, want, fallback) => {
+    const slack = 1 - c;
+    if (!(slack > 1e-6)) return fallback;        // no room on this axis; nothing to do
+    return clamp((pt - want * c) / slack, 0, 1);
+  };
+  return {
+    panX: pan(pos.sx, cw, 0.5 + (Number(pos.offX) || 0), f.panX),
+    panY: pan(pos.sy, ch, 0.5 + (Number(pos.offY) || 0), f.panY),
+  };
+}
+
+/**
+ * The clip as the picture is framed at `tLocal` - `framedCopy()` plus any tracked crop.
+ *
+ * Everything that maps between the source and the frame goes through this rather than
+ * through the clip: the draw, the markers on the viewer, a drag that reads a pixel back,
+ * and every other binding on the same clip. A copy, never the clip - a view mode and a
+ * tracked crop are both things the timeline must never be written back with.
+ *
+ * `frames` is dropped from the copy on purpose. `framingOf()` reads the per-format
+ * override off the clip and it would win over the values assigned here, so the override
+ * is folded in first and then removed - otherwise the tracked crop would be silently
+ * ignored on every format but the master.
+ */
+function trackFramed(clip, tLocal) {
+  const pan = trackCropPan(clip, tLocal);
+  if (!pan) return framedCopy(clip);
+  const out = Object.assign({}, clip, framingOf(clip), { panX: pan.panX, panY: pan.panY });
+  delete out.frames;
+  return out;
+}
 
 /** Every track marker visible on the viewer right now, in frame fractions. */
 function trackMarkers() {
@@ -9666,7 +10130,7 @@ function trackMarkers() {
   for (const c of sel) {
     const tLocal = state.playhead - c.start;
     if (tLocal < -1e-6 || tLocal > clipLen(c) + 1e-6) continue;
-    const m = Tracker.frameMap(framedCopy(c), outSize().w / outSize().h);
+    const m = Tracker.frameMap(trackFramed(c, tLocal), outSize().w / outSize().h);
     for (const tk of c.tracks) {
       const s = Tracker.sampleAt(tk, srcAt(c, tLocal));
       if (!s) continue;
@@ -9687,8 +10151,21 @@ function trackMarkers() {
 function drawTrackOverlay(c, W, H) {
   const marks = trackMarkers();
   if (!marks.length) return;
+  const d = Trk.drag;
   for (const m of marks) {
-    const x = m.x * W, y = m.y * H;
+    /*
+     * A DRAGGED MARKER IS DRAWN UNDER THE POINTER, not where its samples still say.
+     *
+     * It used to be drawn at the solved position throughout, with a dashed ghost
+     * following the cursor - so the thing being dragged sat perfectly still, and the
+     * moment the button came up it jumped. That reads as a teleport rather than as a
+     * drag, and it is the reason nobody could tell whether they had grabbed the marker
+     * or the picture behind it. The samples have not moved yet, and they must not: the
+     * re-anchor is committed on pointerup and undo has to have something to go back to.
+     * This is a drawing decision only.
+     */
+    const live = d && d.track === m.track;
+    const x = (live ? d.x : m.x) * W, y = (live ? d.y : m.y) * H;
     // "Lost" is only a thing a SOLVED track can be. A marker that has not been solved yet
     // is not failing at anything - it is waiting to be put somewhere and solved, and
     // painting it in the alarm colour was half of why the first build read as broken.
@@ -9710,16 +10187,19 @@ function drawTrackOverlay(c, W, H) {
     c.moveTo(x, y + 3); c.lineTo(x, y + r + 5);
     c.stroke();
     c.font = '11px system-ui, sans-serif';
-    c.fillText(m.track.name + (lost ? '  lost' : (solved ? '' : '  drag me, then Solve')),
+    c.fillText(m.track.name + (live ? (d.fixOnly ? '  fixing this frame' : '  drop to re-anchor')
+      : (lost ? '  lost' : (solved ? '' : '  drag me, then Solve'))),
       x + r + 8, y - r - 2);
     c.restore();
   }
-  if (Trk.drag) {
+  // Where the drag started, so the distance being moved is visible while it is happening.
+  if (d && d.moved) {
     c.save();
     c.strokeStyle = Cursor.ACCENT;
+    c.globalAlpha = 0.45;
     c.setLineDash([4, 3]);
     c.beginPath();
-    c.arc(Trk.drag.x * W, Trk.drag.y * H, 11, 0, Math.PI * 2);
+    c.arc(d.x0 * W, d.y0 * H, 11, 0, Math.PI * 2);
     c.stroke();
     c.restore();
   }
@@ -9760,14 +10240,32 @@ canvas.addEventListener('pointerdown', (e) => {
   // wrong from here on and re-solves it, and an Alt-drag says this one frame is wrong and
   // leaves every other sample alone. In the middle of a long track with one bad stretch,
   // re-solving the remaining minute to correct six frames is a bad trade.
-  Trk.drag = { clip: m.clip, track: m.track, x: m.x, y: m.y, fixOnly: !!e.altKey };
+  /*
+   * THE GRAB OFFSET IS KEPT. The marker is caught from up to `TRK_GRAB` canvas pixels
+   * away, so setting its position straight to the pointer's snatched it sideways by
+   * however far off-centre the press landed - a jump at the start of every drag, on a
+   * control whose entire job is to be put on an exact pixel. The pointer now moves the
+   * marker BY the distance it travels, which is what a drag is.
+   */
+  const p = mousePointAt(e);
+  Trk.drag = {
+    clip: m.clip, track: m.track,
+    x: m.x, y: m.y, x0: m.x, y0: m.y,
+    gx: m.x - p.x, gy: m.y - p.y,
+    fixOnly: !!e.altKey, moved: false,
+  };
   try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
 }, true);
 
 canvas.addEventListener('pointermove', (e) => {
-  if (!Trk.drag) return;
+  const d = Trk.drag;
+  if (!d) return;
+  e.preventDefault();
+  e.stopPropagation();
   const p = mousePointAt(e);
-  Trk.drag.x = p.x; Trk.drag.y = p.y;
+  d.x = clamp(p.x + d.gx, 0, 1);
+  d.y = clamp(p.y + d.gy, 0, 1);
+  d.moved = true;
 }, true);
 
 canvas.addEventListener('pointerup', (e) => {
@@ -9776,6 +10274,10 @@ canvas.addEventListener('pointerup', (e) => {
   Trk.drag = null;
   e.preventDefault();
   e.stopPropagation();
+  // A PRESS THAT NEVER MOVED IS NOT A CORRECTION. Committing one re-anchored the track to
+  // the pixel it was already on and re-solved the rest of the clip for it - a seek per
+  // frame, for nothing, every time somebody clicked a marker to see which one it was.
+  if (!d.moved || (Math.abs(d.x - d.x0) < 1e-4 && Math.abs(d.y - d.y0) < 1e-4)) return;
   if (d.fixOnly) fixTrackerHere(d.clip, d.track, d.x, d.y);
   else reanchorTracker(d.clip, d.track, d.x, d.y);
 }, true);
@@ -11255,7 +11757,13 @@ const SHORTCUTS = [
   ['N', 'Toggle snapping'],
   ['B', 'Show / hide the QuickBin'],
   ['Double-click in the bin', 'Put that clip on the timeline at the playhead'],
-  ['M', 'Mute or unmute the first audio track'],
+  ['M', 'Drop a marker at the playhead'],
+  ['Shift+M / Alt+Shift+M', 'Go to the next / previous marker'],
+  ['Alt+Delete', 'Remove the marker at the playhead'],
+  ['Drag a marker in the lane', 'Move it, snapping to cuts, marks and the playhead'],
+  ['Double-click the marker lane', 'Rename a marker, or drop and name a new one'],
+  ['Right-click a marker', 'Remove it'],
+  ['Alt+M', 'Mute or unmute the first audio track'],
 ];
 $('#shortcutList').innerHTML = SHORTCUTS
   .map((s) => '<kbd>' + escapeHtml(s[0]) + '</kbd><span>' + escapeHtml(s[1]) + '</span>').join('');
@@ -11292,6 +11800,8 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Home') { seek(0); }
   else if (e.key === 'End') { seek(projectDuration()); }
   else if (e.key.toLowerCase() === 's') { splitAtPlayhead(); }
+  // BEFORE the plain Delete branch, which matches on the key alone and would swallow it.
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && e.altKey) { removeMarkerAtPlayhead(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') {
     if (state.selTransition) deleteTransition(); else deleteSelected(e.shiftKey);
   }
@@ -11320,10 +11830,25 @@ document.addEventListener('keydown', (e) => {
     $('#snapToggle').checked = state.snap;
     log('Snapping ' + (state.snap ? 'on' : 'off'));
   }
-  else if (e.key.toLowerCase() === 'm') {
+  /*
+   * `M` IS THE MARKER KEY, everywhere. It used to mute the first audio track here, which
+   * is a track-head button away and is the one thing in this list nothing else could
+   * reach for - so mute moved to `Alt+M` and the letter went where every other editor
+   * puts it. `Shift+M` and `Alt+Shift+M` walk to the next and previous mark.
+   */
+  else if (e.key.toLowerCase() === 'm' && e.altKey && e.shiftKey) {
+    const m = markerStep(state.playhead, -1);
+    if (m) { seek(m.t); setStatus('Marker "' + m.name + '".'); } else setStatus('No earlier marker.');
+  }
+  else if (e.key.toLowerCase() === 'm' && e.altKey) {
     const t = state.tracks.find((x) => x.type === 'audio');
     if (t) { t.muted = !t.muted; markDirty(); renderAll(); }
   }
+  else if (e.key.toLowerCase() === 'm' && e.shiftKey) {
+    const m = markerStep(state.playhead, 1);
+    if (m) { seek(m.t); setStatus('Marker "' + m.name + '".'); } else setStatus('No later marker.');
+  }
+  else if (e.key.toLowerCase() === 'm') { addMarker(); }
   else if (e.key === 'F5') { location.reload(); }
   // Esc stops a take FIRST and does nothing else: the person performing has both hands
   // busy and the nearest exit has to be unambiguous, not also a deselect.
@@ -11389,6 +11914,7 @@ $('#btnAddText').addEventListener('click', () => addTextCard());
   });
 })();
 $('#btnAddTransition').addEventListener('click', () => addTransition(state.lastTransitionType));
+$('#btnAddMarker').addEventListener('click', () => addMarker());
 $('#btnDelTransition').addEventListener('click', () => deleteTransition());
 
 // Closing the drawer just clears the selection - the drawer follows the selected card.

@@ -167,7 +167,14 @@
 
     // ------------------------------------------------------------- the ruler
     renderRuler();
-    ok('the ruler is tall enough for the cache bar', document.querySelector('#ruler').height === 38);
+    // Against the CONSTANT, not against a number typed here. The ruler grew a marker lane
+    // and this assertion was the only thing in the app still claiming it was 38 pixels
+    // tall - a literal here is a second source of truth for a layout that has one.
+    const rulerCv = document.querySelector('#ruler');
+    ok('the ruler is as tall as the layout says', rulerCv.height === RULER_H, rulerCv.height);
+    ok('...and the three strips fit inside it without overlapping',
+      MARK_LANE_Y > 26 && MARK_LANE_Y + MARK_BAR_H + CACHE_BAR_H === RULER_H,
+      MARK_LANE_Y + ' + ' + MARK_BAR_H + ' + ' + CACHE_BAR_H + ' = ' + RULER_H);
     $('#renderRange').value = 'marks';
     renderRangeOverlay();
     const ov = document.querySelector('#rangeOverlay');

@@ -86,6 +86,7 @@
           <button id="btnAddText" class="accent" title="Add a text card at the playhead (Ctrl+T)">+ Text</button>
           <select id="addGraphic" title="Add a graphic at the playhead (Ctrl+G adds the last one again)"></select>
           <button id="btnAddTransition" title="Drop a transition on the nearest cut (T). Double-clicking a cut does the same.">+ Transition</button>
+          <button id="btnAddMarker" title="Drop a marker at the playhead (M). Clips snap to markers. Drag one in the lane below the ruler to move it, double-click to rename, right-click to remove.">+ Mark</button>
         </div>
         <div class="group">
           <button id="btnAddVideoTrack" title="Add video track">+ V</button>
@@ -112,7 +113,7 @@
             <button id="btnZoomIn" class="mini" title="Zoom in (+)">+</button>
             <button id="btnZoomFit" class="mini" title="Fit (Shift+Z)">Fit</button>
           </div>
-          <div id="rulerScroll"><canvas id="ruler" height="38"></canvas></div>
+          <div id="rulerScroll"><canvas id="ruler" height="50" title="Drag to scrub. The strip along the bottom is the marker lane: double-click it to drop a mark, drag a mark to move it, right-click one to remove it."></canvas></div>
         </div>
         <div id="tracksScroll">
           <div id="trackHeads"></div>

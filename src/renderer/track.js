@@ -665,7 +665,8 @@
     // Damped in SOURCE space, before the framing map. The map is affine, so damping either
     // side of it is the same picture - and doing it here means `strength` means "a
     // fraction of how far the tracked thing actually moved", which is what it says.
-    const p = m(a.x + (s.x - a.x) * strength, a.y + (s.y - a.y) * strength);
+    const dx = a.x + (s.x - a.x) * strength, dy = a.y + (s.y - a.y) * strength;
+    const p = m(dx, dy);
     /*
      * THE OFFSETS COME BACK RATHER THAN BEING APPLIED, and that is not fussiness.
      *
@@ -681,9 +682,20 @@
     // absolute position - the author placed the thing where they wanted it and the track
     // is there to carry it, not to teleport it onto the tracked pixel.
     const ap = m(a.x, a.y);
+    /*
+     * THE DAMPED POINT IN SOURCE FRACTIONS COMES BACK TOO - `sx`/`sy`, with the anchor as
+     * `asx`/`asy` - and it is not a duplicate of `x`/`y`.
+     *
+     * `x`/`y` are the point AFTER the crop, which is the only answer a consumer that
+     * draws into the finished frame can use. A consumer that moves the CROP ITSELF cannot
+     * use it: the crop is what the map is made of, so reading a position through it to
+     * decide where to put it is circular. The transform's `crop` mode is exactly that
+     * consumer, and it works in these instead - the axis the samples were measured on.
+     */
     return {
       x: p.x, y: p.y, c: s.c,
       ax: ap.x, ay: ap.y,
+      sx: dx, sy: dy, asx: a.x, asy: a.y,
       offX: anim('offX', num(bind.offX, 0)),
       offY: anim('offY', num(bind.offY, 0)),
     };
