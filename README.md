@@ -2818,8 +2818,13 @@ in a warning line rather than silently sliding.
 
 #### The plate, the edges and the keys
 
-The provider draws the decoded plane through `Tracker.frameMap()`'s crop, so re-framing the
-clip moves the matte with the picture. Grow, then feather, then invert, in fractions of the
+The provider draws the decoded plane through the crop of **`trackFramed(clip, t)`**, not of
+the clip, so re-framing the clip moves the matte with the picture — and so does a **`crop`-mode
+motion-track binding**, whether it sits on the clip or on an adjustment layer reaching down.
+That framing changes every frame, which is why it is asked for at a time rather than read off
+the clip: a plate built from the resting framing sat still while the picture slid under it,
+and a matte that has come loose is what that looks like. The sliding crop is already in the
+plate's `sig`, so the memo follows it. Grow, then feather, then invert, in fractions of the
 plane's shorter side (the unit rule), all keyframeable because they are `matte` params.
 **The plate is built as alpha**, white at full alpha falling to zero, never black-and-white.
 A matte that has not loaded yet draws the clip unmasked and starts the load.

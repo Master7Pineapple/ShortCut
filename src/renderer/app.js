@@ -11680,13 +11680,14 @@ function rmPlane(mask, store, idx) {
  * The plate `fx.js` masks with: a canvas whose ALPHA is the matte, in FRAME space.
  *
  * The matte is in SOURCE space and the layer is the FRAMED picture, so the plane is drawn
- * through the same crop `drawClipTo()` uses - `Tracker.frameMap()`. Pan, zoom or re-frame
- * the clip and the matte moves with the picture.
+ * through the same crop `drawClipTo()` uses - `Tracker.frameMap(trackFramed(...))`. Pan,
+ * zoom or re-frame the clip and the matte moves with the picture; so does a tracked crop,
+ * which is why the framing is asked for AT A TIME rather than read off the clip.
  *
  * The plate is built as TRANSPARENCY - white at full alpha falling to white at zero -
  * never as black-and-white, which would be opaque everywhere and mask nothing.
  */
-function rmPlate(clip, mask, tSrc, W, H, p) {
+function rmPlate(clip, mask, tSrc, W, H, p, tLocal) {
   const store = rmStore(mask);
   if (!store || store.status !== 'ready' || !store.frames.length) return null;
   // A frame-space matte (a vertical export of a Resolve timeline) is the finished frame:
@@ -11697,7 +11698,15 @@ function rmPlate(clip, mask, tSrc, W, H, p) {
   if (idx < 0) return null;
   const { w, h } = store;
 
-  const crop = space === 'frame' ? { x: 0, y: 0, w: 1, h: 1 } : Tracker.frameMap(clip, W / Math.max(1, H)).crop;
+  // `trackFramed`, NOT the clip. A `crop`-mode motion-track binding - on the clip, or on
+  // an adjustment layer above it reaching down - slides the crop window every frame, and
+  // the picture is drawn through that slid window. A plate built from the clip's resting
+  // framing would therefore sit still while the picture moved under it, which looks like a
+  // matte that has come loose. The sliding crop is already in `sig`, so the memo follows.
+  const crop = space === 'frame'
+    ? { x: 0, y: 0, w: 1, h: 1 }
+    : Tracker.frameMap(trackFramed(clip, isFinite(tLocal) ? tLocal : tSrc - (Number(clip.in) || 0)),
+      W / Math.max(1, H)).crop;
   const r4 = (x) => Math.round((Number(x) || 0) * 1e4) / 1e4;
   const sig = [rmKey(mask), idx, W, H,
     r4(p.feather), r4(p.grow), p.invert ? 1 : 0, r4(p.mix),
@@ -11804,12 +11813,15 @@ FX.setMatteProvider((clip, entry, t, W, H, p) => {
   // clip's, not this one's - the two start at different places on the timeline.
   const owner = isAdjustClip(clip) ? matteReach(clip, clip.start + t) : clip;
   if (!owner || !Matte.hasMasks(owner)) return null;
-  const tSrc = (Number(owner.in) || 0) + (owner === clip ? t : clip.start + t - owner.start);
+  // The owner's own clip-local time: the same instant, counted from its start rather than
+  // from this layer's. It is what the matte's crop is framed at.
+  const tOwn = owner === clip ? t : clip.start + t - owner.start;
+  const tSrc = (Number(owner.in) || 0) + tOwn;
   const mask = Matte.maskFor(owner, p && p.mask);
   if (!mask) return null;
   try {
     if (!rmStore(mask)) { rmLoad(mask); return null; }
-    return rmPlate(owner, mask, tSrc, W, H, p || {});
+    return rmPlate(owner, mask, tSrc, W, H, p || {}, tOwn);
   } catch (e) {
     // A failed plate is a clip that draws unmasked, never a frame that does not draw.
     return null;
