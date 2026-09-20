@@ -3106,6 +3106,8 @@ Key   = { t, v, ease }   // t is seconds into the CLIP, not the timeline
 Track = [ Key, ... ]     // kept sorted by t
 
 Anim.ease(easing, t)              // 0..1 -> 0..1, bezier or named
+Anim.easingName(ease)             // which preset this curve IS, by value - '' for a custom one
+Anim.easingPath(ease, w, h, pad)  // the curve as an SVG path, for the thumbnail in the panel
 Anim.evalTrack(keys, t)           // the value at t, or null when the track is empty
 Anim.addKey(keys, t, v?, ease?)   // v omitted = pin the value the track already shows
 Anim.removeKey(keys, i)
@@ -3119,7 +3121,14 @@ Four rules the tracks live by, each of which has a test:
   last key it is the last. Keys sitting outside the clip's own range therefore still
   produce a sensible slice of the curve inside it.
 - **Easing belongs to the key on the LEFT of a span** — it is the curve travelled to
-  *reach* the next key, so the final key's easing is never used.
+  *reach* the next key, so the final key's easing is never used. `keyStrip()` puts a
+  **Curve** picker on every key row for exactly that span, with a live thumbnail drawn by
+  `Anim.easingPath()` beside it, and the last key's picker is disabled and says why.
+  The menu is `Anim.EASING_MENU`, one entry per `EASING_PRESETS` key; a curve that matches
+  no preset — a hand-edited bezier in a `.scut` — shows as **Custom curve** and keeps its
+  numbers until something else is picked, because `easingName()` matches **by value** and
+  the key has never carried a preset name. That is what keeps a project readable by any
+  build: the key holds the curve, not a label for it.
 - **An unsorted track evaluates correctly and is not reordered.** `evalTrack` sorts a
   copy; a paint pass must never rewrite the author's data underneath it. Order is written
   in exactly one place, `Anim.sortKeys()`, called by the editing functions.

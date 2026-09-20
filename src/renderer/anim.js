@@ -9,7 +9,8 @@
  *
  * `Anim` owns five things and nothing else:
  *
- *   1. Easing - the cubic bezier solver, the named curves a bezier cannot express,
+ *   1. Easing - the cubic bezier solver, the named curves a bezier cannot express, the
+ *      menu of presets and the thumbnail path that draws one,
  *      and the preset menu both of those feed.
  *   2. A track - a plain array of `{ t, v, ease }`, sorted by `t`, evaluated at any time.
  *   3. Track editing - add / remove / move / retime one key.
@@ -104,6 +105,63 @@ const Anim = (() => {
   }
 
   const cloneEasing = (e) => JSON.parse(JSON.stringify(e || EASING_PRESETS.easeOut));
+
+  /**
+   * Which preset a key's easing IS, by value - '' for a curve that matches none of them.
+   *
+   * By value rather than by a name stored on the key, because the key has never carried a
+   * name: it carries the curve itself, which is what makes a `.scut` from any build
+   * readable by any other. A hand-edited bezier therefore answers '' and keeps its numbers
+   * instead of being snapped to the nearest preset by a menu that had to show something.
+   */
+  function easingName(e) {
+    if (!e) return '';
+    for (const k of Object.keys(EASING_PRESETS)) {
+      const p = EASING_PRESETS[k];
+      if (p.kind !== e.kind) continue;
+      if (p.kind === 'named') { if (p.name === e.name) return k; continue; }
+      const a = p.p || [], b = e.p || [];
+      if (a.length === b.length && a.every((n, i) => Math.abs(n - b[i]) < 1e-6)) return k;
+    }
+    return '';
+  }
+
+  /** The curve menu, in the order it is offered: gentle first, then the ones that overshoot. */
+  const EASING_MENU = [
+    { value: 'linear', label: 'Linear - no easing' },
+    { value: 'ease', label: 'Ease' },
+    { value: 'easeIn', label: 'Ease in - starts slow' },
+    { value: 'easeOut', label: 'Ease out - ends slow' },
+    { value: 'easeInOut', label: 'Ease in-out' },
+    { value: 'easeInQuad', label: 'Ease in (quad)' },
+    { value: 'easeOutQuad', label: 'Ease out (quad)' },
+    { value: 'easeInExpo', label: 'Ease in (expo) - very slow start' },
+    { value: 'easeOutExpo', label: 'Ease out (expo) - very slow end' },
+    { value: 'softLand', label: 'Soft land' },
+    { value: 'back', label: 'Back - dips before it goes' },
+    { value: 'backOut', label: 'Back out - overshoots, settles' },
+    { value: 'bounce', label: 'Bounce' },
+    { value: 'elastic', label: 'Elastic' },
+    { value: 'step', label: 'Hold - jump at the next key' },
+  ];
+
+  /**
+   * An easing sampled as an SVG path across a unit box, for the thumbnail beside the menu.
+   *
+   * `w` x `h` pixels, y flipped because SVG counts down, and padded by `pad` so a curve
+   * that overshoots 1 - back, bounce, elastic - is drawn rather than clipped at the edge.
+   */
+  function easingPath(e, w, h, pad, steps) {
+    const W = w || 40, H = h || 24, P = pad == null ? 3 : pad, N = Math.max(2, steps || 24);
+    const lo = -0.12, hi = 1.12;                    // the band an overshoot lives in
+    const y = (v) => H - P - ((v - lo) / (hi - lo)) * (H - 2 * P);
+    const pts = [];
+    for (let i = 0; i <= N; i++) {
+      const x = i / N;
+      pts.push((P + x * (W - 2 * P)).toFixed(2) + ',' + y(ease(e, x)).toFixed(2));
+    }
+    return 'M' + pts.join('L');
+  }
 
   // ------------------------------------------------------------------ tracks
 
@@ -382,7 +440,7 @@ const Anim = (() => {
 
   return {
     // easing
-    EASING_PRESETS, NAMED, bezier, ease, cloneEasing,
+    EASING_PRESETS, EASING_MENU, NAMED, bezier, ease, cloneEasing, easingName, easingPath,
     // motion blur
     temporalAverage,
     // tracks

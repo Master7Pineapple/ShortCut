@@ -757,6 +757,50 @@ const TextUI = (() => {
 
       kr.appendChild(t); kr.appendChild(v); kr.appendChild(vo);
       kr.appendChild(goto); kr.appendChild(del);
+
+      // THE CURVE TRAVELLED FROM THIS KEY TO THE NEXT ONE. The easing has always been on
+      // the key - `evalTrack()` reads `a.ease` for the span a..b - and this is the first
+      // thing that lets anyone choose it; before, every key kept the easeInOut it was
+      // created with. It belongs to the key on the LEFT, so the LAST key has no span to
+      // travel and its picker says so rather than pretending to do something.
+      const last = i === keys.length - 1;
+      const easeRow = el('div', 'tc-key-ease');
+      easeRow.appendChild(el('span', 'tc-hint', last ? 'Curve - none, this is the last key' : 'Curve'));
+      const sel = el('select');
+      sel.title = 'How the value travels from this key to the next one';
+      for (const o of Anim.EASING_MENU) {
+        const opt = el('option');
+        opt.value = o.value; opt.textContent = o.label;
+        sel.appendChild(opt);
+      }
+      const name = Anim.easingName(k.ease);
+      // A hand-edited curve matches no preset. It gets an option of its own so the menu can
+      // show what is actually on the key, and picking anything else replaces it.
+      if (!name) {
+        const opt = el('option');
+        opt.value = ''; opt.textContent = 'Custom curve';
+        sel.insertBefore(opt, sel.firstChild);
+      }
+      sel.value = name;
+      sel.disabled = last;
+      const plot = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      plot.setAttribute('class', 'tc-key-curve');
+      plot.setAttribute('viewBox', '0 0 40 24');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      const drawCurve = () => path.setAttribute('d', Anim.easingPath(k.ease, 40, 24, 3, 24));
+      drawCurve();
+      plot.appendChild(path);
+      sel.addEventListener('change', () => {
+        if (!sel.value) return;
+        beginEdit();
+        k.ease = Anim.cloneEasing(Anim.EASING_PRESETS[sel.value]);
+        endEdit();
+        drawCurve();
+        changed();
+      });
+      easeRow.appendChild(sel);
+      easeRow.appendChild(plot);
+      kr.appendChild(easeRow);
       row.appendChild(kr);
     });
     return row;
