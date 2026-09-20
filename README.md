@@ -2793,13 +2793,26 @@ and in the `.scut`. `channel` is `auto | alpha | luma | black`, `space` is `auto
 SOURCE time at which the matte's first frame sits. A painted mask from the old build has no
 `src` and is dropped by `Matte.normalizeClip()`.
 
+**Where frame 0 sits is two numbers, and only one of them is typed.** `at` is the source
+second the matte's first frame sits at — 0 for a matte rendered over the whole source, the
+clip's `in` for one rendered from just that cut's range, which on a half-hour source is a
+number like `756.75`. **Import measures it**; the panel shows it as a readout with **Stick
+to this clip** and **Source start** beside it, because no slider with a usable nudge range
+can also reach the middle of a long file. `offset` is the nudge, ±10 s, for a matte that
+starts a few frames out. `Matte.maskStart()` is their sum and the only thing the lookup
+reads. A project saved before `at` existed carries the whole start in `offset`;
+`normalizeMask()` moves anything past ±10 s into `at`, so the same matte reads the same
+frame. Both are in the render key and neither is in the decode key — moving either
+re-reads nothing.
+
 #### Matte frame N is source frame N
 
 The lookup is by **source** time (`clip.in` + clip-local time) — `floor((t - offset) * fps)`,
 held rather than blended, clamped to the matte's own ends. Trimming, splitting and dragging
 the clip never move it, which is why the export has to cover the clip's whole source range.
-Rendering just this cut's range from Resolve is fine: on import, a matte as long as the
-clip but shorter than the source gets `offset = clip.in` set for it. When the matte's fps
+Rendering just this cut's range from Resolve is fine: on import, a source-space matte no
+longer than the clip but shorter than the source gets `at = clip.in` set for it, so it
+lands on the cut without a number being typed. When the matte's fps
 or aspect does not match, or its span does not cover the clip at all, the panel says which
 in a warning line rather than silently sliding.
 
@@ -4891,7 +4904,7 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
   see "The effect stack".
 - Resolve Matte does no tracking of its own: the matte is only as good as the Magic Mask
   track in Resolve, and it has to be rendered at the source's frame rate over either the
-  whole source clip or this cut's range (whose Offset is filled in on import). A matte is per clip; two cuts of the same file each
+  whole source clip or this cut's range (whose start is measured on import). A matte is per clip; two cuts of the same file each
   import it, though both hit the same disk cache. A long matte at Fine detail holds its
   run-length planes in memory — a few KB a frame for a clean key, more for a noisy one.
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The

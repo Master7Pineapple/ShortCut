@@ -17,14 +17,17 @@
  *
  * WHAT LANDS ON A CLIP
  *
- *   clip.masks = [ { id, name, src, channel, res, offset } ]
+ *   clip.masks = [ { id, name, src, channel, res, at, offset } ]
  *
  *   `src`      the matte video's path. A PATH, never the pixels - `clip.masks` is plain
  *              JSON in every undo snapshot and in the .scut file.
  *   `channel`  'auto' (alpha if the file has one, otherwise luma), 'alpha' or 'luma'.
  *   `res`      the long side the matte is decoded at.
- *   `offset`   SOURCE seconds at which the matte's first frame sits. 0 when the matte was
- *              rendered over the whole source clip, which is the export this is built for.
+ *   `at`       SOURCE seconds at which the matte's first frame sits. 0 for a matte
+ *              rendered over the whole source clip; the clip's `in` for one rendered from
+ *              just that cut's range, and IMPORT SETS IT - nobody types 756.75.
+ *   `offset`   a hand nudge in seconds on top of `at`, for a matte that starts a few
+ *              frames out. Small by design: the big number is `at`, and it is measured.
  *
  * TIME: MATTE FRAME N IS SOURCE FRAME N.
  *
@@ -40,6 +43,7 @@
   const DEFAULTS = {
     res: 960,          // decoded long side; the 9:16 crop of a 16:9 source is ~540 wide
     channel: 'auto',
+    at: 0,
     offset: 0,
   };
   const RES_CHOICES = [480, 960, 1920];
@@ -53,7 +57,7 @@
     const o = opts || {};
     return normalizeMask({
       id: uid(), name: name || 'Matte 1', src: String(src || ''),
-      channel: o.channel, res: o.res, offset: o.offset, space: o.space,
+      channel: o.channel, res: o.res, at: o.at, offset: o.offset, space: o.space,
     });
   }
 
@@ -83,7 +87,15 @@
     m.channel = CHANNELS.includes(m.channel) ? m.channel : DEFAULTS.channel;
     const res = Math.round(num(m.res, DEFAULTS.res));
     m.res = RES_CHOICES.includes(res) ? res : DEFAULTS.res;
-    m.offset = r4(clamp(num(m.offset, 0), -3600, 3600));
+    // A project from before `at` existed carries the whole start in `offset`, which is now
+    // a nudge with a +/- 10 s range. Anything past that range is where the matte STARTS,
+    // so it moves to `at` rather than being clamped away - the same matte, the same frame,
+    // read by a build that splits the number in two.
+    let at = num(m.at, 0);
+    let off = num(m.offset, 0);
+    if (Math.abs(off) > 10) { at += off; off = 0; }
+    m.at = r4(clamp(at, 0, 360000));
+    m.offset = r4(clamp(off, -10, 10));
     m.space = SPACES.includes(m.space) ? m.space : 'auto';
     delete m.strokes; delete m.rate;
     return m;
@@ -103,8 +115,13 @@
    */
   function frameIndex(mask, fps, count, t) {
     if (!(count > 0) || !(fps > 0)) return -1;
-    const x = (num(t, 0) - num(mask && mask.offset, 0)) * fps;
+    const x = (num(t, 0) - maskStart(mask)) * fps;
     return clamp(Math.floor(x + 1e-3), 0, count - 1);
+  }
+
+  /** The SOURCE second the matte's first frame sits at: where it was rendered, plus the nudge. */
+  function maskStart(mask) {
+    return r4(num(mask && mask.at, 0) + num(mask && mask.offset, 0));
   }
 
   /**
@@ -295,8 +312,8 @@
 
   /**
    * The decode cache key: the file, its stamp, the channel and the resolution. Nothing
-   * about the clip and not the offset - the offset is applied at lookup, so sliding it
-   * re-reads nothing.
+   * about the clip and not where it starts - `at` and `offset` are applied at lookup, so
+   * sliding either re-reads nothing.
    */
   function cacheKey(src, stamp, channel, res) {
     const s = stamp || {};
@@ -313,13 +330,14 @@
   function digest(mask, stamp) {
     if (!mask) return null;
     const s = stamp || {};
-    return hash([mask.src, mask.channel, mask.res, mask.offset, mask.space, s.size | 0, Math.round(num(s.mtime, 0))].join('|'));
+    return hash([mask.src, mask.channel, mask.res, mask.at, mask.offset, mask.space,
+      s.size | 0, Math.round(num(s.mtime, 0))].join('|'));
   }
 
   const API = {
     DEFAULTS, RES_CHOICES, CHANNELS, SPACES, resolveSpace, keyBlack,
     makeMask, normalizeMask, normalizeClip, hasMasks, maskById, maskFor,
-    frameIndex, planeSize, rleEncode, rleDecode,
+    frameIndex, maskStart, planeSize, rleEncode, rleDecode,
     edge, growPlane, blurPlane, radiusPx,
     hash, cacheKey, digest,
   };

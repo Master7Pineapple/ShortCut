@@ -11834,14 +11834,19 @@ async function rmAttach(clip, src) {
   if (!Array.isArray(clip.masks)) clip.masks = [];
   const name = src.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
   const m = Matte.makeMask(name, src, { channel: 'auto' });
-  // A matte rendered from the clip's range alone - the usual thing when you mask one cut
-  // in Resolve - starts at the clip's in point, not at the source's head.
+  // WHERE FRAME 0 SITS IS MEASURED, NOT TYPED. A matte rendered from this cut's range
+  // alone - the usual thing when you mask one cut in Resolve - begins at the clip's in
+  // point, which on a half-hour source is a number like 756.75 s. That is `at`, set here;
+  // `offset` stays the small nudge it looks like on its slider.
   const cin = Number(clip.in) || 0;
   const clen = (Number(clip.out) || 0) - cin;
   const cdur = Number(clip.mediaDuration) || 0;
   const mdur = Number(info.duration) || 0;
-  if (cin > 0.04 && mdur > 0 && clen > 0 && Math.abs(mdur - clen) <= 0.2 &&
-      !(cdur > 0 && Math.abs(mdur - cdur) <= 0.2)) m.offset = Math.round(cin * 10000) / 10000;
+  // Source space only: a frame-space matte (a vertical timeline export) is already looked
+  // up from the clip's first frame, so it has no source second to sit at.
+  const space = Matte.resolveSpace(m, info.width, info.height, clip.srcW, clip.srcH);
+  if (space === 'source' && cin > 0.04 && mdur > 0 && clen > 0 && mdur <= clen + 0.5 &&
+      !(cdur > 0 && Math.abs(mdur - cdur) <= 0.2)) m.at = Math.round(cin * 10000) / 10000;
   clip.masks.push(m);
   Matte.normalizeClip(clip);
   // Cutting with it is what anybody importing a matte came to do, so the effect goes on
@@ -11898,8 +11903,8 @@ function rmWarnings(clip, mask, store) {
   const cdur = Number(clip.mediaDuration) || 0;
   const cin = Number(clip.in) || 0;
   const cout = Number(clip.out) || 0;
-  const start = mask.offset;
-  const end = mdur + mask.offset;
+  const start = Matte.maskStart(mask);
+  const end = mdur + start;
   const coversClip = cout > cin && start <= cin + 0.1 && end >= cout - 0.1;
   const coversSource = cdur > 0 && start <= 0.1 && end >= cdur - 0.1;
   if (!coversClip && !coversSource) {
@@ -11907,8 +11912,8 @@ function rmWarnings(clip, mask, store) {
       ? 'this clip runs ' + cin.toFixed(2) + ' - ' + cout.toFixed(2) + ' s in the source'
       : 'the source is ' + cdur.toFixed(2) + ' s';
     out.push('The matte does not cover the clip: it holds ' + mdur.toFixed(2) + ' s from ' +
-      start.toFixed(2) + ' s, and ' + miss + '. Set Offset to the source time the matte ' +
-      'starts at, or render the clip’s range again from Resolve.');
+      start.toFixed(2) + ' s, and ' + miss + '. Press "Stick to this clip" to put its ' +
+      'first frame on the clip’s first frame, or render the clip’s range again from Resolve.');
   }
   return out;
 }
@@ -11931,9 +11936,9 @@ function maskPanel(clip) {
   box.appendChild(el('div', 'tc-hint fx-note',
     'Cut the object with Magic Mask in DaVinci Resolve and render it with Export Alpha ' +
     '(ProRes 4444, or DNxHR 444 - read as a cut-out over black). A matte the shape of the ' +
-    'source follows trims - render the whole source or just this clip’s range, whose ' +
-    'Offset is set for you; a vertical timeline export is drawn over the output frame from ' +
-    'this clip’s first frame.'));
+    'source follows trims - render the whole source or just this clip’s range, and where ' +
+    'it starts is set for you on import; a vertical timeline export is drawn over the ' +
+    'output frame from this clip’s first frame.'));
 
   const row = el('div', 'fx-add');
   const add = el('button', 'mini', 'Import matte from Resolve...');
@@ -12027,8 +12032,42 @@ function maskPanel(clip) {
         { value: 'frame', label: 'Output frame (vertical timeline export)' },
       ],
     }, mask, { space: 'auto' }, setHooks));
+    // WHERE THE MATTE STARTS IS TWO NUMBERS, and only one of them is typed. `at` is the
+    // source second frame 0 sits at - measured at import, a number like 756.75 on a long
+    // source - and it is shown with a button rather than a slider, because no slider with
+    // a usable nudge range can also reach the middle of a half-hour file. `offset` is the
+    // nudge, and it stays the +/- 10 s it looks like.
+    const startRow = el('div', 'tc-row');
+    startRow.appendChild(el('label', 'tc-label', 'Starts at'));
+    startRow.appendChild(el('span', 'tc-hint',
+      Number(mask.at || 0).toFixed(2) + ' s in the source' +
+      (Math.abs(Number(mask.at) || 0) < 0.005 ? ' (the source’s head)' : '')));
+    const stick = el('button', 'mini', 'Stick to this clip');
+    stick.title = 'Put the matte’s first frame on this clip’s first frame - what a matte ' +
+      'rendered from this cut’s range in Resolve wants.';
+    stick.addEventListener('click', () => {
+      pushUndo();
+      // A frame-space matte is already counted from the clip's first frame, so sticking it
+      // to the clip is `at = 0` there - the source second means nothing in that space.
+      const src = rmSpace(clip, mask, store) === 'source';
+      mask.at = src ? Math.round((Number(clip.in) || 0) * 10000) / 10000 : 0;
+      mask.offset = 0;
+      changed();
+    });
+    startRow.appendChild(stick);
+    const head0 = el('button', 'mini', 'Source start');
+    head0.title = 'Put the matte’s first frame on the source’s first frame - for a matte ' +
+      'rendered over the whole source clip.';
+    head0.addEventListener('click', () => {
+      pushUndo();
+      mask.at = 0;
+      mask.offset = 0;
+      changed();
+    });
+    startRow.appendChild(head0);
+    settings.appendChild(startRow);
     settings.appendChild(TextUI.control({
-      path: 'offset', label: 'Offset (s)', type: 'range', min: -10, max: 10, step: 0.001, digits: 3,
+      path: 'offset', label: 'Nudge (s)', type: 'range', min: -10, max: 10, step: 0.001, digits: 3,
     }, mask, { offset: 0 }, setHooks));
     mrow.appendChild(settings);
 
