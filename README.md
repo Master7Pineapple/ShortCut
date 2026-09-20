@@ -1003,6 +1003,16 @@ that lights the whole frame. The fill is `rgba(255,255,255,1)` and the feather i
 right on a white plate and mask nothing. `smoke-mockup.js` asserts specifically that a
 corner is dark while the middle is not, which is the assertion an opaque mask fails.
 
+**One opaque plate, then one masked plate — never two masked ones.** `source-over` does
+not add alpha: where a feather says `m`, two plates carrying `m` and `1 - m` come out at
+`m + (1 - m)(1 - m)`, which is 0.75 at `m = 0.5`. A quarter of the frame's own black then
+shows through the softest part of the edge, and the softer the feather the wider the
+bruise. That is what the inverted `spotlight` used to draw — the sharp picture with the
+shape punched out, plus the treated copy kept inside it — and it read as a dark ring around
+a blurred patch with `dim` at 0. Every masked composite in the file now has the shape its
+uninverted branch always had: the whole frame at alpha 1 first, then the other plate masked
+on top of it. `blursurround` was written that way from the start and never had the ring.
+
 `spotlight` and `cutout` darken with `source-atop` rather than a plain fill, so a layer
 that is already partly transparent — anything downstream of `chrome` or `inset` — does not
 get black painted into its empty half. Every blur goes through `padBlur()` at 1:1, so none

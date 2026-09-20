@@ -1599,19 +1599,24 @@
         }
 
         // Inverted: the treated copy shows THROUGH the shape and the sharp original is
-        // everything else - a redaction rather than a spotlight. Same two plates, masked
-        // the other way round, so nothing here re-derives the geometry.
+        // everything else - a redaction rather than a spotlight.
+        //
+        // ONE OPAQUE PLATE, THEN ONE MASKED ONE, and that ordering is the whole fix for
+        // the dark ring this used to draw around the shape. It built TWO masked plates -
+        // the sharp picture with the shape punched out, and the treated copy kept inside
+        // it - and drew one over the other. Alphas do not add under `source-over`: where
+        // the feather says m, the two carry m and 1 - m, and the result is
+        // m + (1 - m)(1 - m), which is 0.75 at m = 0.5. A quarter of the frame's own
+        // black therefore showed through the softest part of the edge, and the softer the
+        // feather the wider the bruise. The uninverted branch above never had it, because
+        // its first plate is the whole frame at alpha 1 - so this one is now the same
+        // shape: the sharp picture whole, then the treated copy masked on top of it.
         const hole = clean(L.surface, 'fxSpD', W, H);
         hole.c.drawImage(out.cv, 0, 0);
         hole.c.globalCompositeOperation = 'destination-in';
         hole.c.drawImage(maskCv, 0, 0);
         reset(hole.c);
-        const rest = clean(L.surface, 'fxSpE', W, H);
-        rest.c.drawImage(src, 0, 0);
-        rest.c.globalCompositeOperation = 'destination-out';
-        rest.c.drawImage(maskCv, 0, 0);
-        reset(rest.c);
-        L.c.drawImage(rest.cv, 0, 0);
+        L.c.drawImage(src, 0, 0);
         L.c.drawImage(hole.cv, 0, 0);
       },
     },
