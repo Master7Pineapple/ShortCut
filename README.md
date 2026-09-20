@@ -2774,9 +2774,11 @@ SOURCE time at which the matte's first frame sits. A painted mask from the old b
 
 The lookup is by **source** time (`clip.in` + clip-local time) — `floor((t - offset) * fps)`,
 held rather than blended, clamped to the matte's own ends. Trimming, splitting and dragging
-the clip never move it, which is why the export has to cover the whole source clip. When
-the matte's fps, length or aspect does not match the clip, the panel says which in a
-warning line rather than silently sliding.
+the clip never move it, which is why the export has to cover the clip's whole source range.
+Rendering just this cut's range from Resolve is fine: on import, a matte as long as the
+clip but shorter than the source gets `offset = clip.in` set for it. When the matte's fps
+or aspect does not match, or its span does not cover the clip at all, the panel says which
+in a warning line rather than silently sliding.
 
 #### The plate, the edges and the keys
 
@@ -4865,8 +4867,8 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
 - An effect does not apply inside a transition window, in the preview or in the render —
   see "The effect stack".
 - Resolve Matte does no tracking of its own: the matte is only as good as the Magic Mask
-  track in Resolve, and it has to be rendered over the whole source clip at the source's
-  frame rate (or placed with Offset). A matte is per clip; two cuts of the same file each
+  track in Resolve, and it has to be rendered at the source's frame rate over either the
+  whole source clip or this cut's range (whose Offset is filled in on import). A matte is per clip; two cuts of the same file each
   import it, though both hit the same disk cache. A long matte at Fine detail holds its
   run-length planes in memory — a few KB a frame for a clean key, more for a noisy one.
 - Any clip carrying a live effect leaves the fast path, so it renders at bake speed. The

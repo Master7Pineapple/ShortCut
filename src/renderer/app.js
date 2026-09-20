@@ -11749,6 +11749,14 @@ async function rmAttach(clip, src) {
   if (!Array.isArray(clip.masks)) clip.masks = [];
   const name = src.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
   const m = Matte.makeMask(name, src, { channel: 'auto' });
+  // A matte rendered from the clip's range alone - the usual thing when you mask one cut
+  // in Resolve - starts at the clip's in point, not at the source's head.
+  const cin = Number(clip.in) || 0;
+  const clen = (Number(clip.out) || 0) - cin;
+  const cdur = Number(clip.mediaDuration) || 0;
+  const mdur = Number(info.duration) || 0;
+  if (cin > 0.04 && mdur > 0 && clen > 0 && Math.abs(mdur - clen) <= 0.2 &&
+      !(cdur > 0 && Math.abs(mdur - cdur) <= 0.2)) m.offset = Math.round(cin * 10000) / 10000;
   clip.masks.push(m);
   Matte.normalizeClip(clip);
   // Cutting with it is what anybody importing a matte came to do, so the effect goes on
@@ -11799,10 +11807,23 @@ function rmWarnings(clip, mask, store) {
     }
     return out;
   }
+  // Two renders are both right in source space: the whole source file, or just this
+  // clip's range. Only complain when the matte covers neither - a matte that ends before
+  // the clip's out point is the one that leaves the object uncut.
   const cdur = Number(clip.mediaDuration) || 0;
-  if (cdur && cdur < 3000 && Math.abs(mdur + mask.offset - cdur) > 0.1) {
-    out.push('Length differs: the matte is ' + mdur.toFixed(2) + ' s, the source ' + cdur.toFixed(2) +
-      ' s. Render the whole source clip from Resolve, or set Offset to where the matte starts.');
+  const cin = Number(clip.in) || 0;
+  const cout = Number(clip.out) || 0;
+  const start = mask.offset;
+  const end = mdur + mask.offset;
+  const coversClip = cout > cin && start <= cin + 0.1 && end >= cout - 0.1;
+  const coversSource = cdur > 0 && start <= 0.1 && end >= cdur - 0.1;
+  if (!coversClip && !coversSource) {
+    const miss = cout > cin
+      ? 'this clip runs ' + cin.toFixed(2) + ' - ' + cout.toFixed(2) + ' s in the source'
+      : 'the source is ' + cdur.toFixed(2) + ' s';
+    out.push('The matte does not cover the clip: it holds ' + mdur.toFixed(2) + ' s from ' +
+      start.toFixed(2) + ' s, and ' + miss + '. Set Offset to the source time the matte ' +
+      'starts at, or render the clip’s range again from Resolve.');
   }
   return out;
 }
@@ -11824,8 +11845,9 @@ function maskPanel(clip) {
 
   box.appendChild(el('div', 'tc-hint fx-note',
     'Cut the object with Magic Mask in DaVinci Resolve and render it with Export Alpha ' +
-    '(ProRes 4444, or DNxHR 444 - read as a cut-out over black). A 16:9 matte of the whole ' +
-    'source follows trims; a vertical timeline export is drawn over the output frame from ' +
+    '(ProRes 4444, or DNxHR 444 - read as a cut-out over black). A matte the shape of the ' +
+    'source follows trims - render the whole source or just this clip’s range, whose ' +
+    'Offset is set for you; a vertical timeline export is drawn over the output frame from ' +
     'this clip’s first frame.'));
 
   const row = el('div', 'fx-add');
