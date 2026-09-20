@@ -3393,11 +3393,19 @@ function clipFxPanel(clip) {
         'No mouse take on this clip, so this draws nothing. Record one with Mouse.'));
     }
     if (d.needs === 'mask') {
-      const mk = Matte.maskFor(clip, fx.params.mask);
+      // On an adjustment layer the matte comes from the clip underneath - see
+      // `matteReach()` - so the row reads it, and says whose it is, from there.
+      const mc = fxMaskClip(clip);
+      const mk = Matte.maskFor(mc, fx.params.mask);
       const store = rmStore(mk);
+      if (mc !== clip && mk) {
+        row.appendChild(el('div', 'tc-hint',
+          'Cutting with the matte on ' + (mc.name || 'the clip below') + ', underneath this layer.'));
+      }
       if (!mk) {
-        row.appendChild(el('div', 'tc-hint fx-warn',
-          'No matte on this clip, so this draws nothing. Import one in Resolve Matte.'));
+        row.appendChild(el('div', 'tc-hint fx-warn', isAdjustClip(clip)
+          ? 'No clip with an imported matte under this layer, so this draws nothing.'
+          : 'No matte on this clip, so this draws nothing. Import one in Resolve Matte.'));
       } else if (!store || store.status !== 'ready') {
         row.appendChild(el('div', 'tc-hint fx-warn',
           mk.name + (store && store.status === 'error' ? ' failed to load: ' + store.error
@@ -3442,7 +3450,7 @@ function clipFxPanel(clip) {
       // painted on it, which no fixed array in `fx.js` could know. Resolved here, once,
       // rather than by teaching `control()` about clips.
       const sp = typeof spec.optionsFor === 'function'
-        ? Object.assign({}, spec, { options: spec.optionsFor(clip) })
+        ? Object.assign({}, spec, { options: spec.optionsFor(fxMaskClip(clip)) })
         : spec;
       body.appendChild(TextUI.control(sp, fx, { params: d.params }, rowHooks));
     }
@@ -3571,9 +3579,11 @@ function clipFxPanel(clip) {
     o.value = type;
     const need = FX.DEFS[type].needs;
     o.disabled = (need === 'mouse' && !clipHasTake(clip)) ||
-      (need === 'mask' && !Matte.hasMasks(clip));
+      (need === 'mask' && !Matte.hasMasks(fxMaskClip(clip)));
     o.textContent = FX.DEFS[type].label +
-      (o.disabled ? (need === 'mask' ? '  - needs an imported matte' : '  - needs a mouse take') : '');
+      (o.disabled ? (need === 'mask'
+        ? (isAdjustClip(clip) ? '  - needs a matte on a clip below' : '  - needs an imported matte')
+        : '  - needs a mouse take') : '');
     add.appendChild(o);
   }
   add.addEventListener('change', () => {
@@ -8959,9 +8969,12 @@ function trackDigests(c) {
  */
 function maskDigests(c) {
   const out = [];
+  // An adjustment layer's matte is the one on the clip beneath it, and a bake key that
+  // did not carry it would hold a stale frame when that matte changed underneath.
+  const src = fxMaskClip(c) || c;
   for (const f of (c.fx || [])) {
     if (!(f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'mask')) continue;
-    const mk = Matte.maskFor(c, f.params && f.params.mask);
+    const mk = Matte.maskFor(src, f.params && f.params.mask);
     const store = rmStore(mk);
     out.push(mk ? Matte.digest(mk, store && store.stamp) : null);
   }
@@ -11621,11 +11634,17 @@ function rmLoad(mask, force) {
 async function rmPreload(clips) {
   const want = [];
   for (const c of clips || []) {
-    if (!c || !Matte.hasMasks(c)) continue;
+    if (!c) continue;
+    // An adjustment layer reads the mattes of everything under its span, and any of them
+    // can be the one in the frame being baked, so all of them load.
+    const srcs = isAdjustClip(c) ? matteTargets(c) : (Matte.hasMasks(c) ? [c] : []);
+    if (!srcs.length) continue;
     for (const f of (c.fx || [])) {
       if (!(f && f.enabled !== false && FX.DEFS[f.type] && FX.DEFS[f.type].needs === 'mask')) continue;
-      const mk = Matte.maskFor(c, f.params && f.params.mask);
-      if (mk) want.push(rmLoad(mk));
+      for (const sc of srcs) {
+        const mk = Matte.maskFor(sc, f.params && f.params.mask);
+        if (mk) want.push(rmLoad(mk));
+      }
     }
   }
   await Promise.all(want);
@@ -11714,17 +11733,83 @@ function rmPlate(clip, mask, tSrc, W, H, p) {
 }
 
 /**
+ * A MATTE ON AN ADJUSTMENT LAYER REACHES DOWN, for the same reason a crop binding does
+ * (see `cropBindFor()`): an adjustment clip carries no media, so it can carry no imported
+ * matte, and "cut this with the matte" on a layer that adjusts everything below it can
+ * only mean the matte of what is below it. Without this the effect could not even be
+ * added - the menu greyed it out - so grading through a Magic Mask meant putting the
+ * grade on the clip and losing the one thing an adjustment layer is for: one look over a
+ * run of cuts.
+ *
+ * The NEAREST picture clip underneath that carries a matte wins, top track first, exactly
+ * as the crop binding picks the nearest layer above. The plate is built from THAT clip -
+ * its framing, its source time - and it lands on the composited frame, which is that
+ * clip's picture already cropped. The two agree because `rmPlate()` draws the plane
+ * through the owner's own crop.
+ */
+function matteReach(adj, tl) {
+  if (!isAdjustClip(adj)) return null;
+  const mine = state.tracks.findIndex((t) => t.clips.indexOf(adj) >= 0);
+  if (mine < 0) return null;
+  for (let i = mine + 1; i < state.tracks.length; i++) {
+    const t = state.tracks[i];
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c) || !Matte.hasMasks(c)) continue;
+      if (tl < c.start - 1e-6 || tl >= clipEnd(c) - 1e-6) continue;
+      return c;
+    }
+  }
+  return null;
+}
+
+/** Every picture clip under an adjustment layer's span that carries a matte. */
+function matteTargets(adj) {
+  if (!isAdjustClip(adj)) return [];
+  const mine = state.tracks.findIndex((t) => t.clips.indexOf(adj) >= 0);
+  if (mine < 0) return [];
+  const out = [];
+  for (let i = mine + 1; i < state.tracks.length; i++) {
+    const t = state.tracks[i];
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c) || !Matte.hasMasks(c)) continue;
+      if (clipEnd(c) <= adj.start + 1e-6 || c.start >= clipEnd(adj) - 1e-6) continue;
+      if (out.indexOf(c) < 0) out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * The clip whose `clip.masks` a `mask` effect on `clip` reads: itself, or - on an
+ * adjustment layer - whatever it reaches down to. The panel asks this without a time, so
+ * it takes the first clip under the layer's span that carries a matte; the draw asks
+ * `matteReach()` per frame, which is the answer that has to be exact.
+ */
+function fxMaskClip(clip) {
+  if (!clip) return null;
+  if (!isAdjustClip(clip)) return clip;
+  return matteReach(clip, clip.start + 1e-4) || matteTargets(clip)[0] || clip;
+}
+
+/**
  * The provider `fx.js` calls from inside a `matte` draw. `t` is CLIP-LOCAL time; the
  * conversion to source time happens here, because only the clip knows its own `in`.
  * A matte that has not loaded yet starts loading and draws the clip unmasked meanwhile.
  */
 FX.setMatteProvider((clip, entry, t, W, H, p) => {
-  if (!clip || !Matte.hasMasks(clip)) return null;
-  const mask = Matte.maskFor(clip, p && p.mask);
+  if (!clip) return null;
+  // On an adjustment layer the owner is the clip underneath, and the source time is that
+  // clip's, not this one's - the two start at different places on the timeline.
+  const owner = isAdjustClip(clip) ? matteReach(clip, clip.start + t) : clip;
+  if (!owner || !Matte.hasMasks(owner)) return null;
+  const tSrc = (Number(owner.in) || 0) + (owner === clip ? t : clip.start + t - owner.start);
+  const mask = Matte.maskFor(owner, p && p.mask);
   if (!mask) return null;
   try {
     if (!rmStore(mask)) { rmLoad(mask); return null; }
-    return rmPlate(clip, mask, (Number(clip.in) || 0) + t, W, H, p || {});
+    return rmPlate(owner, mask, tSrc, W, H, p || {});
   } catch (e) {
     // A failed plate is a clip that draws unmasked, never a frame that does not draw.
     return null;

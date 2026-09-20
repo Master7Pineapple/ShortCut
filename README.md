@@ -853,11 +853,34 @@ link, no volume, no speed, and never sliced by Tighten. `trackCuts()` also skips
 its edges are not cuts — a transition needs two sides to show and one of them would be
 nothing at all.
 
-The "add an effect" menu already greys out `cursor`, `ripple` and `matte` on it with no
-extra code: they declare `needs`, and an adjustment clip carries neither a mouse take nor a
-matte. A `transform` bound to a track on **another** clip works, though — `bind.clip` and
+The "add an effect" menu greys out `cursor` and `ripple` on it with no extra code: they
+declare `needs`, and an adjustment clip carries no mouse take. **`matte` is the exception,
+and it reaches down** — see below. A `transform` bound to a track on **another** clip works,
+too — `bind.clip` and
 the injected binder were built for exactly that, so "this vignette follows that button" is
 an adjustment layer with one binding.
+
+#### A matte on an adjustment layer reaches down
+
+An adjustment clip carries no media, so it can carry no imported matte — which used to mean
+the `matte` effect was greyed out on it, and cutting a grade with a Magic Mask meant putting
+that grade on the clip and giving up the one thing an adjustment layer is for: one look over
+a run of cuts.
+
+So the effect reaches **down**, the mirror of the crop binding's reach **up**
+(`cropBindFor()`): `matteReach(adj, t)` takes the **nearest picture clip beneath the layer
+that carries a matte**, top track first, at that instant. The plate is built from *that*
+clip — its `clip.in` for the source time, its framing for the crop — and lands on the frame
+the composite has already built, which is that same clip's picture already cropped. The two
+line up because `rmPlate()` draws the plane through the owner's own crop either way.
+
+Everything that asks "which mattes does this stack read" goes through one function,
+`fxMaskClip()`, so the answer is the same in all four places: the Matte dropdown's options,
+the row's warning line (which names the clip it borrowed from), the add-menu's disabled
+state, and `maskDigests()` — the last of which matters, because a bake key that did not
+carry the borrowed matte would hold a stale frame when that matte changed underneath.
+`rmPreload()` loads the mattes of **every** clip under the layer's span, since any of them
+can be the one in the frame being baked.
 
 #### Copying effects
 
