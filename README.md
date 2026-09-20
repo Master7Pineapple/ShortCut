@@ -1050,6 +1050,35 @@ A clip with **no** effects skips all of this: `FX.render()` hands the target str
 the painter and allocates nothing, so the compositing loop stays the single `drawImage`
 it has always been.
 
+#### Geometry composes; it does not draw
+
+The layer is the size of the **frame**, and that is what made two geometric effects in one
+stack cut the picture. `animate`'s slide pushes the layer 0.88 of a frame to the left, and
+everything past the canvas edge is gone — permanently, not parked offscreen. A `transform`
+after it then rotates *what is left*, swinging that straight cut edge back into view as a
+slice taken out of the picture with frame showing through beyond it. On a still set to
+**Whole image** that reads as the image being cropped by something, and nothing was
+cropping it: the canvas in the middle of the stack was.
+
+So a geometric effect contributes a **matrix and an alpha** (`DEFS[type].geom()`) instead of
+painting, and `render()` multiplies consecutive ones together and resamples **once**, at the
+end of the run. `transform` and `animate` are the two that do this today. Three consequences,
+all of them wanted:
+
+- **Nothing is lost between two geometric effects**, because there is no intermediate canvas
+  to lose it at. Only the final result meets the frame's edge, which is the one place a
+  picture is genuinely off-screen.
+- **One resample instead of two or three**, so a slid-and-rotated still is sharper than it was.
+- **Order still means what it meant.** The later effect used to be handed the canvas the
+  earlier one had already moved, so the composition is `g · pend` — the new matrix on the
+  left. Backwards, a rotation would turn the picture about where it started instead of where
+  it had got to.
+
+A non-geometric effect in between (a blur, a grade, a matte) **flushes** the pending geometry
+first, because it has to see the picture as it is by then. Per-effect **motion blur** flushes
+too and then paints its sweep the old way: `drawBlurred()` needs each sample drawn, and
+`DEFS[type].draw()` is kept for exactly that — it is the same matrix, applied on its own.
+
 #### `animate`: which end of the zoom the full frame is at
 
 `animate` has an in phase and an out phase, and each can be a fade, a slide, a **zoom**, a

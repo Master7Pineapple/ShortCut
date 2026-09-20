@@ -202,6 +202,109 @@
   }
 
   /** Copy the layer into a scratch and clear the layer, ready to be repainted from it. */
+  // ------------------------------------------------------- composing the geometry
+  //
+  // A 2x3 affine matrix, [a, b, c, d, e, f] - the same six numbers `setTransform()` takes.
+  //
+  // THE BUG THESE EXIST FOR. Every effect used to draw itself immediately, into a layer
+  // the size of the FRAME. That is right for one geometric effect and wrong for two: a
+  // `slide` that pushes the picture 0.88 of a frame to the left loses everything past the
+  // canvas edge, permanently, and a `transform` after it then rotates what is left -
+  // swinging that straight cut edge back INTO view as a slice taken out of the picture,
+  // with the frame showing through beyond it. Nothing was cropping the image; the canvas
+  // in the middle of the stack was.
+  //
+  // So consecutive geometric effects COMPOSE instead of drawing: each contributes a matrix
+  // and an alpha, and the picture is resampled ONCE when the run ends. No intermediate
+  // canvas means no intermediate edge to lose pixels at - and one resample instead of
+  // three is sharper into the bargain. A non-geometric effect in between (a blur, a grade)
+  // flushes what has built up first, because it has to see the picture as it is by then.
+  const matMul = (m, n) => [
+    m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+    m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+    m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5],
+  ];
+  const matT = (x, y) => [1, 0, 0, 1, x, y];
+  const matS = (s) => [s, 0, 0, s, 0, 0];
+  const matR = (deg) => {
+    const r = deg * Math.PI / 180, c = Math.cos(r), n = Math.sin(r);
+    return [c, n, -n, c, 0, 0];
+  };
+  const matIsId = (m) =>
+    Math.abs(m[0] - 1) < 1e-9 && Math.abs(m[1]) < 1e-9 && Math.abs(m[2]) < 1e-9 &&
+    Math.abs(m[3] - 1) < 1e-9 && Math.abs(m[4]) < 1e-9 && Math.abs(m[5]) < 1e-9;
+
+  /** Move, rotate and scale about an anchor - the shape every geometric effect has. */
+  function aboutAnchor(ax, ay, dx, dy, deg, s) {
+    return matMul(matMul(matMul(matT(ax + dx, ay + dy), matR(deg)), matS(s)), matT(-ax, -ay));
+  }
+
+  /**
+   * Draw the layer through one geometry, on its own. The composing path in `render()` is
+   * what runs in an ordinary stack; this is for the two places that cannot compose - the
+   * per-effect motion-blur sweep, which needs each sample drawn - and it is the same
+   * matrix, applied singly.
+   */
+  function applyGeom(L, g) {
+    if (!g) return;
+    const a = clamp(g.a == null ? 1 : g.a, 0, 1);
+    if (a >= 0.9999 && matIsId(g.m)) return;      // nothing to do, and nothing to resample
+    const src = take(L, 'fxA');
+    if (!(a > 0)) return;                         // invisible: the layer is already clear
+    L.c.save();
+    L.c.globalAlpha = a;
+    L.c.setTransform(g.m[0], g.m[1], g.m[2], g.m[3], g.m[4], g.m[5]);
+    L.c.drawImage(src, 0, 0);
+    L.c.restore();
+    reset(L.c);
+  }
+
+  /**
+   * What an `animate` entry is doing at `t`: an alpha, a move in frame fractions and a
+   * scale. Lifted out of the draw so `geom()` can answer without painting - the phase
+   * logic is the effect and there is exactly one copy of it.
+   */
+  function animState(p, t, clip) {
+    const dur = clipDuration(clip);
+    const st = { a: 1, dx: 0, dy: 0, s: 1 };
+    const phase = (type, len, ease, from, dist, zoom, zmode, isIn) => {
+    type = String(type || 'none');
+    len = Number(len) || 0;
+    if (type === 'none' || !(len > 0)) return;
+    const start = isIn ? 0 : dur - len;
+    const raw = clamp((t - start) / len, 0, 1);
+    const k = Anim.ease(Anim.EASING_PRESETS[ease] || Anim.EASING_PRESETS.easeOut, raw);
+    const on = isIn ? k : 1 - k;
+    if (type === 'fade') st.a *= clamp(on, 0, 1);
+    else if (type === 'slide') {
+      const off = (1 - on) * (Number(dist) || 0);
+      if (from === 'left') st.dx -= off;
+      else if (from === 'right') st.dx += off;
+      else if (from === 'top') st.dy -= off;
+      else st.dy += off;
+    } else if (type === 'zoom') {
+      const amt = Number(zoom) || 0;
+      // `k` is the eased progress THROUGH the phase and `on` is how much of the
+      // picture the phase is letting through, which are the same number on the way
+      // in and opposite numbers on the way out. 'push' wants the first - it grows
+      // for as long as the phase runs, either end - and 'settle' wants the second,
+      // because what it does is arrive at, or leave, the resting scale of 1.
+      st.s *= zmode === 'push'
+        ? Math.max(0.001, 1 + k * amt)
+        : Math.max(0.001, 1 - (1 - on) * amt);
+    } else if (type === 'pop') {
+      st.s *= Math.max(0.001, 0.3 + 0.7 * on);
+      st.a *= clamp(on * 3, 0, 1);
+    } else if (type === 'flicker') {
+      if (raw > 0 && raw < 1) st.a *= ((t * clamp(p.flickerHz, 0.1, 60)) % 1) < 0.55 ? 1 : 0;
+      else if (isIn ? raw <= 0 : raw >= 1) st.a = 0;
+    }
+  };
+    phase(p.inType, p.inDur, p.inEase, p.inFrom, p.inDistance, p.inZoom, p.inZoomMode, true);
+    phase(p.outType, p.outDur, p.outEase, p.outFrom, p.outDistance, p.outZoom, p.outZoomMode, false);
+    return st;
+  }
+
   function take(L, name) {
     const s = clean(L.surface, name, L.W, L.H);
     s.c.drawImage(L.cv, 0, 0);
@@ -397,19 +500,20 @@
       // Offsets are fractions of the FRAME, so a move reads the same at every resolution.
       // The anchor is the point scale and rotation turn about - the difference between a
       // card growing out of the middle and one growing out of its own corner.
-      draw(L, p) {
-        const src = take(L, 'fxA');
-        const W = L.W, H = L.H;
+      // GEOMETRY, NOT A DRAW. `geom()` hands the move back as a matrix and an alpha so
+      // `render()` can compose it with the geometric effects beside it in the stack and
+      // resample once - see the matrix helpers above. `draw()` is that same matrix applied
+      // on its own, for the motion-blur sweep, which has to paint each sample.
+      geom(p, t, e, clip, W, H) {
         const ax = clamp(p.anchorX, -4, 5) * W, ay = clamp(p.anchorY, -4, 5) * H;
-        L.c.save();
-        L.c.globalAlpha = clamp(p.opacity, 0, 1);
-        L.c.translate(ax + (Number(p.x) || 0) * W, ay + (Number(p.y) || 0) * H);
-        L.c.rotate((Number(p.rotate) || 0) * Math.PI / 180);
-        const s = clamp(p.scale, 0.001, 64);
-        L.c.scale(s, s);
-        L.c.translate(-ax, -ay);
-        L.c.drawImage(src, 0, 0);
-        L.c.restore();
+        return {
+          a: clamp(p.opacity, 0, 1),
+          m: aboutAnchor(ax, ay, (Number(p.x) || 0) * W, (Number(p.y) || 0) * H,
+            Number(p.rotate) || 0, clamp(p.scale, 0.001, 64)),
+        };
+      },
+      draw(L, p, t, e, clip) {
+        applyGeom(L, DEFS.transform.geom(p, t, e, clip, L.W, L.H));
       },
     },
 
@@ -664,55 +768,15 @@
         { path: 'params.outZoomMode', label: 'Out zoom starts', type: 'select', options: ZOOM_MODE_OPTIONS },
         { path: 'params.flickerHz', label: 'Flicker rate', type: 'range', min: 1, max: 30, step: 0.5, unit: 'Hz', digits: 1 },
       ],
-      draw(L, p, t, e, clip) {
-        const dur = clipDuration(clip);
-        const st = { a: 1, dx: 0, dy: 0, s: 1 };
-        const phase = (type, len, ease, from, dist, zoom, zmode, isIn) => {
-          type = String(type || 'none');
-          len = Number(len) || 0;
-          if (type === 'none' || !(len > 0)) return;
-          const start = isIn ? 0 : dur - len;
-          const raw = clamp((t - start) / len, 0, 1);
-          const k = Anim.ease(Anim.EASING_PRESETS[ease] || Anim.EASING_PRESETS.easeOut, raw);
-          const on = isIn ? k : 1 - k;
-          if (type === 'fade') st.a *= clamp(on, 0, 1);
-          else if (type === 'slide') {
-            const off = (1 - on) * (Number(dist) || 0);
-            if (from === 'left') st.dx -= off;
-            else if (from === 'right') st.dx += off;
-            else if (from === 'top') st.dy -= off;
-            else st.dy += off;
-          } else if (type === 'zoom') {
-            const amt = Number(zoom) || 0;
-            // `k` is the eased progress THROUGH the phase and `on` is how much of the
-            // picture the phase is letting through, which are the same number on the way
-            // in and opposite numbers on the way out. 'push' wants the first - it grows
-            // for as long as the phase runs, either end - and 'settle' wants the second,
-            // because what it does is arrive at, or leave, the resting scale of 1.
-            st.s *= zmode === 'push'
-              ? Math.max(0.001, 1 + k * amt)
-              : Math.max(0.001, 1 - (1 - on) * amt);
-          } else if (type === 'pop') {
-            st.s *= Math.max(0.001, 0.3 + 0.7 * on);
-            st.a *= clamp(on * 3, 0, 1);
-          } else if (type === 'flicker') {
-            if (raw > 0 && raw < 1) st.a *= ((t * clamp(p.flickerHz, 0.1, 60)) % 1) < 0.55 ? 1 : 0;
-            else if (isIn ? raw <= 0 : raw >= 1) st.a = 0;
-          }
+      geom(p, t, e, clip, W, H) {
+        const st = animState(p, t, clip);
+        return {
+          a: clamp(st.a, 0, 1),
+          m: aboutAnchor(W / 2, H / 2, st.dx * W, st.dy * H, 0, Math.max(0.001, st.s)),
         };
-        phase(p.inType, p.inDur, p.inEase, p.inFrom, p.inDistance, p.inZoom, p.inZoomMode, true);
-        phase(p.outType, p.outDur, p.outEase, p.outFrom, p.outDistance, p.outZoom, p.outZoomMode, false);
-        if (st.a >= 0.9999 && !st.dx && !st.dy && Math.abs(st.s - 1) < 1e-6) return;
-        const src = take(L, 'fxA');
-        if (!(st.a > 0)) return;
-        const W = L.W, H = L.H;
-        L.c.save();
-        L.c.globalAlpha = clamp(st.a, 0, 1);
-        L.c.translate(W / 2 + st.dx * W, H / 2 + st.dy * H);
-        L.c.scale(st.s, st.s);
-        L.c.translate(-W / 2, -H / 2);
-        L.c.drawImage(src, 0, 0);
-        L.c.restore();
+      },
+      draw(L, p, t, e, clip) {
+        applyGeom(L, DEFS.animate.geom(p, t, e, clip, L.W, L.H));
       },
     },
 
@@ -3138,20 +3202,48 @@
     const layer = clean(surface, 'fxLayer', W, H);
     const L = { cv: layer.cv, c: layer.c, W, H, surface, base: baseOf(surface, W, H, paint) };
     paint(L.c, W, H);
+    // The geometry built up but not yet painted - see the matrix helpers. `null` means
+    // the layer is the picture as it stands.
+    let pend = null;
+    const flush = () => {
+      if (!pend) return;
+      const g = pend;
+      pend = null;
+      applyGeom(L, g);
+    };
     for (const e of entries) {
       try {
         // Motion blur is per EFFECT and costs `samples` passes of that effect, so it is
         // refused outright for one that cannot paint differently across the shutter -
         // see `timeVarying()`.
         const mb = mblurOf(e);
-        if (mb && timeVarying(e)) drawBlurred(L, e, t, clip, frameDur, mb);
-        else DEFS[e.type].draw(L, paramsAt(e, t, clip, W, H), t, e, clip);
+        const blurred = mb && timeVarying(e);
+        const d = DEFS[e.type];
+        // A GEOMETRIC EFFECT JOINS THE ONE BEFORE IT rather than drawing over it, so a
+        // slide and a rotation are one resample of the whole picture instead of two of
+        // whatever the frame's edge left of it. Motion blur is the exception: the sweep
+        // paints each sample, so it takes the composed geometry with it and then draws.
+        if (d.geom && !blurred) {
+          const g = d.geom(paramsAt(e, t, clip, W, H), t, e, clip, W, H);
+          // `g` AFTER `pend`, and that is the whole order question: the later effect used
+          // to be handed the canvas the earlier one had already moved, so its matrix
+          // applies to that result - g . pend, not pend . g. Backwards, a rotation would
+          // turn the picture about where it started instead of where it had got to.
+          pend = pend
+            ? { a: clamp(pend.a, 0, 1) * clamp(g.a, 0, 1), m: matMul(g.m, pend.m) }
+            : { a: clamp(g.a, 0, 1), m: g.m };
+          continue;
+        }
+        flush();
+        if (blurred) drawBlurred(L, e, t, clip, frameDur, mb);
+        else d.draw(L, paramsAt(e, t, clip, W, H), t, e, clip);
       } catch (err) {
         if (typeof console !== 'undefined') console.warn('FX ' + e.type + ' failed:', err);
       }
       // An effect that leaves the context dirty would poison every effect after it.
       reset(L.c);
     }
+    flush();
     target.drawImage(L.cv, 0, 0);
     return true;
   }
