@@ -3175,6 +3175,31 @@ Four rules the tracks live by, each of which has a test:
 - **`retimeKey` returns the key's new index**, because dragging a key past its neighbour
   reorders the track and a caller holding the old index would then edit the wrong key.
 
+#### Framing keyframes: Pan X, Pan Y and Zoom
+
+The clip-key registry (`Anim.registerClipProp()`) was built empty, waiting for a property
+the draw could honour in the preview and the export alike. Framing is the first: `panX`,
+`panY` and `zoom` are registered for every picture clip, as ordinary `clip.keys` tracks timed
+from the clip's start, so the **Clip keyframes** panel, the per-key curve picker and undo come
+with them.
+
+- **One reader.** `trackFramed(clip, t)` folds the keyed values over the resting framing,
+  and every path that frames a picture already asks it — the viewer, the baker, a
+  transition's sides, a matte's plate, a tracked marker — so none of them was told.
+  A crop-mode track binding still wins the pan: following a point is more specific.
+- **The Framing panel keyframes too.** A ◆ beside each slider adds a key at the playhead
+  (holding the framing on screen, so nothing moves) or removes the one there. Once a
+  property has keys, `writeFraming()` — the one door every framing edit already goes
+  through — writes **a key at the playhead** instead of the resting value, so the sliders,
+  the number boxes, the wheel, Left/Center/Right and dragging on the viewer all keyframe.
+  The panel shows the animated value under the playhead and follows it as it moves.
+- **Clamped like the sliders:** a crop never zooms below 1, a pan stays in 0..1.
+- **Same keys on every delivery format.** An override is a resting crop; a move is part of
+  the edit.
+- **Off the fast path.** ffmpeg's crop is one constant, so `clipNeedsBake()` bakes a clip with
+  keyed framing, and the keys are in the job (`fkeys`) so a re-keyed push-in never hits the
+  old cached render.
+
 #### One key is a constant, and the slider becomes decoration
 
 A track holds its first value before its first key and its last after its last, so a

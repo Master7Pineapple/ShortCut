@@ -542,7 +542,12 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
 .tc-row.tc-area.has-reset { grid-template-columns: 1fr 20px; }
 .tc-row.tc-area textarea { grid-column: 1 / -1; }
 
-#framing .row { grid-template-columns: 46px 1fr 56px 20px; }
+#framing .row { grid-template-columns: 46px 1fr 56px 20px 20px; }
+/* The keyframe diamond: hollow-looking when the property is still, lit when it is
+   animated, solid accent when a key sits exactly under the playhead. */
+#framing .fr-key { font-size: 11px; }
+#framing .fr-key.keyed { color: var(--text); }
+#framing .fr-key.on { color: var(--accent); }
 #inspector .kv-range { display: grid; grid-template-columns: 1fr 52px; gap: 4px; align-items: center; }
 
 .tc-key { grid-template-columns: 56px 1fr 52px auto auto; }

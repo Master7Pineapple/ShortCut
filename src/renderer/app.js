@@ -2035,6 +2035,12 @@ function renderRangeOverlay() {
 function renderPlayhead() {
   $('#playhead').style.left = (state.playhead * state.pxPerSec) + 'px';
   $('#timecode').textContent = fmtTc(state.playhead) + ' / ' + fmtTc(projectDuration());
+  // Only when something is animated: the framing panel is otherwise a constant, and this
+  // runs every frame of playback.
+  try {
+    const ft = framingTarget()[0];
+    if (ft && hasFramingKeys(ft)) syncFramingControls();
+  } catch (e) { /* called before the panel exists */ }
 }
 
 function selectedClips() {
@@ -4147,7 +4153,10 @@ function clipKeyPanel(clip) {
   return TextUI.section('clipkeys', 'Keyframes', (b) => {
     b.appendChild(TextUI.el('div', 'tc-hint',
       'Keys are times within the clip, so moving the clip moves its animation with it.'));
-    for (const spec of props) {
+    for (const spec0 of props) {
+      // A property whose neutral value is the clip's own - framing - says so with
+      // `baseOf`, and the strip is handed that value as its base.
+      const spec = spec0.baseOf ? Object.assign({}, spec0, { base: spec0.baseOf(clip) }) : spec0;
       b.appendChild(TextUI.keyStrip(spec.prop, Object.assign({}, hooks, {
         spec,
         getKeys: () => Anim.trackFor(clip, spec.prop, true),
@@ -6612,9 +6621,47 @@ const FRAMING_DEFAULTS = { panX: 0.5, panY: 0.5, zoom: 1 };
  * one rule rather than seven.
  */
 function writeFraming(c, prop, value) {
+  // ANIMATED, THE EDIT IS A KEY. Once a property has keys the resting value is not what
+  // is on screen, so moving the slider must move what is on screen: the key under the
+  // playhead, or a new one there. Every door into framing comes through here - the
+  // sliders, the boxes, the wheel, L/C/R, the drag on the viewer - so all of them keyframe.
+  const tr = framingKeys(c, prop);
+  if (tr) {
+    const i = keyAtPlayhead(c, tr);
+    if (i >= 0) tr[i].v = value;
+    else Anim.addKey(tr, clipLocalNow(c), value, Anim.EASING_PRESETS.easeInOut);
+    return;
+  }
   const fmt = framingFormat();
   if (fmt) Delivery.setOverride(c, fmt, { [prop]: value });
   else c[prop] = value;
+}
+
+/**
+ * The diamond beside a framing slider: a key at the playhead, or none.
+ *
+ * On a property with no keys it starts the animation with one key holding the framing
+ * already on screen, so the picture does not move. On a key it removes that key, and the
+ * last one going takes the track with it - `pruneKeys()` - so a clip that stops being
+ * animated serialises exactly as one that never was.
+ */
+function toggleFramingKey(prop) {
+  const targets = framingTarget();
+  if (!targets.length) return;
+  pushUndo();
+  for (const c of targets) {
+    const tr = Anim.trackFor(c, prop, true);
+    const i = keyAtPlayhead(c, tr);
+    if (i >= 0) {
+      Anim.removeKey(tr, i);
+      if (!tr.length) Anim.pruneKeys(c);
+    } else {
+      const now = trackFramed(c, clipLocalNow(c));
+      Anim.addKey(tr, clipLocalNow(c), framingOf(now)[prop], Anim.EASING_PRESETS.easeInOut);
+    }
+  }
+  markDirty();
+  renderAll();
 }
 
 function syncFramingControls() {
@@ -6632,17 +6679,34 @@ function syncFramingControls() {
   ['panX', 'panY', 'zoom'].forEach((k) => {
     $('#' + k).disabled = !on;
     $('#' + k + 'v').disabled = !on;
+    const kb = document.querySelector('#framing .fr-key[data-key="' + k + '"]');
+    if (kb) kb.disabled = !on;
   });
   if (!on) return;
   // Don't fight the user while they are mid-edit in a number box.
   const skip = document.activeElement && document.activeElement.classList.contains('tc-num')
     ? document.activeElement.id : null;
-  const f = framingOf(t);
+  // The value ON SCREEN: an animated property shows where its keys have it now.
+  const f = Object.assign({}, framingOf(t), framingKeysAt(t, clipLocalNow(t)) || {});
   for (const k of ['panX', 'panY', 'zoom']) {
     $('#' + k).value = f[k];
     if (skip !== k + 'v') $('#' + k + 'v').value = Number(f[k]).toFixed(3);
+    const btn = document.querySelector('#framing .fr-key[data-key="' + k + '"]');
+    if (btn) {
+      const tr = framingKeys(t, k);
+      btn.disabled = false;
+      btn.classList.toggle('keyed', !!tr);
+      btn.classList.toggle('on', keyAtPlayhead(t, tr) >= 0);
+      btn.title = !tr ? 'Animate ' + k + ': add a keyframe here'
+        : keyAtPlayhead(t, tr) >= 0 ? 'Remove the keyframe at the playhead'
+          : 'Add a keyframe at the playhead (moving the slider does too)';
+    }
   }
 }
+
+document.querySelectorAll('#framing .fr-key').forEach((b) => {
+  b.addEventListener('click', () => toggleFramingKey(b.dataset.key));
+});
 
 function setFraming(prop, value) {
   const targets = framingTarget();
@@ -8942,6 +9006,13 @@ function buildJob(outPath, range) {
         // it out and turning up a blur would hit the cached render of the old picture.
         // ffmpeg never sees it - the baker has already drawn it by the time main runs.
         fx: c.fx && c.fx.length ? JSON.parse(JSON.stringify(c.fx)) : undefined,
+        // Animated framing decides pixels the resting panX/panY/zoom above cannot see.
+        fkeys: hasFramingKeys(c)
+          ? JSON.parse(JSON.stringify(FRAME_KEY_PROPS().reduce((o, k) => {
+            if (framingKeys(c, k)) o[k] = c.keys[k];
+            return o;
+          }, {})))
+          : undefined,
         // The take itself stays off the job - it is thousands of samples. But a `cursor`
         // or `ripple` effect DRAWS from it, so the picture depends on something the key
         // could not otherwise see: two cuts of one file with different takes would share
@@ -9441,6 +9512,9 @@ function clipNeedsBake(c) {
   // Read through the format, so a still set to 'contain' for 1:1 only is composited
   // when 1:1 is the shape being rendered and handed to the fast path when it is not.
   if (framingOf(c).fit === 'contain') return true;
+  // Keyed framing moves the crop every frame; the chain's crop is one constant. Baked, it
+  // goes through `trackFramed()`, which is where the keys are read.
+  if (hasFramingKeys(c)) return true;
   return FX.active(c).length > 0;
 }
 
@@ -11320,11 +11394,86 @@ function trackCropPan(clip, tLocal) {
  */
 function trackFramed(clip, tLocal) {
   const pan = trackCropPan(clip, tLocal);
-  if (!pan) return framedCopy(clip);
-  const out = Object.assign({}, clip, framingOf(clip), { panX: pan.panX, panY: pan.panY });
+  const keyed = framingKeysAt(clip, tLocal);
+  if (!pan && !keyed) return framedCopy(clip);
+  // Keys over the resting framing, and a tracked crop over both: a crop that FOLLOWS a
+  // point is the more specific of the two, and it only ever takes the pan.
+  const out = Object.assign({}, clip, framingOf(clip), keyed || {},
+    pan ? { panX: pan.panX, panY: pan.panY } : {});
   delete out.frames;
   return out;
 }
+
+/**
+ * FRAMING KEYFRAMES. Pan X, Pan Y and Zoom, animated.
+ *
+ * They are ordinary clip keys - `clip.keys.panX` and friends, `{ t, v, ease }` timed in
+ * seconds from the clip's start - so the Clip keyframes panel, the curve picker and undo
+ * all come free. The one thing they need that no other clip key did is a READER in the
+ * draw, and `trackFramed()` is that reader: every path that frames a picture already asks
+ * it rather than the clip, so the viewer, the baker, a transition's two sides, a matte's
+ * plate and a tracked marker all see the animated crop without being told.
+ *
+ * Keys are the same across every delivery format. A per-format override is a resting
+ * framing; an animation is a move, and a push-in on the master that did not happen in the
+ * square cut would be a different edit, not a different crop.
+ */
+// A function, not a top-level const: `trackFramed()` can run during start-up before this
+// line of the file has executed, and a const read there is a TDZ error, not an empty list.
+function FRAME_KEY_PROPS() { return ['panX', 'panY', 'zoom']; }
+
+function framingKeys(c, prop) {
+  const tr = c && c.keys && c.keys[prop];
+  return tr && tr.length ? tr : null;
+}
+
+function hasFramingKeys(c) {
+  return !!c && FRAME_KEY_PROPS().some((k) => framingKeys(c, k));
+}
+
+/** The keyed framing values at clip-local `t`, or null when nothing is keyed. */
+function framingKeysAt(clip, t) {
+  if (!clip || !clip.keys) return null;
+  let out = null;
+  for (const k of FRAME_KEY_PROPS()) {
+    const tr = framingKeys(clip, k);
+    if (!tr) continue;
+    const v = Anim.evalTrack(tr, t);
+    if (v == null || !isFinite(v)) continue;
+    (out = out || {})[k] = v;
+  }
+  if (!out) return null;
+  // The same ranges the sliders keep: a crop cannot zoom out past the source, and a pan
+  // is a fraction of the spare room either side.
+  const contain = framingOf(clip).fit === 'contain';
+  if (out.zoom != null) out.zoom = contain ? clamp(out.zoom, 0.05, 8) : clamp(out.zoom, 1, 8);
+  if (out.panX != null) out.panX = clamp(out.panX, 0, 1);
+  if (out.panY != null) out.panY = clamp(out.panY, 0, 1);
+  return out;
+}
+
+/** Where the playhead sits inside `c`, in the seconds its keys are timed in. */
+function clipLocalNow(c) {
+  return clamp(state.playhead - c.start, 0, clipLen(c));
+}
+
+/** Index of the key on `tr` under the playhead, within half a frame, or -1. */
+function keyAtPlayhead(c, tr) {
+  if (!tr) return -1;
+  const t = clipLocalNow(c);
+  const tol = 0.5 / (state.out.fps || 30);
+  return tr.findIndex((k) => Math.abs(k.t - t) <= tol);
+}
+
+// Offered in the Clip keyframes panel on anything with a picture to frame. The key a
+// first "+ key" drops is the framing the clip has NOW - `baseOf` - so starting to animate
+// never moves the picture.
+Anim.registerClipProp({ prop: 'panX', label: 'Pan X', min: 0, max: 1, step: 0.001, base: 0.5,
+  when: isPictureClip, baseOf: (c) => framingOf(c).panX });
+Anim.registerClipProp({ prop: 'panY', label: 'Pan Y', min: 0, max: 1, step: 0.001, base: 0.5,
+  when: isPictureClip, baseOf: (c) => framingOf(c).panY });
+Anim.registerClipProp({ prop: 'zoom', label: 'Zoom', min: 0.05, max: 4, step: 0.01, base: 1,
+  when: isPictureClip, baseOf: (c) => framingOf(c).zoom });
 
 /** Every track marker visible on the viewer right now, in frame fractions. */
 function trackMarkers() {
