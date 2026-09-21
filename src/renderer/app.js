@@ -1461,10 +1461,35 @@ function addTransition(type, cutInfo) {
   // almost always sits exactly on a clip cut below it, because that is where the scene
   // changes. Select the adjustment clip (or any clip) and the transition goes on its own
   // edges; with nothing selected it is the nearest cut, topmost track first on a tie.
+  //
+  // A SELECTION IS A PROMISE, NOT A HINT. With clips selected the transition goes on one of
+  // THEIR edges or nowhere: falling back to the nearest cut on some other track put it on
+  // a clip the author had not picked, which is exactly the surprise this exists to stop.
+  // With a TRANSITION selected - which is what adding one leaves you with, so it is what a
+  // second press of T sees - it stays on that transition's track, so adding a run of scene
+  // transitions on an adjustment track does not wander down onto the footage below.
   if (!cutInfo) {
-    const sel = new Set(selectedClips().map((x) => x.clip));
-    const own = cuts.filter((c) => sel.has(c.a) || sel.has(c.b));
-    if (own.length) cuts = own;
+    const selClips = selectedClips().map((x) => x.clip).filter((c) => c.kind !== 'audio');
+    if (selClips.length) {
+      const sel = new Set(selClips);
+      cuts = cuts.filter((c) => sel.has(c.a) || sel.has(c.b));
+      // A selection holding an adjustment clip AND footage means the scene: the footage
+      // is usually selected along with it by a marquee, not chosen.
+      if (selClips.some(isAdjustClip) && cuts.some((c) => isAdjustClip(c.a))) {
+        cuts = cuts.filter((c) => isAdjustClip(c.a));
+      }
+      if (!cuts.length) {
+        log(selClips.some(isAdjustClip)
+          ? 'The selected adjustment clip does not touch another adjustment clip - put two ' +
+            'end to end on the same track to make a scene cut.'
+          : 'The selected clip has no cut - it has to touch another clip on its track.');
+        return null;
+      }
+    } else if (state.selTransition) {
+      const cur = findTransition(state.selTransition);
+      const same = cur ? cuts.filter((c) => c.track === cur.track) : [];
+      if (same.length) cuts = same;
+    }
   }
   if (!cuts.length) {
     log('No cut to put a transition on - two clips must touch. Two touching adjustment ' +
