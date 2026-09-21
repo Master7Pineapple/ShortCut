@@ -9532,7 +9532,11 @@ function compositeSpans(job) {
 async function bakeComposite(job) {
   const dirs = [];
   const spans = compositeSpans(job);
-  if (!spans.length) return dirs;
+  if (!spans.length) {
+    // Nothing to composite - but a scene transition may still cover clips outright.
+    dropCovered(job, []);
+    return dirs;
+  }
 
   const frame = document.createElement('canvas');
   frame.width = job.width; frame.height = job.height;
@@ -9604,10 +9608,39 @@ async function bakeComposite(job) {
       fmtTc(span.from) + ' - ' + fmtTc(span.to) + '.');
   }
 
-  // Anything wholly inside a bake span is already in those pixels. Dropping it here is
-  // what makes the bake a saving rather than a surcharge: buildArgs() only opens an input
-  // for a clip that is still visible or audible, so its decoder goes with it.
-  const covered = (a, b) => spans.some((sp) => a >= sp.from - 1e-4 && b <= sp.to + 1e-4);
+  dropCovered(job, spans);
+  return dirs;
+}
+
+/**
+ * Take off the ffmpeg chain every clip whose whole extent is already painted by the
+ * renderer, and return nothing.
+ *
+ * Dropping it is what makes the bake a saving rather than a surcharge: buildArgs() only
+ * opens an input for a clip that is still visible or audible, so its decoder goes with it.
+ *
+ * It is ALSO what keeps the chain from being handed a clip it cannot draw, and that is the
+ * half that failed. A composite span stops at a transition window, so a still set to Whole
+ * image that ran into a SCENE transition was covered by neither on its own - the span
+ * ended at the window's edge and the window was not counted - and went down ffmpeg's
+ * fill-and-crop chain, where Size 0.75 asks for a crop bigger than the picture and the
+ * render dies. A scene transition's layer sits on top of the whole chain with everything
+ * painted into it (`paintSceneFrame()`), so its window covers every clip exactly as a
+ * composite span does; coverage is the UNION of the two, merged, so a clip straddling
+ * the seam between them counts as covered.
+ */
+function dropCovered(job, spans) {
+  const wins = job.clips
+    .filter((c) => c.kind === 'trans' && c.transRef && isSceneTransition(c.transRef))
+    .map((c) => ({ from: job.rangeFrom + c.start, to: job.rangeFrom + c.start + jobLen(c) }));
+  const all = spans.concat(wins).sort((x, y) => x.from - y.from);
+  const merged = [];
+  for (const iv of all) {
+    const last = merged[merged.length - 1];
+    if (last && iv.from <= last.to + 1e-4) last.to = Math.max(last.to, iv.to);
+    else merged.push({ from: iv.from, to: iv.to });
+  }
+  const covered = (a, b) => merged.some((sp) => a >= sp.from - 1e-4 && b <= sp.to + 1e-4);
   for (const e of job.clips) {
     if (!e.visible || e.kind === 'baked' || e.kind === 'trans') continue;
     const a = job.rangeFrom + e.start;
@@ -9617,7 +9650,6 @@ async function bakeComposite(job) {
       for (const k of Object.keys(CANVAS_PAINTERS)) delete e[CANVAS_PAINTERS[k].ref];
     }
   }
-  return dirs;
 }
 
 /** Bake every canvas-drawn layer a job needs: the composite, text cards, transitions. */

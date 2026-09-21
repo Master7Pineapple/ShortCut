@@ -2179,7 +2179,12 @@ function buildArgs(job, opts) {
       return;
     }
 
-    const zoom = c.zoom || 1;
+    // Never below 1. The crop chain can only zoom IN - a crop is a window onto the source,
+    // and a window bigger than the source is not a picture, it is ffmpeg refusing the
+    // whole render ("Invalid too big or non positive size"). Below 1 is a 'contain'
+    // still's Size, and such a clip is composited by the renderer and should never be
+    // here; if one ever slips through, it draws filled rather than killing the render.
+    const zoom = Math.max(1, c.zoom || 1);
     // Largest source region matching the target aspect, divided by zoom, then panned.
     const cw = 'min(iw,ih*' + width + '/' + height + ')/' + r3(zoom);
     const ch = 'min(ih,iw*' + height + '/' + width + ')/' + r3(zoom);
