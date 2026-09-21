@@ -1455,7 +1455,17 @@ function maxTransitionDuration(a, b) {
  * closest cut with a sensible length and selects itself so it can be tuned right away.
  */
 function addTransition(type, cutInfo) {
-  const cuts = cutInfo ? [cutInfo] : allCuts();
+  let cuts = cutInfo ? [cutInfo] : allCuts();
+  // THE SELECTION SAYS WHICH TRACK. Nearest-to-the-playhead alone is a coin toss the
+  // moment two tracks cut at the same instant - and a scene cut on an adjustment track
+  // almost always sits exactly on a clip cut below it, because that is where the scene
+  // changes. Select the adjustment clip (or any clip) and the transition goes on its own
+  // edges; with nothing selected it is the nearest cut, topmost track first on a tie.
+  if (!cutInfo) {
+    const sel = new Set(selectedClips().map((x) => x.clip));
+    const own = cuts.filter((c) => sel.has(c.a) || sel.has(c.b));
+    if (own.length) cuts = own;
+  }
   if (!cuts.length) {
     log('No cut to put a transition on - two clips must touch. Two touching adjustment ' +
       'clips make a scene cut that transitions everything beneath them.');
