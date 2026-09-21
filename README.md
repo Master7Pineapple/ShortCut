@@ -849,9 +849,10 @@ It is **not a canvas clip**. A canvas clip is one the renderer *paints* — a ca
 graphic — and it bakes into its own cropped sequence that ffmpeg overlays. This one paints
 nothing and must never be overlaid: it modifies. What it shares with a card is only that
 there is no source clock, which is what `noSourceClock()` is for: no decoder, no in/out, no
-link, no volume, no speed, and never sliced by Tighten. `trackCuts()` also skips it, because
-its edges are not cuts — a transition needs two sides to show and one of them would be
-nothing at all.
+link, no volume, no speed, and never sliced by Tighten. `trackCuts()` pairs it **only with
+another adjustment clip**: an adjustment clip against a picture is not a cut, because one side
+would be a picture and the other a whole stack. Two touching adjustment clips are a **scene
+cut** — see "Scene transitions" under Transitions.
 
 The "add an effect" menu greys out `cursor` and `ripple` on it with no extra code: they
 declare `needs`, and an adjustment clip carries no mouse take. **`matte` is the exception,
@@ -3732,6 +3733,37 @@ stored on that track as `{ id, type, aId, bId, duration, align, easing, motionBl
 params }`, keyed by the two clips rather than by a time, so it follows them when they move.
 `resolveTransition()` returns null the moment those clips stop touching, which makes a
 stranded transition inert rather than wrong; it comes back if they meet again.
+
+#### Scene transitions: a transition on the cut between two adjustment clips
+
+A transition between two clips moves two pictures, so it could never move a *scene* — five
+clips on four tracks, a caption, a graphic. Put two adjustment clips end to end on a track
+above the scene and the cut between them takes a transition like any other, and that
+transition moves **everything beneath each of them**:
+
+- **Side A** is the ordinary composite of every track under the outgoing adjustment clip,
+  with that clip's own effects on top; **side B** is the same for the incoming one.
+  `sceneSide()` picks the layers at the cut's *edge* on each side — just before it for A,
+  just after for B — so the outgoing scene cannot turn into the incoming one halfway
+  through the window.
+- Each side is then painted at the transition's own time, **reaching into its handles**
+  exactly as a clip transition does: a video past its out point keeps playing from its
+  source, and a card or an effect past its end **holds** its last frame
+  (`compositeLayers(..., { hold })`) rather than vanishing.
+- Anything **above** the adjustment track is not in the scene. It is drawn over the finished
+  transition untouched, as it is drawn over an adjustment layer's effects.
+- The master finish is applied **once**, after, not per side.
+
+Nothing is stored to mark it: it is an ordinary `{ aId, bId }` on the adjustment track, and
+`isSceneTransition()` answers from what its two clips are. `paintSceneFrame()` is the one
+paint path, and the viewer and the baker differ only in where a picture comes from — the same
+`srcFor` split `compositeLayers()` already has. `sceneMediaTargets()` parks every source both
+sides need, for the viewer's `syncMedia()` and for the bake alike.
+
+In the export a scene transition's layer goes **on top of the whole chain** rather than just
+above its own track, because it already has everything above it painted in. Everything under
+it in its window is covered — drawn by ffmpeg and hidden, which costs a little and changes
+nothing.
 
 #### How they render, and why
 

@@ -1286,15 +1286,118 @@ function activeCanvasClips() {
 /** Every cut on a track: a pair of clips that touch, with the time they meet at. */
 function trackCuts(track) {
   const out = [];
-  // An adjustment clip has no picture, so its edges are not cuts - a transition needs two
-  // sides to show, and one of them would be nothing at all.
-  const clips = track.clips.filter((c) => c.kind !== 'audio' && !isAdjustClip(c))
+  const clips = track.clips.filter((c) => c.kind !== 'audio')
     .slice().sort((x, y) => x.start - y.start);
   for (let i = 0; i < clips.length - 1; i++) {
     const a = clips[i], b = clips[i + 1];
+    // LIKE WITH LIKE. Two touching adjustment clips are a SCENE cut - a transition there
+    // carries everything beneath each of them, see `sceneSide()`. An adjustment clip
+    // against a picture is not a cut at all: one side would be a picture and the other
+    // the whole stack under a layer, and there is no transition between those two things.
+    if (isAdjustClip(a) !== isAdjustClip(b)) continue;
     if (Math.abs(clipEnd(a) - b.start) < 0.002) out.push({ a, b, cut: b.start, track });
   }
   return out;
+}
+
+/**
+ * A SCENE TRANSITION: one on the cut between two adjustment clips.
+ *
+ * A transition between two clips moves two pictures. Put one between two adjustment
+ * clips and it moves two STACKS: side A is everything composited beneath the outgoing
+ * layer - every track under it, captions and graphics included, with that layer's own
+ * effects on top - and side B is the same for the incoming one. So the whole scene swipes,
+ * zooms or dissolves into the next, which is what a transition on a single clip can never
+ * do when the scene is five clips on four tracks. Anything ABOVE the adjustment track is
+ * not in the scene: it is drawn over the transition, untouched, exactly as it is drawn
+ * over an adjustment layer's effects.
+ *
+ * Nothing is stored to say so. The transition is an ordinary `{ aId, bId }` on the
+ * adjustment track, and it is a scene transition because of what its two clips are.
+ */
+function isSceneTransition(r) {
+  return !!r && isAdjustClip(r.a) && isAdjustClip(r.b);
+}
+
+/**
+ * The layers one side of a scene transition is made of, bottom first - the order
+ * `compositeLayers()` wants.
+ *
+ * WHICH clips is decided at the cut's EDGE on that side: what was showing just before it
+ * for A, just after for B. They are then painted at the transition's own time, reaching
+ * into their handles exactly as a clip transition's two sides do - a video past its out
+ * point keeps playing from its source, and a card or an effect past its end holds its
+ * last frame (`hold`). Picking by the edge rather than by the current time is what keeps
+ * the outgoing scene from turning into the incoming one halfway through the window.
+ */
+function sceneSide(r, side) {
+  const adj = side === 'a' ? r.a : r.b;
+  const edge = side === 'a' ? r.cut - 1e-3 : r.cut + 1e-3;
+  const ti = state.tracks.indexOf(r.track);
+  const out = [];
+  for (let i = state.tracks.length - 1; i > ti; i--) {
+    const t = state.tracks[i];
+    if (t.type !== 'video' || t.hidden) continue;
+    for (const c of t.clips) {
+      if (!isPictureClip(c) && !isCanvasClip(c) && !isAdjustClip(c)) continue;
+      if (edge >= c.start - 1e-6 && edge < clipEnd(c) - 1e-6) out.push(c);
+    }
+  }
+  out.push(adj);
+  return out;
+}
+
+/** What is drawn OVER a scene transition: everything above its track, live at `time`. */
+function layersAbove(track, time) {
+  const ti = state.tracks.indexOf(track);
+  return layersAt(time).filter((c) => {
+    const k = state.tracks.findIndex((t) => t.clips.indexOf(c) >= 0);
+    return k >= 0 && k < ti;
+  });
+}
+
+/**
+ * Every source a scene transition needs parked, and where. The same handle rule as a clip
+ * transition's two sides - `srcAt()` past the trim, clamped to the file - for every
+ * picture on both sides; and the plain playhead time for the ones above it. A clip that
+ * runs under the cut is on both sides and wants the same time for each, so it is listed
+ * once.
+ */
+function sceneMediaTargets(r, time) {
+  const out = new Map();
+  const at = (c) => clamp(srcAt(c, time - c.start), 0, Math.max(0, (c.mediaDuration || 0) - 0.03));
+  for (const c of sceneSide(r, 'a').concat(sceneSide(r, 'b'), layersAbove(r.track, time))) {
+    if (!isPictureClip(c) || out.has(c.id)) continue;
+    out.set(c.id, { clip: c, t: at(c) });
+  }
+  return [...out.values()];
+}
+
+/**
+ * Paint one scene transition frame at `time`, onto `cctx` at W x H.
+ *
+ * The viewer and the baker both come through here, and they differ only in where a
+ * picture comes from - `srcFor` - which is the same split `compositeLayers()` already
+ * has. Each side is the ordinary composite of its own layers, so an effect, a matte or a
+ * caption inside the scene looks in the transition exactly as it does either side of it.
+ * The master finish is applied ONCE, after, because it is the project's look over the
+ * finished frame rather than something each half has.
+ */
+function paintSceneFrame(r, cctx, W, H, time, srcFor, frameDur, surfA, surfB) {
+  const opts = { hold: true, noMaster: true };
+  const pa = compositeLayers(surfA.getContext('2d'), W, H, sceneSide(r, 'a'), time, srcFor, frameDur, opts);
+  const pb = compositeLayers(surfB.getContext('2d'), W, H, sceneSide(r, 'b'), time, srcFor, frameDur, opts);
+  if (!pa && !pb) return false;
+  cctx.save();
+  cctx.fillStyle = '#000';
+  cctx.fillRect(0, 0, W, H);
+  cctx.restore();
+  const p = (time - r.from) / Math.max(0.001, r.dur);
+  Trans.draw(cctx, W, H, r.tr, p, pa ? surfA : null, pb ? surfB : null, frameDur, null);
+  compositeLayers(cctx, W, H, layersAbove(r.track, time), time, srcFor, frameDur,
+    { over: true, noMaster: true });
+  FX.renderMaster(cctx, W, H, state.master, time, fxSurface, frameDur);
+  return true;
 }
 
 function allCuts() {
@@ -1353,7 +1456,11 @@ function maxTransitionDuration(a, b) {
  */
 function addTransition(type, cutInfo) {
   const cuts = cutInfo ? [cutInfo] : allCuts();
-  if (!cuts.length) { log('No cut to put a transition on - two clips must touch.'); return null; }
+  if (!cuts.length) {
+    log('No cut to put a transition on - two clips must touch. Two touching adjustment ' +
+      'clips make a scene cut that transitions everything beneath them.');
+    return null;
+  }
   let best = cuts[0], bestD = Math.abs(cuts[0].cut - state.playhead);
   for (const c of cuts) {
     const d = Math.abs(c.cut - state.playhead);
@@ -1379,7 +1486,9 @@ function addTransition(type, cutInfo) {
   state.lastTransitionType = tr.type;
   markDirty();
   renderAll();
-  log('Added a ' + Trans.TYPES[tr.type].label.toLowerCase() + ' transition at ' + fmtTc(best.cut) + '.');
+  log('Added a ' + Trans.TYPES[tr.type].label.toLowerCase() +
+    (isAdjustClip(best.a) ? ' scene transition - everything under the two adjustment ' +
+      'clips moves with it -' : ' transition') + ' at ' + fmtTc(best.cut) + '.');
   return tr;
 }
 
@@ -5510,14 +5619,24 @@ function fxSurface(name, w, h) {
   return cv;
 }
 
-function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
+function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur, opts) {
+  // `opts`, all off by default and all for scene transitions (see `paintSceneFrame()`):
+  //   hold      a layer past either end of itself is painted at that end - one side of a
+  //             transition reaches past its clips, and a caption must hold, not vanish
+  //   over      paint onto what is already there instead of onto black
+  //   noMaster  leave the master finish to the caller, who applies it once
+  const o = opts || {};
   cctx.save();
   cctx.globalCompositeOperation = 'source-over';
-  cctx.fillStyle = '#000';
-  cctx.fillRect(0, 0, W, H);
-  let painted = false;
+  if (!o.over) {
+    cctx.fillStyle = '#000';
+    cctx.fillRect(0, 0, W, H);
+  }
+  let painted = !!o.over;
   for (const c of layers) {
-    const local = time - c.start;
+    const local = o.hold
+      ? clamp(time - c.start, 0, Math.max(0, clipLen(c) - (frameDur || 1 / 30)))
+      : time - c.start;
     // An ADJUSTMENT CLIP takes the frame built so far and runs its stack over it. It is
     // skipped entirely when nothing has painted yet - an adjustment layer hanging over a
     // gap has nothing to adjust, and running it over the black base would turn a hole in
@@ -5557,7 +5676,7 @@ function compositeLayers(cctx, W, H, layers, time, srcFor, frameDur) {
   // The project master finish, over everything the stack just built. Here rather than in
   // the two callers because this IS the composite: the viewer and the baker both come
   // through this function, so a LUT or a grain that is in the file was in the viewer.
-  if (painted) FX.renderMaster(cctx, W, H, state.master, time, fxSurface, frameDur);
+  if (painted && !o.noMaster) FX.renderMaster(cctx, W, H, state.master, time, fxSurface, frameDur);
   return painted;
 }
 
@@ -5787,7 +5906,19 @@ function drawPreview() {
   // A transition owns the frame for its whole window: it needs BOTH clips, so the
   // normal single-clip path cannot express it.
   const trans = transitionAt();
-  if (trans) {
+  if (trans && isSceneTransition(trans)) {
+    // A scene transition already holds everything - both scenes and whatever is above
+    // them - so nothing is drawn over it afterwards.
+    const cache = videoFrameCache();
+    const ok = paintSceneFrame(trans, cache.getContext('2d'), P.w, P.h, state.playhead,
+      (c) => layerFor(c, P), 1 / state.out.fps,
+      transSurface('sceneA', P.w, P.h), transSurface('sceneB', P.w, P.h));
+    if (ok) {
+      ctx.drawImage(cache, 0, 0);
+      frameCacheValid = true;
+      return;
+    }
+  } else if (trans) {
     if (drawTransitionFrame(trans, P)) {
       const over = activeCanvasClips();
       if (over.length) drawCanvasLayer(over);
@@ -5981,6 +6112,7 @@ const EVICT_BEYOND = 20;
 function transitionMediaTargets() {
   const r = transitionAt();
   if (!r) return null;
+  if (isSceneTransition(r)) return sceneMediaTargets(r, state.playhead);
   const st = transitionSourceTimes(r, state.playhead);
   return [{ clip: r.a, t: st.a }, { clip: r.b, t: st.b }];
 }
@@ -8751,6 +8883,7 @@ async function openProject(filePath) {
 function buildJob(outPath, range) {
   const r = range || { from: 0, to: projectDuration() };
   const clips = [];
+  const sceneLayers = [];   // scene transitions: appended last, over everything
   // Bottom video track first so higher tracks overlay on top.
   const ordered = [...state.tracks].reverse();
   for (const t of ordered) {
@@ -8842,7 +8975,9 @@ function buildJob(outPath, range) {
     }
 
     // A transition's layer is opaque and belongs above its own track's clips but below
-    // anything on a higher track, so it goes in right after them.
+    // anything on a higher track, so it goes in right after them. A SCENE transition's
+    // layer already has everything above it painted in (`paintSceneFrame()`), so it goes
+    // on top of the whole chain instead - after the loop, below.
     if (t.type === 'video' && !t.hidden) {
       for (const trDef of (t.transitions || [])) {
         const rv = resolveTransition(trDef, t);
@@ -8850,7 +8985,7 @@ function buildJob(outPath, range) {
         const from = Math.max(rv.from, r.from);
         const to = Math.min(rv.to, r.to);
         if (to - from <= 0.002) continue;
-        clips.push({
+        (isSceneTransition(rv) ? sceneLayers : clips).push({
           src: null,
           kind: 'trans',
           start: Math.max(0, from - r.from),
@@ -8866,6 +9001,7 @@ function buildJob(outPath, range) {
       }
     }
   }
+  for (const e of sceneLayers) clips.push(e);
   return {
     width: outSize().w, height: outSize().h, fps: state.out.fps,
     quality: state.out.quality, outPath, clips,
@@ -9109,9 +9245,12 @@ async function bakeTransitions(job) {
       if (r.tr.type === 'object') await Trans.loadImage(r.tr.params.src);
 
       const frames = Math.max(1, Math.round(jobLen(e) * job.fps));
-      const aEl = mediaFor(r.a);
-      const bEl = mediaFor(r.b);
-      aEl.muted = bEl.muted = true;
+      // A scene transition's two sides are adjustment clips, which have no media at all -
+      // its sources are everything under them, parked per frame below.
+      const scene = isSceneTransition(r);
+      const aEl = scene ? null : mediaFor(r.a);
+      const bEl = scene ? null : mediaFor(r.b);
+      if (!scene) aEl.muted = bEl.muted = true;
 
       const slot = await window.api.textSeq();
       e.seqDir = slot.dir;
@@ -9128,6 +9267,43 @@ async function bakeTransitions(job) {
           inBatch === BATCH ? batch : batch.slice(0, inBatch * frameBytes));
         inBatch = 0;
       };
+
+      if (isSceneTransition(r)) {
+        // A SCENE transition: every picture on both sides and above, seeked to its own
+        // handle time, then the one paint function the viewer uses. See paintSceneFrame().
+        const sA = document.createElement('canvas');
+        const sB = document.createElement('canvas');
+        sA.width = sB.width = job.width;
+        sA.height = sB.height = job.height;
+        const srcFor = (c) => { const el = mediaFor(c); return frameReady(el) ? el : null; };
+        for (let i = 0; i < frames; i++) {
+          const t = r.from + e.tStart + i / job.fps;
+          await Promise.all(sceneMediaTargets(r, t).map(({ clip, t: at }) => {
+            const el = mediaFor(clip);
+            if (el.tagName === 'IMG') return Promise.resolve();
+            el.muted = true;
+            return seekMedia(el, at);
+          }));
+          if (!paintSceneFrame(r, fctx, job.width, job.height, t, srcFor, 1 / job.fps, sA, sB)) {
+            fctx.fillStyle = '#000';
+            fctx.fillRect(0, 0, job.width, job.height);
+          }
+          batch.set(fctx.getImageData(0, 0, job.width, job.height).data, inBatch * frameBytes);
+          inBatch++;
+          if (inBatch === BATCH) await flush();
+          done++;
+          if (i % 4 === 0 || i === frames - 1) {
+            setStatus('Baking transitions... ' + done + ' / ' + totalFrames + ' frames');
+            $('#renderBar').style.width = (done / totalFrames * 100) + '%';
+            await new Promise((res) => setTimeout(res, 0));
+          }
+        }
+        await flush();
+        await window.api.textSeqDone(slot.dir, frames);
+        log('Baked ' + frames + ' frames of a ' + Trans.TYPES[r.tr.type].label.toLowerCase() +
+          ' scene transition at ' + fmtTc(r.cut) + '.');
+        continue;
+      }
 
       for (let i = 0; i < frames; i++) {
         const t = r.from + e.tStart + i / job.fps;
