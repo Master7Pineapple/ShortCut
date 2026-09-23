@@ -197,6 +197,19 @@ Mask.install({
 
 app.whenReady().then(createWindow);
 
+// Whatever a killed or reloaded run left behind, before this one starts writing its own.
+// See `sweepScratch()` - this is the half that makes the leak self-healing rather than a
+// disk that fills up a little more with every crash.
+app.whenReady().then(() => {
+  try {
+    const r = sweepScratch();
+    if (r.gone) {
+      console.log('Cleared ' + r.gone + ' orphaned bake folder(s), ' +
+        (r.freed / 1073741824).toFixed(2) + ' GB.');
+    }
+  } catch (e) { /* diagnostics only; never stop the app starting */ }
+});
+
 // Starting and stopping a recording both need a key that works while another app has
 // focus - the editor window is hidden behind whatever is being demonstrated, and on the
 // screen being recorded. One key TOGGLES, because the moment you want to start is the
@@ -1738,8 +1751,67 @@ function pruneTextCache(budgetBytes) {
  * enough that these do not need caching: they are temporary and deleted after the render.
  * The finished MP4 is what gets cached (see the render cache).
  */
+/**
+ * ORPHANED SCRATCH, AND WHY IT HAS TO BE SWEPT HERE.
+ *
+ * A baked sequence is raw RGBA - about 8 MB per 1080x1920 frame - and the renderer deletes
+ * its own dirs in a `finally`. That covers a render that finishes or fails; it covers
+ * nothing about a window that was reloaded mid-bake, an app that was killed, or a crash.
+ * Every one of those leaves tens of gigabytes behind under %TEMP%, and they never went
+ * away on their own: 266 of them, 31 GB, on the machine this was found on.
+ *
+ * That is not a tidiness problem, it is the "renders get slower the longer it runs"
+ * problem. A nearly full disk turns an 8 MB append from instant into something you can
+ * watch, so a bake that started at tens of milliseconds a frame ends up taking seconds -
+ * and the next run starts from a fuller disk than the last one did.
+ *
+ * So the main process sweeps. A dir this process is still writing to is off limits by
+ * name, and anything else is judged by its mtime: a live bake appends constantly, so a
+ * sequence untouched for 20 minutes belongs to a run that is gone. Once at startup, and
+ * again after every render.
+ */
+const liveSeqDirs = new Set();
+const SCRATCH_STALE_MS = 20 * 60 * 1000;
+
+function dirBytes(p) {
+  let n = 0;
+  try {
+    for (const name of fs.readdirSync(p)) {
+      try { n += fs.statSync(path.join(p, name)).size; } catch (e) { /* vanished */ }
+    }
+  } catch (e) { /* vanished */ }
+  return n;
+}
+
+function sweepScratch() {
+  const root = app.getPath('temp');
+  let freed = 0, gone = 0;
+  let names = [];
+  try { names = fs.readdirSync(root); } catch (e) { return { freed, gone }; }
+  for (const name of names) {
+    if (!/^shortcut-text-/.test(name)) continue;
+    const p = path.join(root, name);
+    if (liveSeqDirs.has(p)) continue;
+    try {
+      const st = fs.statSync(p);
+      if (!st.isDirectory() || Date.now() - st.mtimeMs < SCRATCH_STALE_MS) continue;
+      const size = dirBytes(p);
+      fs.rmSync(p, { recursive: true, force: true });
+      freed += size;
+      gone++;
+    } catch (e) { /* in use by another instance, or already gone */ }
+  }
+  return { freed, gone };
+}
+
+ipcMain.handle('scratch:sweep', () => sweepScratch());
+
 ipcMain.handle('text:seq', () => ({
-  dir: fs.mkdtempSync(path.join(app.getPath('temp'), 'shortcut-text-')),
+  dir: (() => {
+    const d = fs.mkdtempSync(path.join(app.getPath('temp'), 'shortcut-text-'));
+    liveSeqDirs.add(d);
+    return d;
+  })(),
   cached: false,
 }));
 
@@ -1883,6 +1955,7 @@ ipcMain.handle('text:writeFrames', (_e, { dir, data }) => {
 });
 
 ipcMain.handle('text:endSeq', (_e, dir) => {
+  liveSeqDirs.delete(dir);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* temp dir */ }
   return true;
 });

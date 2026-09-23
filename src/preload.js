@@ -69,6 +69,7 @@ contextBridge.exposeInMainWorld('api', {
   // Resolve Matte. A matte video rendered from DaVinci Resolve, decoded once in main into
   // run-length planes and cached on disk. Every call answers `{ ok:false, error }` on failure.
   mattePick: () => ipcRenderer.invoke('matte:pick'),
+  sweepScratch: () => ipcRenderer.invoke('scratch:sweep'),
   matteProbe: (p) => ipcRenderer.invoke('matte:probe', p),
   matteDecode: (req) => ipcRenderer.invoke('matte:decode', req),
   onMatteProgress: (cb) => ipcRenderer.on('matte:progress', (_e, d) => cb(d)),

@@ -254,9 +254,58 @@ function markClean() {
 /** clip.id -> HTMLMediaElement. Each clip gets its own so overlapping clips can coexist. */
 const mediaEls = new Map();
 
+/**
+ * HOW MANY DECODERS MAY BE OPEN AT ONCE, and why there has to be a number.
+ *
+ * `mediaEls` is a cache with an eviction rule that only the VIEWER ever ran: `syncMedia()`
+ * drops a clip's element once the playhead is 20 s away. A bake has no playhead - it walks
+ * the whole range asking for whatever the frame needs - so nothing was ever dropped, and a
+ * long render ended up holding one open decoder per clip it had touched. On a timeline cut
+ * from one 29-minute file that is dozens of decoders on the same file.
+ *
+ * The symptom is not memory, it is TIME. Chromium will only keep so many media elements
+ * alive in a renderer; past that they stop reaching readyState 2, every `seekMedia()` waits
+ * out its 1500 ms guard instead of resolving, and a frame that took 40 ms takes three
+ * seconds. Which is exactly the shape of it: fast for five minutes, then a crawl.
+ *
+ * So the map is an LRU. `mediaFor()` moves a hit to the end, and a miss evicts from the
+ * front until the live count is back under the cap. Two things are never evicted: an
+ * element that is PLAYING (the preview is using it right now) and the clip being asked
+ * for. The cap is comfortably above the number of layers any one frame composites, so the
+ * eviction only ever reaches clips the render has moved past.
+ */
+const MEDIA_CAP = 20;     // open video/audio decoders
+// Clips with a seek in flight. Evicting one of those would leave its `seekMedia()` waiting
+// on an element that no longer has a source - the 1500 ms guard, per frame, which is the
+// very stall this cache exists to avoid.
+const mediaBusy = new Set();
+const IMAGE_CAP = 40;     // decoded stills, which cost memory rather than a decoder
+
+function evictStaleMedia(keepId) {
+  let live = 0, stills = 0;
+  for (const el of mediaEls.values()) {
+    if (el.tagName === 'IMG') stills++; else live++;
+  }
+  if (live <= MEDIA_CAP && stills <= IMAGE_CAP) return;
+  for (const [id, el] of [...mediaEls]) {          // oldest use first
+    const img = el.tagName === 'IMG';
+    if (img ? stills <= IMAGE_CAP : live <= MEDIA_CAP) continue;
+    if (id === keepId || mediaBusy.has(id)) continue;
+    // Playing means the viewer is hearing or showing it this instant.
+    if (!img && !el.paused) continue;
+    dropMedia(id);
+    if (img) stills--; else live--;
+  }
+}
+
 function mediaFor(clip) {
   let el = mediaEls.get(clip.id);
-  if (el) return el;
+  if (el) {
+    // Touch: a Map keeps insertion order, so re-inserting is what makes this an LRU.
+    mediaEls.delete(clip.id);
+    mediaEls.set(clip.id, el);
+    return el;
+  }
   // A still is an <img>: no decoder, no clock, nothing to seek. It lives in the same map
   // as the media elements because everything downstream - the compositor, the framing
   // draw, eviction - only ever asks it for a picture and its natural size.
@@ -264,6 +313,7 @@ function mediaFor(clip) {
     el = document.createElement('img');
     el.src = 'file:///' + clip.src.replace(/\\/g, '/').replace(/^\/+/, '');
     mediaEls.set(clip.id, el);
+    evictStaleMedia(clip.id);
     return el;
   }
   el = document.createElement(clip.kind === 'video' ? 'video' : 'audio');
@@ -272,6 +322,7 @@ function mediaFor(clip) {
   if (clip.kind === 'video') el.muted = true; // audio always comes from the paired audio clip
   el.load();
   mediaEls.set(clip.id, el);
+  evictStaleMedia(clip.id);
   return el;
 }
 
@@ -9294,23 +9345,54 @@ function jobCacheKey(job) {
 let rendering = false;
 
 /** Park a media element on an exact source time and wait for the frame to land. */
-function seekMedia(el, t) {
+/**
+ * Ask main to bin any bake scratch a dead run left behind - see `sweepScratch()` there.
+ *
+ * After a render rather than before: this one's own dirs have just been deleted by name,
+ * so anything still lying around belongs to a run that is not coming back, and freeing it
+ * is what stops the disk filling a little more with every crash until writes crawl.
+ */
+function sweepScratch() {
+  try {
+    Promise.resolve(window.api.sweepScratch()).then((r) => {
+      if (r && r.gone) {
+        log('Cleared ' + r.gone + ' orphaned bake folder' + (r.gone === 1 ? '' : 's') +
+          ', ' + (r.freed / 1073741824).toFixed(2) + ' GB of scratch.');
+      }
+    }).catch(() => {});
+  } catch (e) { /* an older build with no bridge */ }
+}
+
+function seekMedia(el, t, clip) {
   return new Promise((resolve) => {
     if (el.readyState >= 2 && Math.abs(el.currentTime - t) < 0.004) return resolve();
     let done = false;
-    const finish = () => {
+    if (clip && clip.id) mediaBusy.add(clip.id);
+    const finish = (timedOut) => {
       if (done) return;
       done = true;
-      el.removeEventListener('seeked', finish);
+      el.removeEventListener('seeked', ok);
       el.removeEventListener('loadeddata', kick);
+      if (clip && clip.id) mediaBusy.delete(clip.id);
+      // A TIMEOUT THAT KEEPS HAPPENING IS A DEAD ELEMENT, not a slow one. Waiting out the
+      // guard once costs a frame; doing it on every frame of a render is the three-second
+      // frame. Two in a row and the element is thrown away, so the next ask builds a fresh
+      // one - which is also what frees whatever Chromium was refusing to give it.
+      if (timedOut) {
+        el.__stalls = (el.__stalls || 0) + 1;
+        if (el.__stalls >= 2 && clip && clip.id) dropMedia(clip.id);
+      } else {
+        el.__stalls = 0;
+      }
       resolve();
     };
-    const kick = () => { try { el.currentTime = t; } catch (e) { finish(); } };
-    el.addEventListener('seeked', finish);
+    const ok = () => finish(false);
+    const kick = () => { try { el.currentTime = t; } catch (e) { finish(false); } };
+    el.addEventListener('seeked', ok);
     if (el.readyState >= 1) kick();
     else el.addEventListener('loadeddata', kick);
     // A stubborn seek must never hang a render; take whatever frame is there.
-    setTimeout(finish, 1500);
+    setTimeout(() => finish(true), 1500);
   });
 }
 
@@ -9388,7 +9470,7 @@ async function bakeTransitions(job) {
             const el = mediaFor(clip);
             if (el.tagName === 'IMG') return Promise.resolve();
             el.muted = true;
-            return seekMedia(el, at);
+            return seekMedia(el, at, clip);
           }));
           if (!paintSceneFrame(r, fctx, job.width, job.height, t, srcFor, 1 / job.fps, sA, sB)) {
             fctx.fillStyle = '#000';
@@ -9415,8 +9497,8 @@ async function bakeTransitions(job) {
         const t = r.from + e.tStart + i / job.fps;
         const st = transitionSourceTimes(r, t);
         await Promise.all([
-          isCanvasClip(r.a) ? Promise.resolve() : seekMedia(aEl, st.a),
-          isCanvasClip(r.b) ? Promise.resolve() : seekMedia(bEl, st.b),
+          isCanvasClip(r.a) ? Promise.resolve() : seekMedia(aEl, st.a, r.a),
+          isCanvasClip(r.b) ? Promise.resolve() : seekMedia(bEl, st.b, r.b),
         ]);
 
         // The same plate function the viewer uses, so a transition's two halves are the
@@ -9672,7 +9754,7 @@ async function bakeComposite(job) {
         const el = mediaFor(c);
         if (el.tagName === 'IMG') return Promise.resolve();
         el.muted = true;
-        return seekMedia(el, clamp(srcAt(c, t - c.start), 0, Math.max(0, c.mediaDuration - 0.03)));
+        return seekMedia(el, clamp(srcAt(c, t - c.start), 0, Math.max(0, c.mediaDuration - 0.03)), c);
       }));
 
       compositeLayers(fctx, job.width, job.height, layers, t,
@@ -9981,6 +10063,7 @@ async function doPreviewRender(opts) {
   } finally {
     $('#renderBarWrap').classList.remove('busy');
     for (const d of dirs) window.api.endTextSeq(d);   // raw frames are scratch
+    sweepScratch();
   }
 
   rendering = false;
@@ -10071,6 +10154,7 @@ async function doRender(opts) {
     // Raw frames are bulky and now cheap to regenerate, so they are scratch rather than
     // cache. What gets cached is the finished MP4.
     for (const d of dirs) window.api.endTextSeq(d);
+    sweepScratch();
   }
 
   rendering = false;
@@ -10523,6 +10607,7 @@ async function renderSpanTo(outPath, range) {
     return await window.api.startRender(job);
   } finally {
     for (const d of dirs) window.api.endTextSeq(d);
+    sweepScratch();
   }
 }
 
