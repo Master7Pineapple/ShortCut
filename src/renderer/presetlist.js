@@ -139,13 +139,14 @@ const PresetList = (() => {
     focus: 0.5,
     zoom: 1,
     distance: 0,
-    seam: 0,                  // > 0 adds a `edgefade` on the band's inner edge
+    seam: 0,                  // feather on the band's inner edge, moves with the band
     animIn: true,             // glide from the full frame into the band ...
     animOut: false,           // ... and back out to the full frame at the end
     animDur: F(12),
     animEase: 'easeInOut',
     animAt: 'start',          // 'start' | 'playhead' - where the glide in begins
     animBlur: 0.5,            // shutter on the glide; 0 = none
+    animSamples: 8,
   };
 
   const TABLES = { p01: P01, p02: P02, p03: P03 };
@@ -469,7 +470,7 @@ const PresetList = (() => {
     const s = FX.create('split');
     s.preset = 'split';
     Object.assign(s.params, {
-      side, size: p.size, focus: p.focus, zoom: p.zoom, distance: p.distance, mix: 1,
+      side, size: p.size, focus: p.focus, zoom: p.zoom, distance: p.distance, mix: 1, seam: p.seam,
     });
     // The glide: `mix` keyed 0 -> 1 (and 1 -> 0 at the end), the curve on the first key of
     // each span. Nothing keyed when neither end animates, so the split is simply there.
@@ -491,24 +492,11 @@ const PresetList = (() => {
     }
     if (keys.length) {
       s.keys = { mix: keys };
-      if (Number(p.animBlur) > 0) s.mblur = { on: true, strength: Number(p.animBlur), samples: 8 };
+      if (Number(p.animBlur) > 0) {
+        s.mblur = { on: true, strength: Number(p.animBlur), samples: Math.round(p.animSamples) || 8 };
+      }
     }
-    const out = [s];
-    if (p.seam > 0) {
-      // The band's inner edge, measured from the frame edge the fade is named after.
-      const f = FX.create('edgefade');
-      f.preset = 'split';
-      const inner = 0.5 + p.distance;
-      Object.assign(f.params, {
-        side: side === 'top' ? 'bottom' : 'top',
-        start: Math.max(0, Math.min(1, inner)), length: p.seam, amount: 1, ease: 'easeInOut',
-      });
-      // The seam fades in with the split: a full frame with a fade cut through it would be
-      // a hard edge travelling with nothing to blend against.
-      if (keys.length) f.keys = { amount: JSON.parse(JSON.stringify(keys)) };
-      out.push(f);
-    }
-    return out;
+    return [s];
   }
 
   /** Move every selected picture clip into the top or bottom half. One undo entry. */
@@ -820,8 +808,8 @@ const PresetList = (() => {
     body.appendChild(R('zoom', 'Zoom in band', 0.5, 4, 0.01, 2));
     body.appendChild(R('distance', 'Distance from centre', -0.5, 0.5, 0.002, 3));
     body.appendChild(R('seam', 'Soft seam', 0, 0.3, 0.002, 3));
-    body.appendChild(el('div', 'tc-hint', 'Soft seam adds a Fade on the inner edge, so the ' +
-      'two halves blend instead of meeting on a hard line.'));
+    body.appendChild(el('div', 'tc-hint', 'Soft seam feathers the inner edge, so the two ' +
+      'halves blend instead of meeting on a hard line. It moves with the band as it glides.'));
     body.appendChild(el('div', 'tc-hint', 'Animation - the picture glides from the full ' +
       'frame into its half instead of cutting there. It keys the Split amount of the Split screen effect.'));
     body.appendChild(C({ path: 'animIn', label: 'Glide in', type: 'check' }));
@@ -829,6 +817,7 @@ const PresetList = (() => {
     body.appendChild(R('animDur', 'Over', F(2), F(60), F(1) / 2, 3, 's'));
     body.appendChild(C({ path: 'animEase', label: 'Curve', type: 'select', options: Anim.EASING_MENU }));
     body.appendChild(R('animBlur', 'Motion blur', 0, 4, 0.05, 2));
+    body.appendChild(R('animSamples', 'Blur samples', 2, 32, 1, 0));
     body.appendChild(C({
       path: 'animAt', label: 'Glide in starts at', type: 'buttons', options: [
         { value: 'start', label: 'Clip start' },

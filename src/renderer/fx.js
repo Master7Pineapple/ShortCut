@@ -720,7 +720,11 @@
       // the band. Keyed 0 -> 1 it is the animation from one to the other - the band and the
       // strip of picture in it are both interpolated, so the picture glides into its half
       // rather than being cut there.
-      params: { side: 'top', size: 0.5, focus: 0.5, zoom: 1, distance: 0, mix: 1 },
+      // `seam` feathers the band's INNER edge (a fraction of the frame height). It is drawn
+      // here, on the edge as it stands this frame, and not by a separate Fade: a Fade sits
+      // at a fixed line, so while the band glides it cut a hard edge through the picture and
+      // left a half-faded copy of it hanging below.
+      params: { side: 'top', size: 0.5, focus: 0.5, zoom: 1, distance: 0, mix: 1, seam: 0 },
       schema: [
         { path: 'params.side', label: 'Picture goes', type: 'select',
           options: [{ value: 'top', label: 'Top half' }, { value: 'bottom', label: 'Bottom half' }] },
@@ -729,6 +733,7 @@
         { path: 'params.zoom', label: 'Zoom in band', type: 'range', min: 0.5, max: 4, step: 0.01, digits: 2 },
         { path: 'params.distance', label: 'Distance from centre', type: 'range', min: -0.5, max: 0.5, step: 0.002, digits: 3 },
         { path: 'params.mix', label: 'Split amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.seam', label: 'Soft seam', type: 'range', min: 0, max: 0.3, step: 0.002, digits: 3 },
       ],
       draw(L, p) {
         const W = L.W, H = L.H;
@@ -745,6 +750,24 @@
         L.c.clip();
         L.c.drawImage(src, lerp(0, r.sx), lerp(0, r.sy), lerp(W, r.sw), lerp(H, r.sh), 0, y, W, h);
         L.c.restore();
+        // The seam grows with the split, so the full frame at mix 0 has no feathered edge.
+        const f = Math.min(h, clamp(p.seam, 0, 1) * H * m);
+        if (f > 0.5) {
+          const top = String(p.side) !== 'bottom';
+          const edge = top ? y + h : y;
+          const g = L.c.createLinearGradient(0, edge, 0, top ? edge - f : edge + f);
+          const N = 12;
+          for (let i = 0; i <= N; i++) {
+            const k = clamp(Anim.ease(Anim.EASING_PRESETS.easeInOut, i / N), 0, 1);
+            g.addColorStop(i / N, 'rgba(0,0,0,' + k.toFixed(4) + ')');
+          }
+          L.c.save();
+          L.c.globalCompositeOperation = 'destination-in';
+          L.c.fillStyle = g;
+          L.c.fillRect(0, 0, W, H);
+          L.c.restore();
+          reset(L.c);
+        }
       },
     },
 

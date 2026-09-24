@@ -1820,10 +1820,10 @@ Focus X/Y is the transform's anchor.
 **03 Split screen** moves every selected clip into the top or bottom half with a `split`
 effect (band height, crop centre, zoom in band, distance from the centre line); the other half
 is left transparent, so a clip on a track below shows through, or black over a gap. **Soft
-seam** adds an `edgefade` on the band's inner edge. The split **glides** rather than
+seam** feathers the band's inner edge (the `split` effect's own `seam`, so it moves with the band). The split **glides** rather than
 cutting: the effect's `mix` (0 = full frame, 1 = the band) is keyed 0 -> 1 over the chosen
 length and curve, from the clip start or the playhead, optionally back to 0 at the clip end,
-with a shutter on the move; a seam's `amount` is keyed alongside it. Untick both glides for
+with a shutter on the move (strength and samples). Untick both glides for
 an immediate split.
 
 Both tag what they add with `fx.preset` (`'push'` / `'split'`), so applying again REPLACES

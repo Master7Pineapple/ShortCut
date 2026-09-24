@@ -13319,7 +13319,7 @@ window.addEventListener('drop', async (e) => {
     const p = window.api.pathForFile(f);
     if (p) paths.push(p);
   }
-  await importPaths(paths);
+  await importPaths(paths, { at: state.playhead });
 });
 
 // ---- shortcuts -----------------------------------------------------------
