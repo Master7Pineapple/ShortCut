@@ -1838,7 +1838,13 @@ under the playhead to move it, drag a handle to resize it, drag elsewhere to dra
 (Shift keeps the frame's shape). A rectangle whose shape is not the frame's is never
 stretched: `fit` shows all of it (`contain`) or fills the frame with it (`cover`). Keys drawn
 before free shapes carry no `h` (it reads as the frame's shape) and get an `h` track holding
-that shape the first time a free key is added beside them. The camera then
+that shape the first time a free key is added beside them. The second way in is **Zoom & pan**: the viewer
+shows the camera's own view, the wheel zooms about the cursor and a drag pans, and **Set key**
+writes that view at the playhead; moving the playhead picks the view up again from the camera
+there. The view being dialled in reaches the picture through `FX.setCameraView()`, honoured
+only inside the viewer's composite like the drawing bypass - a clip with no camera yet gets a
+stand-in entry there alone. A key's time is a typable box; moving one onto another key's time
+is refused. The camera then
 moves from rectangle to rectangle, the curve on each key being the move to the next; any
 number of keys per clip, two identical ones hold. While drawing, the viewer shows the
 uncropped frame: `FX.setCameraEdit()` bypasses the camera, but only while
@@ -1856,7 +1862,9 @@ itself; 07, 08 and 09 also have looks (`LOOKS` in `presetlist.js`) that only set
 they name. Looks come in groups (a row each): one look per row, and rows combine, because
 the looks of different rows set different values; a look with `off` is a switch. Glow
 (`glowanim`) glows for the whole clip or `glowDur` from `start`, with its in and out a share
-(`ramp`) of that span. Emphasis has a slow zoom across the whole clip (`drift`); Motion has a
+(`ramp`) of that span. Emphasis has an in start time (`inAt`), an out that finishes at the clip end or starts
+at `outAt` and then holds the out values (`outAnchor`), and a slow zoom across the whole clip
+(`drift`); Motion has a
 mid turn (`midRotate`) and a fade in / fade out. All are applied like 02: tagged, replacing
 the last apply, one undo entry.
 

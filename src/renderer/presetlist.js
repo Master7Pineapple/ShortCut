@@ -572,6 +572,10 @@ const PresetList = (() => {
         { name: 'In only', v: { inOpacity: 0, inScale: 0, outOpacity: 1, outScale: 1 } },
         { name: 'Vanish', v: { inOpacity: 0, inScale: 0.5, outOpacity: 0, outScale: 0 } },
       ] },
+      { group: 'Timing', items: [
+        { name: 'At the ends', v: { inAt: 0, outAnchor: 'end' }, title: 'In at the start of the clip, out at its end' },
+        { name: 'In, then hold', v: { inAt: 0, outAnchor: 'time', outAt: 0.5 }, title: 'In and out in the first second, then the out values hold for the rest of the clip' },
+      ] },
       { group: 'Across the clip', items: [
         { name: 'Slow zoom in', v: { drift: 1.1 }, title: 'Creeps 10% bigger from the first frame to the last' },
         { name: 'Slow zoom out', v: { drift: 0.9 }, title: 'Creeps 10% smaller from the first frame to the last' },
@@ -638,8 +642,14 @@ const PresetList = (() => {
 
   // ------------------------------------------------------------ 04 Camera move
 
-  /** Drawing mode - UI only, never saved. */
-  const cam = { drawing: false, drag: null };
+  /*
+   * The two ways of making a key - UI only, never saved:
+   *   drawing  drag rectangles over the uncropped frame
+   *   framing  zoom (wheel) and pan (drag) the camera's own view, then Set key
+   * `view` is the framing mode's view being dialled in, `viewAt` the clip and playhead it
+   * was taken at - move the playhead and it is picked up again from the camera there.
+   */
+  const cam = { drawing: false, framing: false, drag: null, view: null, viewAt: '' };
 
   function camClip() { return pictureTargets()[0] || null; }
   function camEntry(clip) { return clip && (clip.fx || []).find((f) => f.preset === 'camera') || null; }
@@ -720,6 +730,7 @@ const PresetList = (() => {
   function setDrawing(on) {
     on = !!on;
     if (cam.drawing === on) return;
+    if (on) setFraming(false);
     cam.drawing = on;
     cam.drag = null;
     FX.setCameraEdit(on);
@@ -727,12 +738,79 @@ const PresetList = (() => {
     try { drawPreview(); } catch (e) { /* before the viewer exists */ }
   }
 
+  /** Where the camera is at the playhead, as a frame-shaped view (what zoom & pan edits). */
+  function pickUpView() {
+    const clip = camClip();
+    cam.view = null;
+    cam.viewAt = '';
+    if (!clip) { FX.setCameraView(null); return; }
+    const e = camEntry(clip);
+    const r = e ? camRect(e, state.playhead - clip.start) : { cx: 0.5, cy: 0.5, size: 1, h: 1 };
+    // A free-shaped key is shown whole, so its frame-shaped equivalent is its larger side.
+    const z = e && e.params.fit === 'cover' ? Math.min(r.size, r.h) : Math.max(r.size, r.h);
+    cam.view = { cx: r.cx, cy: r.cy, size: z, h: z };
+    cam.viewAt = clip.id + '@' + state.playhead;
+    FX.setCameraView({ clip: clip.id, rect: cam.view });
+  }
+
+  function setFraming(on) {
+    on = !!on;
+    if (cam.framing === on) return;
+    if (on) setDrawing(false);
+    cam.framing = on;
+    cam.drag = null;
+    if (on) pickUpView(); else { cam.view = null; FX.setCameraView(null); }
+    syncCamOverlay();
+    try { drawPreview(); } catch (e) { /* before the viewer exists */ }
+  }
+
+  function endCamModes() { setDrawing(false); setFraming(false); }
+
+  /** Push the view being dialled in to the viewer. */
+  function showView() {
+    const clip = camClip();
+    if (!clip || !cam.view) return;
+    cam.viewAt = clip.id + '@' + state.playhead;
+    FX.setCameraView({ clip: clip.id, rect: cam.view });
+    syncCamOverlay();
+    try { drawPreview(); } catch (e) { /* before the viewer exists */ }
+  }
+
+  /** Move a key to another time - every track of it, one undo entry. */
+  function retimeCamKey(from, to) {
+    const clip = camClip(), e = camEntry(clip);
+    if (!e) return false;
+    const t = Math.max(0, Math.min(lenOf(clip), Number(to)));
+    if (!isFinite(t) || Math.abs(t - from) < 1e-4) return false;
+    if (camTimes(e).some((q) => Math.abs(q - t) < 1e-3)) {
+      log('There is already a camera key at ' + t.toFixed(2) + 's.');
+      renderPanel();
+      return false;
+    }
+    camEdit((en) => {
+      for (const k of CAM_PROPS) {
+        const tr = en.keys && en.keys[k];
+        if (!tr) continue;
+        for (const q of tr) if (Math.abs(q.t - from) < 1e-3) q.t = t;
+        Anim.sortKeys(tr);
+      }
+    });
+    return true;
+  }
+
   /** The overlay: every key's rectangle, the one under the playhead bright. DOM only. */
   function syncCamOverlay() {
     const ov = document.getElementById('camOverlay');
     if (!ov) return;
-    if (!cam.drawing || typeof canvas === 'undefined') { ov.hidden = true; return; }
+    if ((!cam.drawing && !cam.framing) || typeof canvas === 'undefined') { ov.hidden = true; return; }
     ov.hidden = false;
+    ov.classList.toggle('framing', cam.framing);
+    // Zoom & pan follows the playhead: a new moment starts from where the camera is there.
+    if (cam.framing && !cam.drag) {
+      const clip = camClip();
+      if (!clip) FX.setCameraView(null);
+      else if (cam.viewAt !== clip.id + '@' + state.playhead) pickUpView();
+    }
     const CW = canvas.offsetWidth, CH = canvas.offsetHeight;
     ov.style.left = canvas.offsetLeft + 'px';
     ov.style.top = canvas.offsetTop + 'px';
@@ -751,6 +829,22 @@ const PresetList = (() => {
     };
     const clip = camClip(), e = camEntry(clip);
     const here = clip ? state.playhead - clip.start : -1;
+    if (cam.framing) {
+      c.setLineDash([8, 5]);
+      c.lineWidth = 2;
+      c.strokeStyle = '#ffd400';
+      c.strokeRect(1, 1, CW - 2, CH - 2);
+      c.setLineDash([]);
+      c.fillStyle = 'rgba(0,0,0,0.55)';
+      c.fillRect(6, 6, 200, 36);
+      c.fillStyle = '#ffd400';
+      c.font = '11px Segoe UI, sans-serif';
+      const onKey = e && camTimes(e).some((t) => Math.abs(t - here) < 1e-3);
+      c.fillText('Zoom ' + (cam.view ? Math.round(100 / cam.view.size) : 100) + '%  ·  ' +
+        (onKey ? 'on a key' : 'not keyed yet'), 12, 21);
+      c.fillText('Wheel: zoom   Drag: pan   then Set key', 12, 35);
+      return;
+    }
     if (e) {
       for (const t of camTimes(e)) {
         const r = camRect(e, t);
@@ -819,12 +913,26 @@ const PresetList = (() => {
       cx: (x0 + x1) / 2, cy: (y0 + y1) / 2,
       size: Math.max(0.01, Math.abs(x1 - x0)), h: Math.max(0.01, Math.abs(y1 - y0)),
     });
+    // Zoom & pan: the wheel zooms about the cursor, so the point under it stays put.
+    ov.addEventListener('wheel', (ev) => {
+      if (!cam.framing || !cam.view) return;
+      ev.preventDefault(); ev.stopPropagation();
+      const v = cam.view, u = at(ev);
+      const px = v.cx + (u.x - 0.5) * v.size, py = v.cy + (u.y - 0.5) * v.h;
+      const z = Math.max(0.05, Math.min(1.5, v.size * Math.exp(ev.deltaY * 0.0015)));
+      cam.view = { cx: px - (u.x - 0.5) * z, cy: py - (u.y - 0.5) * z, size: z, h: z };
+      showView();
+    }, { passive: false });
     ov.addEventListener('pointerdown', (ev) => {
       ev.preventDefault(); ev.stopPropagation();
       const clip = camClip();
       if (!clip) { log('Select the clip to key first.'); return; }
       ov.setPointerCapture(ev.pointerId);
       const pt = at(ev);
+      if (cam.framing) {
+        if (cam.view) cam.drag = { mode: 'pan', a: pt, from: Object.assign({}, cam.view) };
+        return;
+      }
       const e = camEntry(clip);
       const cur = e ? camRect(e, state.playhead - clip.start) : null;
       if (cur) {
@@ -845,6 +953,15 @@ const PresetList = (() => {
       const d = cam.drag;
       if (!d) return;
       const b = at(ev);
+      if (d.mode === 'pan') {
+        // Dragging moves the PICTURE, so the view goes the other way.
+        cam.view = Object.assign({}, d.from, {
+          cx: d.from.cx - (b.x - d.a.x) * d.from.size,
+          cy: d.from.cy - (b.y - d.a.y) * d.from.h,
+        });
+        showView();
+        return;
+      }
       if (d.mode === 'move') {
         d.rect = Object.assign({}, d.from, { cx: d.from.cx + b.x - d.a.x, cy: d.from.cy + b.y - d.a.y });
       } else if (d.mode === 'size') {
@@ -868,6 +985,7 @@ const PresetList = (() => {
       ev.stopPropagation();
       const d = cam.drag;
       cam.drag = null;
+      if (d && d.mode === 'pan') { syncCamOverlay(); return; }
       const clip = camClip();
       const moved = d && d.rect && (d.mode !== 'move' || d.rect !== d.from);
       if (moved && d.rect.size > 0.02 && d.rect.h > 0.02 && clip && addCamKey(clip, d.rect)) {
@@ -893,6 +1011,23 @@ const PresetList = (() => {
       'frame at the playhead. Move the playhead and draw another - the camera moves between them.';
     drawBtn.disabled = !clip;
     drawBtn.addEventListener('click', () => { setDrawing(!cam.drawing); renderPanel(); });
+    const frameBtn = el('button', 'mini' + (cam.framing ? ' on' : ''), cam.framing ? 'Done zooming' : 'Zoom & pan');
+    frameBtn.title = 'Frame the shot in the viewer itself: the wheel zooms about the cursor, dragging ' +
+      'pans. Set key saves the view at the playhead; move the playhead and do it again.';
+    frameBtn.disabled = !clip;
+    frameBtn.addEventListener('click', () => { setFraming(!cam.framing); renderPanel(); });
+    const setBtn = el('button', 'mini primary', 'Set key');
+    setBtn.title = 'Save the view in the viewer as a key at the playhead (replaces a key already there).';
+    setBtn.hidden = !cam.framing;
+    setBtn.addEventListener('click', () => {
+      if (clip && cam.view && addCamKey(clip, Object.assign({}, cam.view))) {
+        log('Camera key at ' + (state.playhead - clip.start).toFixed(2) + 's into the clip.');
+      }
+    });
+    const resetBtn = el('button', 'mini', 'Reset view');
+    resetBtn.title = 'Back to the whole frame (not a key until you Set it)';
+    resetBtn.hidden = !cam.framing;
+    resetBtn.addEventListener('click', () => { cam.view = { cx: 0.5, cy: 0.5, size: 1, h: 1 }; showView(); });
     const fullBtn = el('button', 'mini', 'Full frame here');
     fullBtn.title = 'A key at the playhead showing the whole frame - to start from, or come back to.';
     fullBtn.disabled = !clip;
@@ -904,7 +1039,7 @@ const PresetList = (() => {
     const rmBtn = el('button', 'mini', 'Remove camera');
     rmBtn.disabled = !e;
     rmBtn.addEventListener('click', () => removeTagged(['camera'], 'camera move'));
-    for (const b of [drawBtn, fullBtn, holdBtn, rmBtn]) bar.appendChild(b);
+    for (const b of [drawBtn, frameBtn, setBtn, resetBtn, fullBtn, holdBtn, rmBtn]) bar.appendChild(b);
     top.appendChild(bar);
 
     const body = el('div', 'pl-body');
@@ -914,7 +1049,9 @@ const PresetList = (() => {
       'Add as many as you like on one clip: every pair is its own move, and two keys with the ' +
       'same rectangle hold. Any shape: drag inside the rectangle to move it, drag a handle to ' +
       'resize it, drag elsewhere to draw a new one (Shift keeps the frame\'s shape). While ' +
-      'drawing, the viewer shows the whole frame; press Done to see the move.'));
+      'drawing, the viewer shows the whole frame; press Done to see the move. Or use Zoom & ' +
+      'pan: frame the shot in the viewer with the wheel and a drag, Set key, move the playhead, ' +
+      'frame the next one, Set key. Type in a key\'s time to move it.'));
     body.appendChild(C({ path: 'ease', label: 'Curve for new keys', type: 'select', options: Anim.EASING_MENU }));
     body.appendChild(C({ path: 'fit', label: 'Rectangle shape', type: 'buttons', options: [
       { value: 'contain', label: 'Show all of it', title: 'The whole rectangle is on screen; more picture shows around its short side' },
@@ -928,8 +1065,18 @@ const PresetList = (() => {
     times.forEach((t, i) => {
       const row = el('div', 'tc-row');
       const r = camRect(e, t);
-      row.appendChild(el('label', 'tc-label', t.toFixed(2) + 's  ·  ' + Math.round(r.size * 100) + ' x ' +
-        Math.round(r.h * 100) + '% of frame'));
+      const time = el('input', 'tc-num cam-time');
+      time.type = 'number';
+      time.step = '0.01';
+      time.min = '0';
+      time.max = String(lenOf(clip).toFixed(2));
+      time.value = t.toFixed(2);
+      time.title = 'Seconds into the clip - type a new time to move this key';
+      time.addEventListener('keydown', (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') time.blur(); });
+      time.addEventListener('change', () => retimeCamKey(t, time.value));
+      row.appendChild(time);
+      row.appendChild(el('label', 'tc-label', 's  ·  ' + Math.round(r.size * 100) + ' x ' +
+        Math.round(r.h * 100) + '%'));
       const go = el('button', 'mini', 'Go');
       go.title = 'Put the playhead on this key';
       go.addEventListener('click', () => { seek(clip.start + t); renderPanel(); });
@@ -1346,7 +1493,7 @@ const PresetList = (() => {
       if (it.family) b.appendChild(el('span', 'tc-hint', it.family));
       b.addEventListener('click', () => {
         state.presetList.open = it.id;
-        if (it.id !== '04') setDrawing(false);
+        if (it.id !== '04') endCamModes();
         renderPanel();
       });
       list.appendChild(b);
@@ -1391,7 +1538,7 @@ const PresetList = (() => {
     const d = document.getElementById('presetDrawer');
     const hide = show == null ? !d.hidden : !show;
     d.hidden = hide;
-    if (hide) setDrawing(false);
+    if (hide) endCamModes();
     document.getElementById('btnPresetListCollapse').classList.toggle('on', !hide);
     if (!hide) {
       let pos = null;
@@ -1448,7 +1595,7 @@ const PresetList = (() => {
     LIST, P01, P02, P03, defaults, normalize, captionSettings,
     applyP01, generateP01, roleCard, addRoleTag,
     pushEntry, applyPush, splitEntries, applySplit, removeTagged,
-    applyFx, addCamKey, deleteCamKey, setDrawing, syncCamOverlay, LOOKS, FXP,
+    applyFx, addCamKey, deleteCamKey, retimeCamKey, setDrawing, setFraming, syncCamOverlay, LOOKS, FXP,
     renderPanel, renderGuides, toggle,
   };
 })();

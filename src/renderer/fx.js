@@ -858,6 +858,8 @@
         // While a rectangle is being drawn the VIEWER shows the uncropped frame, so the
         // author draws on the whole picture. Never in a bake: see `setViewer()`.
         if (CAM_EDIT && IN_VIEWER) return { a: 1, m: [1, 0, 0, 1, 0, 0] };
+        // Zoom & pan mode: the viewer shows the view being dialled in, before it is a key.
+        if (IN_VIEWER && CAM_VIEW && clip && clip.id === CAM_VIEW.clip) p = Object.assign({}, p, CAM_VIEW.rect);
         const sw = clamp(p.size, 0.02, 4);
         const sh = Number(p.h) > 0 ? clamp(p.h, 0.02, 4) : sw;
         const z = p.fit === 'cover' ? Math.max(1 / sw, 1 / sh) : Math.min(1 / sw, 1 / sh);
@@ -1030,18 +1032,24 @@
       label: 'Emphasis',
       timeVarying: true,
       params: {
-        inOpacity: 0, inScale: 0, inDur: 0.3, inEase: 'softLand',
-        outOpacity: 0.5, outScale: 0.75, outDur: 0.4, outEase: 'easeInOut',
+        inOpacity: 0, inScale: 0, inAt: 0, inDur: 0.3, inEase: 'softLand',
+        outOpacity: 0.5, outScale: 0.75, outAnchor: 'end', outAt: 1, outDur: 0.4, outEase: 'easeInOut',
         drift: 1, driftEase: 'linear',
         anchorX: 0.5, anchorY: 0.5,
       },
       schema: [
         { path: 'params.inOpacity', label: 'In: opacity from', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
         { path: 'params.inScale', label: 'In: size from', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
+        { path: 'params.inAt', label: 'In starts at', type: 'range', min: 0, max: 30, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.inDur', label: 'In over', type: 'range', min: 0, max: 3, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.inEase', label: 'In curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.outOpacity', label: 'Out: opacity to', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
         { path: 'params.outScale', label: 'Out: size to', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
+        { path: 'params.outAnchor', label: 'Out happens', type: 'select', options: [
+          { value: 'end', label: 'At the end of the clip' },
+          { value: 'time', label: 'At a chosen time, then holds' },
+        ] },
+        { path: 'params.outAt', label: 'Out starts at', type: 'range', min: 0, max: 30, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.outDur', label: 'Out over', type: 'range', min: 0, max: 3, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.drift', label: 'Across the clip: size to', type: 'range', min: 0.5, max: 1.5, step: 0.005, digits: 3 },
@@ -1053,8 +1061,12 @@
         const dur = clipDuration(clip);
         const kd = Anim.ease(easeByName(p.driftEase), clamp(t / dur, 0, 1));
         const drift = 1 + ((Number(p.drift) || 1) - 1) * kd;
-        const ki = phaseIn(t, p.inDur, p.inEase);
-        const ko = phaseOut(t, dur, p.outDur, p.outEase);
+        // The in starts at `inAt`; the out either finishes on the clip's last frame or
+        // starts at `outAt` - and then HOLDS the out values for the rest of the clip.
+        const ki = phaseIn(t - Math.max(0, Number(p.inAt) || 0), p.inDur, p.inEase);
+        const oD = Math.max(0, Number(p.outDur) || 0);
+        const o0 = p.outAnchor === 'time' ? Math.max(0, Number(p.outAt) || 0) : dur - oD;
+        const ko = oD > 0 ? Anim.ease(easeByName(p.outEase), clamp((t - o0) / oD, 0, 1)) : (t >= o0 ? 1 : 0);
         const lerp = (a, b, k) => a + (b - a) * k;
         const a = lerp(clamp(p.inOpacity, 0, 1), 1, ki) * lerp(1, clamp(p.outOpacity, 0, 1), ko);
         const s = lerp(Number(p.inScale) || 0, 1, ki) * lerp(1, Number(p.outScale) || 0, ko) * drift;
@@ -3557,7 +3569,7 @@
    * goes through the injected binder exactly as it does for any other clip.
    */
   function renderOver(target, W, H, clip, t, surface, frameDur, clear, key) {
-    const entries = active(clip);
+    const entries = withCamView(clip, active(clip));
     if (!entries.length) return false;
     const snap = clean(surface, key || 'fxOverSrc', W, H);
     snap.c.drawImage(target.canvas, 0, 0);
@@ -3579,6 +3591,20 @@
   function setCameraEdit(on) { CAM_EDIT = !!on; }
   function setViewer(on) { IN_VIEWER = !!on; }
   function cameraEditing() { return CAM_EDIT; }
+
+  /*
+   * The camera's Zoom & pan mode: `{ clip, rect }`, the view being dialled in on that clip.
+   * Viewer only, like the drawing mode. A clip with no camera yet gets a stand-in entry for
+   * the viewer's composite alone, so the zoom shows before the first key exists.
+   */
+  let CAM_VIEW = null;
+  function setCameraView(v) { CAM_VIEW = v && v.clip && v.rect ? v : null; }
+  function withCamView(clip, entries) {
+    if (!IN_VIEWER || !CAM_VIEW || !clip || clip.id !== CAM_VIEW.clip) return entries;
+    if (entries.some((e) => e.type === 'camera')) return entries;
+    return entries.concat([{ id: '_camView', type: 'camera', enabled: true,
+      params: { cx: 0.5, cy: 0.5, size: 1, h: -1, fit: 'contain' } }]);
+  }
 
   /**
    * Does this effect paint differently at a slightly different time?
@@ -3863,7 +3889,7 @@
  * own pixels, which is the one thing the render cache's key rules forbid.
  */
   function render(target, W, H, clip, t, surface, paint, frameDur) {
-    const entries = active(clip);
+    const entries = withCamView(clip, active(clip));
     if (!entries.length) { paint(target, W, H); return false; }
     const layer = clean(surface, 'fxLayer', W, H);
     const L = { cv: layer.cv, c: layer.c, W, H, surface, base: baseOf(surface, W, H, paint) };
@@ -3988,7 +4014,7 @@
     MASTER_TYPES, normalizeStack, masterActive, renderMaster, renderOver,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
     CHROME, chromeGeom, spotRect, cutoutRect, fitDraw, splitRect,
-    setCameraEdit, setViewer, cameraEditing, motionState, glowLevel, phaseIn, phaseOut,
+    setCameraEdit, setViewer, cameraEditing, setCameraView, motionState, glowLevel, phaseIn, phaseOut,
     MASK_SHAPES, MASK_SHAPE_OPTIONS, fillMaskShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
