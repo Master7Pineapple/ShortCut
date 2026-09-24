@@ -832,26 +832,37 @@
     // SECONDS INTO THE CLIP and the curves are `Anim.EASING_PRESETS` names.
 
     /*
-     * CAMERA MOVE: the frame follows a rectangle. `cx`/`cy` are the rectangle's centre and
-     * `size` its width as a fraction of the frame (the height follows the frame's own
-     * aspect, so the picture is never stretched). Keyed, it is a camera move from one
-     * drawn rectangle to the next, the curve on each key being the move to the next one.
+     * CAMERA MOVE: the frame follows a rectangle. `cx`/`cy` are the rectangle's centre,
+     * `size` its width and `h` its height, each a fraction of the frame on its own axis -
+     * so the rectangle can be any shape. The picture is never stretched to it: `fit` says
+     * whether the whole rectangle is shown (`contain`, with more of the picture around it
+     * on the long side) or the rectangle fills the frame (`cover`, trimming its long
+     * side). `h` of 0 or less means "the frame's shape", which is what every key drawn
+     * before free shapes existed carries. Keyed, it is a camera move from one rectangle to
+     * the next, the curve on each key being the move to the next one.
      */
     camera: {
       label: 'Camera move',
-      params: { cx: 0.5, cy: 0.5, size: 1 },
+      params: { cx: 0.5, cy: 0.5, size: 1, h: -1, fit: 'contain' },
       schema: [
         { path: 'params.cx', label: 'Centre X', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
         { path: 'params.cy', label: 'Centre Y', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
-        { path: 'params.size', label: 'Rectangle size', type: 'range', min: 0.05, max: 2, step: 0.005, digits: 3 },
+        { path: 'params.size', label: 'Rectangle width', type: 'range', min: 0.02, max: 2, step: 0.005, digits: 3 },
+        { path: 'params.h', label: 'Rectangle height (0 = frame shape)', type: 'range', min: 0, max: 2, step: 0.005, digits: 3 },
+        { path: 'params.fit', label: 'Shape', type: 'select', options: [
+          { value: 'contain', label: 'Show the whole rectangle' },
+          { value: 'cover', label: 'Fill the frame with the rectangle' },
+        ] },
       ],
       geom(p, t, e, clip, W, H) {
         // While a rectangle is being drawn the VIEWER shows the uncropped frame, so the
         // author draws on the whole picture. Never in a bake: see `setViewer()`.
         if (CAM_EDIT && IN_VIEWER) return { a: 1, m: [1, 0, 0, 1, 0, 0] };
-        const s = clamp(p.size, 0.02, 4);
+        const sw = clamp(p.size, 0.02, 4);
+        const sh = Number(p.h) > 0 ? clamp(p.h, 0.02, 4) : sw;
+        const z = p.fit === 'cover' ? Math.max(1 / sw, 1 / sh) : Math.min(1 / sw, 1 / sh);
         const cx = clamp(p.cx, -1, 2) * W, cy = clamp(p.cy, -1, 2) * H;
-        return { a: 1, m: aboutAnchor(cx, cy, W / 2 - cx, H / 2 - cy, 0, 1 / s) };
+        return { a: 1, m: aboutAnchor(cx, cy, W / 2 - cx, H / 2 - cy, 0, z) };
       },
       draw(L, p, t, e, clip) {
         applyGeom(L, DEFS.camera.geom(p, t, e, clip, L.W, L.H));
@@ -922,17 +933,18 @@
     },
 
     /*
-     * GLOW IN / OUT: the `glow` look with its strength animated - it blooms up over `inDur`
-     * from the clip start, holds (optionally breathing), and dies away over the last
-     * `outDur` of the clip. The size grows with it, so it opens up rather than just
-     * brightening.
+     * GLOW IN / OUT: the `glow` look with its strength animated. It glows for one span -
+     * the whole clip (`mode: 'whole'`) or `glowDur` seconds from `start` (`'span'`) - and
+     * the in and out are shares of THAT span (`ramp`), so a longer clip or a longer glow
+     * gets a longer bloom rather than a fixed one. In between it holds, optionally
+     * breathing. The size grows with the level, so it opens up rather than brightening.
      */
     glowanim: {
       label: 'Glow in / out',
       timeVarying: true,
       params: {
         colour: '#ffd166', size: 0.04, intensity: 2, over: 0.3,
-        inDur: 0.4, inEase: 'easeOut', outDur: 0.4, outEase: 'easeIn',
+        mode: 'whole', start: 0, glowDur: 1.5, ramp: 0.3, inEase: 'easeOut', outEase: 'easeIn',
         pulse: 0, pulseAmt: 0.3,
       },
       schema: [
@@ -940,9 +952,14 @@
         { path: 'params.size', label: 'Size', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
         { path: 'params.intensity', label: 'Intensity', type: 'range', min: 0, max: 5, step: 0.05, digits: 2 },
         { path: 'params.over', label: 'Glow over picture', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
-        { path: 'params.inDur', label: 'Glow in over (0 = none)', type: 'range', min: 0, max: 5, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.mode', label: 'Glows for', type: 'select', options: [
+          { value: 'whole', label: 'The whole clip' },
+          { value: 'span', label: 'A chosen span' },
+        ] },
+        { path: 'params.start', label: 'Span starts at', type: 'range', min: 0, max: 30, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.glowDur', label: 'Glow duration', type: 'range', min: 0.05, max: 30, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.ramp', label: 'In / out (share of the glow)', type: 'range', min: 0, max: 0.5, step: 0.01, digits: 2 },
         { path: 'params.inEase', label: 'In curve', type: 'select', options: EASE_OPTIONS },
-        { path: 'params.outDur', label: 'Glow out over (0 = none)', type: 'range', min: 0, max: 5, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.pulse', label: 'Pulse (per second, 0 = off)', type: 'range', min: 0, max: 6, step: 0.05, digits: 2 },
         { path: 'params.pulseAmt', label: 'Pulse depth', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
@@ -1005,6 +1022,8 @@
     /*
      * EMPHASIS: in, the picture goes from `inOpacity`/`inScale` to 100% over `inDur`; out,
      * it goes from 100% to `outOpacity`/`outScale` over the last `outDur` of the clip.
+     * `drift` is a slow zoom across the WHOLE clip on top of that (1.1 = creeps 10% in,
+     * 0.9 = 10% out), so an entrance and a slow push are one effect.
      * Geometry, so it composes with a transform and takes the shutter.
      */
     emphasis: {
@@ -1013,6 +1032,7 @@
       params: {
         inOpacity: 0, inScale: 0, inDur: 0.3, inEase: 'softLand',
         outOpacity: 0.5, outScale: 0.75, outDur: 0.4, outEase: 'easeInOut',
+        drift: 1, driftEase: 'linear',
         anchorX: 0.5, anchorY: 0.5,
       },
       schema: [
@@ -1024,16 +1044,20 @@
         { path: 'params.outScale', label: 'Out: size to', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
         { path: 'params.outDur', label: 'Out over', type: 'range', min: 0, max: 3, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.drift', label: 'Across the clip: size to', type: 'range', min: 0.5, max: 1.5, step: 0.005, digits: 3 },
+        { path: 'params.driftEase', label: 'Across curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.anchorX', label: 'Anchor X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
         { path: 'params.anchorY', label: 'Anchor Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
       ],
       geom(p, t, e, clip, W, H) {
         const dur = clipDuration(clip);
+        const kd = Anim.ease(easeByName(p.driftEase), clamp(t / dur, 0, 1));
+        const drift = 1 + ((Number(p.drift) || 1) - 1) * kd;
         const ki = phaseIn(t, p.inDur, p.inEase);
         const ko = phaseOut(t, dur, p.outDur, p.outEase);
         const lerp = (a, b, k) => a + (b - a) * k;
         const a = lerp(clamp(p.inOpacity, 0, 1), 1, ki) * lerp(1, clamp(p.outOpacity, 0, 1), ko);
-        const s = lerp(Number(p.inScale) || 0, 1, ki) * lerp(1, Number(p.outScale) || 0, ko);
+        const s = lerp(Number(p.inScale) || 0, 1, ki) * lerp(1, Number(p.outScale) || 0, ko) * drift;
         return {
           a: clamp(a, 0, 1),
           m: aboutAnchor(clamp(p.anchorX, -4, 5) * W, clamp(p.anchorY, -4, 5) * H, 0, 0, 0, Math.max(0.001, s)),
@@ -1046,8 +1070,10 @@
 
     /*
      * MOTION: three phases. IN, the picture pushes from `inScale`/`inRotate` to rest;
-     * MID, it drifts from 1 to `midScale` and keeps wiggling (a smooth, seeded sum of
-     * sines on position, rotation and scale); OUT, it pushes to `outScale`/`outRotate`.
+     * MID, it drifts from 1 to `midScale` and turns to `midRotate`, and wiggles (a smooth,
+     * seeded sum of sines on position, rotation and scale - all 0 for a clean drift); OUT,
+     * it pushes to `outScale`/`outRotate`. `fadeIn`/`fadeOut` fade the opacity over their
+     * own lengths at the two ends of the clip.
      * Any phase can be switched off. The wiggle fades in and out with the phases around
      * it, so nothing jumps where one phase hands over to the next.
      */
@@ -1056,9 +1082,10 @@
       timeVarying: true,
       params: {
         inOn: true, inDur: 0.5, inEase: 'softLand', inScale: 1.12, inRotate: -3,
-        midOn: true, midScale: 1.04, midEase: 'linear',
+        midOn: true, midScale: 1.04, midRotate: 0, midEase: 'linear',
         wiggle: 0.006, wiggleRot: 0.5, wiggleScale: 0.005, wiggleFreq: 0.5, seed: 1,
         outOn: true, outDur: 0.4, outEase: 'easeIn', outScale: 1.14, outRotate: 3,
+        fadeIn: false, fadeInDur: 0.3, fadeOut: false, fadeOutDur: 0.3,
         anchorX: 0.5, anchorY: 0.5,
       },
       schema: [
@@ -1069,6 +1096,7 @@
         { path: 'params.inRotate', label: 'In: rotation from', type: 'range', min: -30, max: 30, step: 0.1, unit: '°', digits: 1 },
         { path: 'params.midOn', label: 'Mid phase', type: 'check' },
         { path: 'params.midScale', label: 'Mid: drift to size', type: 'range', min: 0.5, max: 1.5, step: 0.005, digits: 3 },
+        { path: 'params.midRotate', label: 'Mid: turn to', type: 'range', min: -15, max: 15, step: 0.1, unit: '°', digits: 1 },
         { path: 'params.midEase', label: 'Mid curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.wiggle', label: 'Wiggle: move', type: 'range', min: 0, max: 0.05, step: 0.0005, digits: 4 },
         { path: 'params.wiggleRot', label: 'Wiggle: rotate', type: 'range', min: 0, max: 5, step: 0.05, unit: '°', digits: 2 },
@@ -1080,13 +1108,17 @@
         { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
         { path: 'params.outScale', label: 'Out: size to', type: 'range', min: 0.2, max: 2, step: 0.005, digits: 3 },
         { path: 'params.outRotate', label: 'Out: rotation to', type: 'range', min: -30, max: 30, step: 0.1, unit: '°', digits: 1 },
+        { path: 'params.fadeIn', label: 'Fade in', type: 'check' },
+        { path: 'params.fadeInDur', label: 'Fade in over', type: 'range', min: 0.02, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.fadeOut', label: 'Fade out', type: 'check' },
+        { path: 'params.fadeOutDur', label: 'Fade out over', type: 'range', min: 0.02, max: 3, step: 0.01, unit: 's', digits: 2 },
         { path: 'params.anchorX', label: 'Anchor X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
         { path: 'params.anchorY', label: 'Anchor Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
       ],
       geom(p, t, e, clip, W, H) {
         const st = motionState(p, t, clipDuration(clip));
         return {
-          a: 1,
+          a: st.a,
           m: aboutAnchor(clamp(p.anchorX, -4, 5) * W, clamp(p.anchorY, -4, 5) * H,
             st.dx * W, st.dy * W, st.rot, Math.max(0.001, st.s)),
         };
@@ -2632,9 +2664,14 @@
     return d > 0 ? Anim.ease(easeByName(ease), clamp((t - (total - d)) / d, 0, 1)) : 0;
   }
 
-  /** `glowanim`'s level at `t`, 0..1: in, hold (maybe breathing), out. */
+  /** `glowanim`'s level at `t`, 0..1: in, hold (maybe breathing), out, over its span. */
   function glowLevel(p, t, dur) {
-    let lvl = phaseIn(t, p.inDur, p.inEase) * (1 - phaseOut(t, dur, p.outDur, p.outEase));
+    const s0 = p.mode === 'span' ? Math.max(0, Number(p.start) || 0) : 0;
+    const len = p.mode === 'span' ? Math.min(Math.max(0, Number(p.glowDur) || 0), dur - s0) : dur;
+    const local = t - s0;
+    if (!(len > 0) || local < 0 || local > len) return 0;
+    const r = clamp(p.ramp, 0, 0.5) * len;
+    let lvl = phaseIn(local, r, p.inEase) * (1 - phaseOut(local, len, r, p.outEase));
     const hz = Number(p.pulse) || 0;
     if (hz > 0) lvl *= 1 - clamp(p.pulseAmt, 0, 1) * 0.5 * (1 - Math.cos(2 * Math.PI * hz * t));
     return clamp(lvl, 0, 1);
@@ -2653,10 +2690,18 @@
     const ko = outOn ? phaseOut(t, dur, outD, p.outEase) : 0;
     const m0 = inD, m1 = dur - outD;
     const km = midOn && m1 > m0 ? Anim.ease(easeByName(p.midEase), clamp((t - m0) / (m1 - m0), 0, 1)) : 0;
-    let s = (inOn ? lerp(Number(p.inScale) || 1, 1, ki) : 1) *
-      (midOn ? lerp(1, Number(p.midScale) || 1, km) : 1) *
-      (outOn ? lerp(1, Number(p.outScale) || 1, ko) : 1);
-    let rot = (inOn ? lerp(Number(p.inRotate) || 0, 0, ki) : 0) + (outOn ? lerp(0, Number(p.outRotate) || 0, ko) : 0);
+    // A size of 0 is a real value here ("from nothing"), so it must not fall back to 1.
+    const num = (v, d) => (isFinite(Number(v)) && v !== '' && v != null ? Number(v) : d);
+    let s = (inOn ? lerp(num(p.inScale, 1), 1, ki) : 1) *
+      (midOn ? lerp(1, num(p.midScale, 1), km) : 1) *
+      (outOn ? lerp(1, num(p.outScale, 1), ko) : 1);
+    let rot = (inOn ? lerp(Number(p.inRotate) || 0, 0, ki) : 0) +
+      (midOn ? lerp(0, Number(p.midRotate) || 0, km) : 0) +
+      (outOn ? lerp(0, Number(p.outRotate) || 0, ko) : 0);
+    // The fades use the in and out curves, over their own lengths.
+    let a = 1;
+    if (p.fadeIn) a *= phaseIn(t, Math.min(Number(p.fadeInDur) || 0, dur), p.inEase);
+    if (p.fadeOut) a *= 1 - phaseOut(t, dur, Math.min(Number(p.fadeOutDur) || 0, dur), p.outEase);
     let dx = 0, dy = 0;
     // The wiggle belongs to the mid phase and fades in and out with the phases around it.
     const w = midOn ? ki * (1 - ko) : 0;
@@ -2671,7 +2716,7 @@
       rot += w * (Number(p.wiggleRot) || 0) * n(2);
       s *= 1 + w * (Number(p.wiggleScale) || 0) * n(3);
     }
-    return { s, rot, dx, dy };
+    return { s, rot, dx, dy, a: clamp(a, 0, 1) };
   }
 
   /**

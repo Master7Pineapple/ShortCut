@@ -540,31 +540,64 @@ const PresetList = (() => {
     TABLES[key] = Object.assign({}, FX.DEFS[d.type].params, { blur: d.blur, samples: 8 });
   }
   /** 04's own settings: the curve a newly drawn rectangle's move gets, and the shutter. */
-  TABLES.p04 = { ease: 'easeInOut', blur: 0.6, samples: 8 };
+  TABLES.p04 = { ease: 'easeInOut', blur: 0.6, samples: 8, fit: 'contain' };
 
-  /** The looks inside a preset: each one only sets the values it names. */
+  /*
+   * The looks inside a preset, in GROUPS. A look sets only the values it names, and the
+   * looks of different groups name different values - so one look from each group can be
+   * on at once (a look is lit while every value it names still holds). A look with `off`
+   * is a switch: clicking it while it is lit sets those values instead.
+   */
   const LOOKS = {
+    p06: [
+      { group: 'Glows for', items: [
+        { name: 'Whole clip', v: { mode: 'whole' }, title: 'Glows from the start of the clip to the end, in and out included' },
+        { name: 'Chosen span', v: { mode: 'span' }, title: 'Glows for Glow duration from Span starts at, in and out included' },
+      ] },
+    ],
     p07: [
-      { name: 'Rough pencil', v: { style: 'pencil', colour: '#e8203a', thickness: 0.09, opacity: 1, height: 0.52, rough: 0.5, behind: false, tilt: -1.5 } },
-      { name: 'Highlighter', v: { style: 'highlighter', colour: '#ffe14d', thickness: 0.6, opacity: 0.45, height: 0.55, rough: 0.4, behind: true, tilt: -0.8 } },
-      { name: 'Clean line', v: { style: 'line', colour: '#ffffff', thickness: 0.07, opacity: 1, height: 0.5, rough: 0, behind: false, tilt: 0 } },
+      { group: 'Look', items: [
+        { name: 'Rough pencil', v: { style: 'pencil', colour: '#e8203a', thickness: 0.09, opacity: 1, height: 0.52, rough: 0.5, behind: false, tilt: -1.5 } },
+        { name: 'Highlighter', v: { style: 'highlighter', colour: '#ffe14d', thickness: 0.6, opacity: 0.45, height: 0.55, rough: 0.4, behind: true, tilt: -0.8 } },
+        { name: 'Clean line', v: { style: 'line', colour: '#ffffff', thickness: 0.07, opacity: 1, height: 0.5, rough: 0, behind: false, tilt: 0 } },
+      ] },
     ],
     p08: [
-      { name: 'Pop', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'softLand' } },
-      { name: 'Soft', v: { inOpacity: 0, inScale: 0.8, outOpacity: 0.7, outScale: 0.9, inEase: 'softLand' } },
-      { name: 'Overshoot', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'backOut' } },
-      { name: 'Size only', v: { inOpacity: 1, inScale: 0, outOpacity: 1, outScale: 0.75 } },
-      { name: 'Fade only', v: { inOpacity: 0, inScale: 1, outOpacity: 0.5, outScale: 1 } },
-      { name: 'In only', v: { inOpacity: 0, inScale: 0, outOpacity: 1, outScale: 1 } },
-      { name: 'Vanish', v: { inOpacity: 0, inScale: 0.5, outOpacity: 0, outScale: 0 } },
+      { group: 'In / out', items: [
+        { name: 'Pop', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'softLand' } },
+        { name: 'Soft', v: { inOpacity: 0, inScale: 0.8, outOpacity: 0.7, outScale: 0.9, inEase: 'softLand' } },
+        { name: 'Overshoot', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'backOut' } },
+        { name: 'Size only', v: { inOpacity: 1, inScale: 0, outOpacity: 1, outScale: 0.75 } },
+        { name: 'Fade only', v: { inOpacity: 0, inScale: 1, outOpacity: 0.5, outScale: 1 } },
+        { name: 'In only', v: { inOpacity: 0, inScale: 0, outOpacity: 1, outScale: 1 } },
+        { name: 'Vanish', v: { inOpacity: 0, inScale: 0.5, outOpacity: 0, outScale: 0 } },
+      ] },
+      { group: 'Across the clip', items: [
+        { name: 'Slow zoom in', v: { drift: 1.1 }, title: 'Creeps 10% bigger from the first frame to the last' },
+        { name: 'Slow zoom out', v: { drift: 0.9 }, title: 'Creeps 10% smaller from the first frame to the last' },
+        { name: 'No drift', v: { drift: 1 } },
+      ] },
     ],
     p09: [
-      { name: 'In + out', v: { inOn: true, midOn: false, outOn: true } },
-      { name: 'In + mid + out', v: { inOn: true, midOn: true, outOn: true } },
-      { name: 'Mid only', v: { inOn: false, midOn: true, outOn: false } },
-      { name: 'Push in', v: { inOn: true, midOn: true, outOn: true, inScale: 0.85, inRotate: -3, midScale: 1.05, outScale: 1.12, outRotate: 2 } },
-      { name: 'Push out', v: { inOn: true, midOn: true, outOn: true, inScale: 1.2, inRotate: 3, midScale: 0.97, outScale: 0.9, outRotate: -2 } },
-      { name: 'Handheld', v: { inOn: false, midOn: true, outOn: false, midScale: 1.02, wiggle: 0.012, wiggleRot: 1.2, wiggleScale: 0.01, wiggleFreq: 0.9 } },
+      { group: 'Phases', items: [
+        { name: 'In + out', v: { inOn: true, midOn: false, outOn: true } },
+        { name: 'In + mid + out', v: { inOn: true, midOn: true, outOn: true } },
+        { name: 'Mid only', v: { inOn: false, midOn: true, outOn: false } },
+      ] },
+      { group: 'In / out', items: [
+        { name: 'Push in', v: { inScale: 0.85, inRotate: -3, outScale: 1.12, outRotate: 2 } },
+        { name: 'Push out', v: { inScale: 1.2, inRotate: 3, outScale: 0.9, outRotate: -2 } },
+        { name: 'Zero to 100', v: { inScale: 0, outScale: 0 }, title: 'Grows from nothing on the way in, shrinks to nothing on the way out' },
+      ] },
+      { group: 'Mid', items: [
+        { name: 'Handheld', v: { midScale: 1.02, midRotate: 0, wiggle: 0.012, wiggleRot: 1.2, wiggleScale: 0.01, wiggleFreq: 0.9 } },
+        { name: 'Slow zoom in + tilt', v: { midScale: 1.06, midRotate: 1.5, wiggle: 0, wiggleRot: 0, wiggleScale: 0 }, title: 'A slow push with a slight turn - no wiggle' },
+        { name: 'Slow zoom out + tilt', v: { midScale: 0.95, midRotate: -1.5, wiggle: 0, wiggleRot: 0, wiggleScale: 0 }, title: 'A slow pull back with a slight turn - no wiggle' },
+      ] },
+      { group: 'Fades', items: [
+        { name: 'Fade in', v: { fadeIn: true }, off: { fadeIn: false } },
+        { name: 'Fade out', v: { fadeOut: true }, off: { fadeOut: false } },
+      ] },
     ],
   };
 
@@ -611,7 +644,13 @@ const PresetList = (() => {
   function camClip() { return pictureTargets()[0] || null; }
   function camEntry(clip) { return clip && (clip.fx || []).find((f) => f.preset === 'camera') || null; }
   function camTimes(e) { return e && e.keys && e.keys.cx ? e.keys.cx.map((k) => k.t) : []; }
-  const CAM_PROPS = ['cx', 'cy', 'size'];
+  const CAM_PROPS = ['cx', 'cy', 'size', 'h'];
+
+  /** A camera rectangle with its height made explicit (a key from before free shapes has none). */
+  function camRect(e, t) {
+    const r = FX.paramsAt(e, t);
+    return { cx: r.cx, cy: r.cy, size: r.size, h: Number(r.h) > 0 ? r.h : r.size };
+  }
 
   /** A rectangle at the playhead: a new key, or the one already there replaced. */
   function addCamKey(clip, rect) {
@@ -632,7 +671,13 @@ const PresetList = (() => {
       clip.fx = fx;
     }
     if (Number(p.blur) > 0) e.mblur = { on: true, strength: Number(p.blur), samples: Math.round(p.samples) || 8 };
+    e.params.fit = p.fit;
     e.keys = e.keys || {};
+    // Keys drawn before free shapes have no height track. Give them one holding the shape
+    // they always had, so a free rectangle added now does not reshape the old ones.
+    if (e.keys.cx && e.keys.cx.length && !(e.keys.h && e.keys.h.length)) {
+      e.keys.h = e.keys.cx.map((q) => ({ t: q.t, v: camRect(e, q.t).h, ease: q.ease }));
+    }
     for (const k of CAM_PROPS) {
       const tr = e.keys[k] = e.keys[k] || [];
       const key = { t: lt, v: rect[k], ease: easeOf(p.ease) };
@@ -701,14 +746,14 @@ const PresetList = (() => {
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, CW, CH);
     const box = (r) => {
-      const w = r.size * CW, h = r.size * CH;
+      const w = r.size * CW, h = (Number(r.h) > 0 ? r.h : r.size) * CH;
       return [r.cx * CW - w / 2, r.cy * CH - h / 2, w, h];
     };
     const clip = camClip(), e = camEntry(clip);
     const here = clip ? state.playhead - clip.start : -1;
     if (e) {
       for (const t of camTimes(e)) {
-        const r = FX.paramsAt(e, t);
+        const r = camRect(e, t);
         const on = Math.abs(t - here) < 1e-3;
         c.setLineDash(on ? [] : [6, 4]);
         c.lineWidth = on ? 3 : 1.5;
@@ -724,7 +769,14 @@ const PresetList = (() => {
         c.setLineDash([2, 3]);
         c.lineWidth = 1.5;
         c.strokeStyle = '#ffffff';
-        c.strokeRect(...box(FX.paramsAt(e, here)));
+        c.strokeRect(...box(camRect(e, here)));
+      }
+      // Handles on the rectangle a drag would edit.
+      const cur = !cam.drag && here >= 0 ? camRect(e, here) : null;
+      if (cur) {
+        c.setLineDash([]);
+        c.fillStyle = '#ffd400';
+        for (const [hx, hy] of camHandles(box(cur))) c.fillRect(hx - 4, hy - 4, 8, 8);
       }
     }
     if (cam.drag && cam.drag.rect) {
@@ -738,28 +790,78 @@ const PresetList = (() => {
     }
   }
 
-  /** Drag out a rectangle locked to the frame's aspect, from the corner pressed. */
+  /** The eight handles of a box [x, y, w, h], as [x, y, sx, sy] - sx/sy say which edges move. */
+  function camHandles(b) {
+    const [x, y, w, h] = b;
+    const out = [];
+    for (const sy of [-1, 0, 1]) {
+      for (const sx of [-1, 0, 1]) {
+        if (sx || sy) out.push([x + w / 2 + sx * w / 2, y + h / 2 + sy * h / 2, sx, sy]);
+      }
+    }
+    return out;
+  }
+
+  /*
+   * The overlay's three gestures, all on the rectangle under the playhead (the key there,
+   * or where the camera is between keys): drag a HANDLE to resize it, drag INSIDE it to
+   * move it, drag anywhere else to draw a new one. Any shape; hold Shift to keep the
+   * frame's shape. Letting go writes a key at the playhead - one undo entry.
+   */
   function wireCamOverlay() {
     const ov = document.getElementById('camOverlay');
     if (!ov) return;
     const at = (ev) => {
       const r = ov.getBoundingClientRect();
-      return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height };
+      return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height, W: r.width, H: r.height };
     };
+    const norm = (x0, y0, x1, y1) => ({
+      cx: (x0 + x1) / 2, cy: (y0 + y1) / 2,
+      size: Math.max(0.01, Math.abs(x1 - x0)), h: Math.max(0.01, Math.abs(y1 - y0)),
+    });
     ov.addEventListener('pointerdown', (ev) => {
       ev.preventDefault(); ev.stopPropagation();
-      if (!camClip()) { log('Select the clip to key first.'); return; }
+      const clip = camClip();
+      if (!clip) { log('Select the clip to key first.'); return; }
       ov.setPointerCapture(ev.pointerId);
-      cam.drag = { a: at(ev), rect: null };
+      const pt = at(ev);
+      const e = camEntry(clip);
+      const cur = e ? camRect(e, state.playhead - clip.start) : null;
+      if (cur) {
+        const x0 = cur.cx - cur.size / 2, x1 = cur.cx + cur.size / 2;
+        const y0 = cur.cy - cur.h / 2, y1 = cur.cy + cur.h / 2;
+        const tol = 7;
+        const hit = camHandles([x0 * pt.W, y0 * pt.H, cur.size * pt.W, cur.h * pt.H])
+          .find(([hx, hy]) => Math.abs(hx - pt.x * pt.W) <= tol && Math.abs(hy - pt.y * pt.H) <= tol);
+        if (hit) { cam.drag = { mode: 'size', sx: hit[2], sy: hit[3], box: [x0, y0, x1, y1], rect: cur }; return; }
+        if (pt.x > x0 && pt.x < x1 && pt.y > y0 && pt.y < y1) {
+          cam.drag = { mode: 'move', a: pt, from: cur, rect: cur };
+          return;
+        }
+      }
+      cam.drag = { mode: 'draw', a: pt, rect: null };
     });
     ov.addEventListener('pointermove', (ev) => {
-      if (!cam.drag) return;
-      const a = cam.drag.a, b = at(ev);
-      // One size for both axes, as fractions of the frame: the rectangle keeps the frame's
-      // shape, so filling the frame with it never stretches the picture.
-      const size = Math.min(2, Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y)));
-      const sx = b.x >= a.x ? 1 : -1, sy = b.y >= a.y ? 1 : -1;
-      cam.drag.rect = { cx: a.x + sx * size / 2, cy: a.y + sy * size / 2, size };
+      const d = cam.drag;
+      if (!d) return;
+      const b = at(ev);
+      if (d.mode === 'move') {
+        d.rect = Object.assign({}, d.from, { cx: d.from.cx + b.x - d.a.x, cy: d.from.cy + b.y - d.a.y });
+      } else if (d.mode === 'size') {
+        let [x0, y0, x1, y1] = d.box;
+        if (d.sx < 0) x0 = b.x; else if (d.sx > 0) x1 = b.x;
+        if (d.sy < 0) y0 = b.y; else if (d.sy > 0) y1 = b.y;
+        d.rect = norm(x0, y0, x1, y1);
+      } else {
+        let x1 = b.x, y1 = b.y;
+        if (ev.shiftKey) {
+          // The frame's own shape: equal fractions on both axes.
+          const s = Math.max(Math.abs(x1 - d.a.x), Math.abs(y1 - d.a.y));
+          x1 = d.a.x + Math.sign(x1 - d.a.x || 1) * s;
+          y1 = d.a.y + Math.sign(y1 - d.a.y || 1) * s;
+        }
+        d.rect = norm(d.a.x, d.a.y, x1, y1);
+      }
       syncCamOverlay();
     });
     ov.addEventListener('pointerup', (ev) => {
@@ -767,7 +869,8 @@ const PresetList = (() => {
       const d = cam.drag;
       cam.drag = null;
       const clip = camClip();
-      if (d && d.rect && d.rect.size > 0.03 && clip && addCamKey(clip, d.rect)) {
+      const moved = d && d.rect && (d.mode !== 'move' || d.rect !== d.from);
+      if (moved && d.rect.size > 0.02 && d.rect.h > 0.02 && clip && addCamKey(clip, d.rect)) {
         log('Camera key at ' + (state.playhead - clip.start).toFixed(2) + 's into the clip.');
       }
       syncCamOverlay();
@@ -793,11 +896,11 @@ const PresetList = (() => {
     const fullBtn = el('button', 'mini', 'Full frame here');
     fullBtn.title = 'A key at the playhead showing the whole frame - to start from, or come back to.';
     fullBtn.disabled = !clip;
-    fullBtn.addEventListener('click', () => { if (clip) addCamKey(clip, { cx: 0.5, cy: 0.5, size: 1 }); });
+    fullBtn.addEventListener('click', () => { if (clip) addCamKey(clip, { cx: 0.5, cy: 0.5, size: 1, h: 1 }); });
     const holdBtn = el('button', 'mini', 'Hold here');
     holdBtn.title = 'A key at the playhead that keeps the camera where it is right now - holds between two moves.';
     holdBtn.disabled = !e;
-    holdBtn.addEventListener('click', () => { if (e) addCamKey(clip, FX.paramsAt(e, state.playhead - clip.start)); });
+    holdBtn.addEventListener('click', () => { if (e) addCamKey(clip, camRect(e, state.playhead - clip.start)); });
     const rmBtn = el('button', 'mini', 'Remove camera');
     rmBtn.disabled = !e;
     rmBtn.addEventListener('click', () => removeTagged(['camera'], 'camera move'));
@@ -809,8 +912,14 @@ const PresetList = (() => {
     body.appendChild(el('div', 'tc-hint', 'CAM_rect - draw a rectangle at one moment, another ' +
       'at a later one, and the camera travels from the first to the second along the curve. ' +
       'Add as many as you like on one clip: every pair is its own move, and two keys with the ' +
-      'same rectangle hold. While drawing, the viewer shows the whole frame; press Done to see the move.'));
+      'same rectangle hold. Any shape: drag inside the rectangle to move it, drag a handle to ' +
+      'resize it, drag elsewhere to draw a new one (Shift keeps the frame\'s shape). While ' +
+      'drawing, the viewer shows the whole frame; press Done to see the move.'));
     body.appendChild(C({ path: 'ease', label: 'Curve for new keys', type: 'select', options: Anim.EASING_MENU }));
+    body.appendChild(C({ path: 'fit', label: 'Rectangle shape', type: 'buttons', options: [
+      { value: 'contain', label: 'Show all of it', title: 'The whole rectangle is on screen; more picture shows around its short side' },
+      { value: 'cover', label: 'Fill the frame', title: 'The rectangle fills the frame; its long side is trimmed' },
+    ] }));
     body.appendChild(C({ path: 'blur', label: 'Motion blur', type: 'range', min: 0, max: 4, step: 0.05, digits: 2 }));
     body.appendChild(C({ path: 'samples', label: 'Blur samples', type: 'range', min: 2, max: 32, step: 1, digits: 0 }));
     if (!e) return;
@@ -818,8 +927,9 @@ const PresetList = (() => {
     const times = camTimes(e);
     times.forEach((t, i) => {
       const row = el('div', 'tc-row');
-      const r = FX.paramsAt(e, t);
-      row.appendChild(el('label', 'tc-label', t.toFixed(2) + 's  ·  ' + Math.round(100 / r.size) + '%'));
+      const r = camRect(e, t);
+      row.appendChild(el('label', 'tc-label', t.toFixed(2) + 's  ·  ' + Math.round(r.size * 100) + ' x ' +
+        Math.round(r.h * 100) + '% of frame'));
       const go = el('button', 'mini', 'Go');
       go.title = 'Put the playhead on this key';
       go.addEventListener('click', () => { seek(clip.start + t); renderPanel(); });
@@ -863,13 +973,22 @@ const PresetList = (() => {
     top.appendChild(bar);
 
     if (LOOKS[key]) {
-      const looks = el('div', 'pl-tabs');
-      for (const lk of LOOKS[key]) {
-        const on = Object.keys(lk.v).every((k) => p[k] === lk.v[k]);
-        const b = el('button', 'mini' + (on ? ' on' : ''), lk.name);
-        b.title = 'Load these values - then Apply';
-        b.addEventListener('click', () => { Object.assign(p, lk.v); renderPanel(); });
-        looks.appendChild(b);
+      const looks = el('div', 'pl-looks');
+      for (const g of LOOKS[key]) {
+        const row = el('div', 'pl-tabs');
+        row.appendChild(el('span', 'tc-hint pl-group', g.group));
+        for (const lk of g.items) {
+          const on = Object.keys(lk.v).every((k) => p[k] === lk.v[k]);
+          const b = el('button', 'mini' + (on ? ' on' : ''), lk.name);
+          b.title = (lk.title ? lk.title + '. ' : '') +
+            (lk.off ? 'Click to switch on or off.' : 'One per row; rows combine. Then Apply.');
+          b.addEventListener('click', () => {
+            Object.assign(p, on && lk.off ? lk.off : lk.v);
+            renderPanel();
+          });
+          row.appendChild(b);
+        }
+        looks.appendChild(row);
       }
       box.appendChild(looks);
     }

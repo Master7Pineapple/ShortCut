@@ -1832,8 +1832,13 @@ apply is one undo entry. Everything they add stays editable in the clip's Effect
 cards have no Effects panel, so a push on a card is managed from the PresetList).
 
 **04 Camera move** keys a `camera` effect on the selected clip: **Draw rectangle** puts a
-DOM overlay (`#camOverlay`) over the viewer, and each yellow rectangle dragged on it (locked
-to the frame's aspect) becomes a key at the playhead on `cx`/`cy`/`size`. The camera then
+DOM overlay (`#camOverlay`) over the viewer, and each yellow rectangle dragged on it becomes a
+key at the playhead on `cx`/`cy`/`size`/`h`. Rectangles are any shape: drag inside the one
+under the playhead to move it, drag a handle to resize it, drag elsewhere to draw a new one
+(Shift keeps the frame's shape). A rectangle whose shape is not the frame's is never
+stretched: `fit` shows all of it (`contain`) or fills the frame with it (`cover`). Keys drawn
+before free shapes carry no `h` (it reads as the frame's shape) and get an `h` track holding
+that shape the first time a free key is added beside them. The camera then
 moves from rectangle to rectangle, the curve on each key being the move to the next; any
 number of keys per clip, two identical ones hold. While drawing, the viewer shows the
 uncropped frame: `FX.setCameraEdit()` bypasses the camera, but only while
@@ -1848,7 +1853,12 @@ opacity and size from the in values to 100% at the start, to the out values at t
 push; each phase can be switched off) are one effect each. Their panels are built from the
 effect's own schema plus a shutter, so a parameter added to the effect appears in the rack by
 itself; 07, 08 and 09 also have looks (`LOOKS` in `presetlist.js`) that only set the values
-they name. All are applied like 02: tagged, replacing the last apply, one undo entry.
+they name. Looks come in groups (a row each): one look per row, and rows combine, because
+the looks of different rows set different values; a look with `off` is a switch. Glow
+(`glowanim`) glows for the whole clip or `glowDur` from `start`, with its in and out a share
+(`ramp`) of that span. Emphasis has a slow zoom across the whole clip (`drift`); Motion has a
+mid turn (`midRotate`) and a fade in / fade out. All are applied like 02: tagged, replacing
+the last apply, one undo entry.
 
 **Apply to captions** only writes the Captions settings. **Apply + generate** also runs
 `generateCaptions()`. The new card fields are all drawn in `TextDraw`, so the preview and
