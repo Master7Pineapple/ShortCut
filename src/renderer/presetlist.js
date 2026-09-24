@@ -140,6 +140,12 @@ const PresetList = (() => {
     zoom: 1,
     distance: 0,
     seam: 0,                  // > 0 adds a `edgefade` on the band's inner edge
+    animIn: true,             // glide from the full frame into the band ...
+    animOut: false,           // ... and back out to the full frame at the end
+    animDur: F(12),
+    animEase: 'easeInOut',
+    animAt: 'start',          // 'start' | 'playhead' - where the glide in begins
+    animBlur: 0.5,            // shutter on the glide; 0 = none
   };
 
   const TABLES = { p01: P01, p02: P02, p03: P03 };
@@ -459,12 +465,34 @@ const PresetList = (() => {
   }
 
   /** The split's entries for one set of parameters: the band, and the seam if asked for. */
-  function splitEntries(p, side) {
+  function splitEntries(p, side, clip, playhead) {
     const s = FX.create('split');
     s.preset = 'split';
     Object.assign(s.params, {
-      side, size: p.size, focus: p.focus, zoom: p.zoom, distance: p.distance,
+      side, size: p.size, focus: p.focus, zoom: p.zoom, distance: p.distance, mix: 1,
     });
+    // The glide: `mix` keyed 0 -> 1 (and 1 -> 0 at the end), the curve on the first key of
+    // each span. Nothing keyed when neither end animates, so the split is simply there.
+    const keys = [];
+    if (clip && (p.animIn || p.animOut)) {
+      const len = lenOf(clip);
+      const dur = Math.min(Math.max(F(1), Number(p.animDur) || F(12)), len / ((p.animIn && p.animOut) ? 2 : 1));
+      if (p.animIn) {
+        const t0 = p.animAt === 'playhead'
+          ? Math.max(0, Math.min(len - dur, playhead - clip.start)) : 0;
+        keys.push({ t: t0, v: 0, ease: easeOf(p.animEase) }, { t: t0 + dur, v: 1, ease: easeOf(p.animEase) });
+      }
+      if (p.animOut) {
+        const t1 = len - dur;
+        if (!keys.length || t1 >= keys[keys.length - 1].t) {
+          keys.push({ t: t1, v: 1, ease: easeOf(p.animEase) }, { t: len, v: 0, ease: easeOf('linear') });
+        }
+      }
+    }
+    if (keys.length) {
+      s.keys = { mix: keys };
+      if (Number(p.animBlur) > 0) s.mblur = { on: true, strength: Number(p.animBlur), samples: 8 };
+    }
     const out = [s];
     if (p.seam > 0) {
       // The band's inner edge, measured from the frame edge the fade is named after.
@@ -475,6 +503,9 @@ const PresetList = (() => {
         side: side === 'top' ? 'bottom' : 'top',
         start: Math.max(0, Math.min(1, inner)), length: p.seam, amount: 1, ease: 'easeInOut',
       });
+      // The seam fades in with the split: a full frame with a fade cut through it would be
+      // a hard edge travelling with nothing to blend against.
+      if (keys.length) f.keys = { amount: JSON.parse(JSON.stringify(keys)) };
       out.push(f);
     }
     return out;
@@ -488,7 +519,7 @@ const PresetList = (() => {
     if (!clips.length) { log('Select a clip or still first.'); return 0; }
     pushUndo();
     for (const c of clips) {
-      c.fx = (c.fx || []).filter((f) => !isTagged('split')(f)).concat(splitEntries(p, side));
+      c.fx = (c.fx || []).filter((f) => !isTagged('split')(f)).concat(splitEntries(p, side, c, state.playhead));
       FX.normalizeClip(c);
     }
     markDirty();
@@ -791,6 +822,19 @@ const PresetList = (() => {
     body.appendChild(R('seam', 'Soft seam', 0, 0.3, 0.002, 3));
     body.appendChild(el('div', 'tc-hint', 'Soft seam adds a Fade on the inner edge, so the ' +
       'two halves blend instead of meeting on a hard line.'));
+    body.appendChild(el('div', 'tc-hint', 'Animation - the picture glides from the full ' +
+      'frame into its half instead of cutting there. It keys the Split amount of the Split screen effect.'));
+    body.appendChild(C({ path: 'animIn', label: 'Glide in', type: 'check' }));
+    body.appendChild(C({ path: 'animOut', label: 'Glide back out at the end', type: 'check' }));
+    body.appendChild(R('animDur', 'Over', F(2), F(60), F(1) / 2, 3, 's'));
+    body.appendChild(C({ path: 'animEase', label: 'Curve', type: 'select', options: Anim.EASING_MENU }));
+    body.appendChild(R('animBlur', 'Motion blur', 0, 4, 0.05, 2));
+    body.appendChild(C({
+      path: 'animAt', label: 'Glide in starts at', type: 'buttons', options: [
+        { value: 'start', label: 'Clip start' },
+        { value: 'playhead', label: 'Playhead' },
+      ],
+    }));
   }
 
   function renderPanel() {

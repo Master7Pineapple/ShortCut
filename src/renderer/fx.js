@@ -716,7 +716,11 @@
      */
     split: {
       label: 'Split screen',
-      params: { side: 'top', size: 0.5, focus: 0.5, zoom: 1, distance: 0 },
+      // `mix` is how far into the split the picture is: 0 is the untouched full frame, 1 is
+      // the band. Keyed 0 -> 1 it is the animation from one to the other - the band and the
+      // strip of picture in it are both interpolated, so the picture glides into its half
+      // rather than being cut there.
+      params: { side: 'top', size: 0.5, focus: 0.5, zoom: 1, distance: 0, mix: 1 },
       schema: [
         { path: 'params.side', label: 'Picture goes', type: 'select',
           options: [{ value: 'top', label: 'Top half' }, { value: 'bottom', label: 'Bottom half' }] },
@@ -724,17 +728,22 @@
         { path: 'params.focus', label: 'Crop centre', type: 'range', min: 0, max: 1, step: 0.005, digits: 3 },
         { path: 'params.zoom', label: 'Zoom in band', type: 'range', min: 0.5, max: 4, step: 0.01, digits: 2 },
         { path: 'params.distance', label: 'Distance from centre', type: 'range', min: -0.5, max: 0.5, step: 0.002, digits: 3 },
+        { path: 'params.mix', label: 'Split amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
       ],
       draw(L, p) {
         const W = L.W, H = L.H;
+        const m = clamp(p.mix == null ? 1 : p.mix, 0, 1);
+        if (!(m > 0)) return;                   // the full frame, untouched
         const r = splitRect(p, W, H);
+        const lerp = (a, b) => a + (b - a) * m;
+        const y = lerp(0, r.y), h = lerp(H, r.h);
         const src = take(L, 'fxA');
-        if (!(r.h > 0.5)) return;
+        if (!(h > 0.5)) return;
         L.c.save();
         L.c.beginPath();
-        L.c.rect(0, r.y, W, r.h);
+        L.c.rect(0, y, W, h);
         L.c.clip();
-        L.c.drawImage(src, r.sx, r.sy, r.sw, r.sh, 0, r.y, W, r.h);
+        L.c.drawImage(src, lerp(0, r.sx), lerp(0, r.sy), lerp(W, r.sw), lerp(H, r.sh), 0, y, W, h);
         L.c.restore();
       },
     },
