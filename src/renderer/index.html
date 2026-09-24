@@ -54,6 +54,9 @@
         <div id="rackGuides" hidden>
           <div class="rg-top"></div><div class="rg-bottom"></div><div class="rg-rail"></div>
         </div>
+        <!-- The camera move's drawing surface (PresetList 04). DOM over the canvas, never
+             drawn into it, so a rectangle can never reach an export. -->
+        <canvas id="camOverlay" hidden></canvas>
         <div id="frameHint" class="hint">Drag on the preview to reposition the frame</div>
       </div>
 

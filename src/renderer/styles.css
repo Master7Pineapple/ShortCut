@@ -799,6 +799,8 @@ select:focus, input[type=number]:focus, input[type=text]:focus, textarea:focus {
    viewer is a drag surface for framing and for a mouse take. */
 #safeOverlay { position: absolute; pointer-events: none; }
 #rackGuides { position: absolute; pointer-events: none; }
+#camOverlay { position: absolute; z-index: 5; cursor: crosshair; touch-action: none; }
+#camOverlay[hidden] { display: none; }
 #rackGuides[hidden] { display: none; }
 #rackGuides > div { position: absolute; background: #ff3b30; }
 #rackGuides .rg-top { left: 0; right: 0; top: 0; }

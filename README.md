@@ -1793,7 +1793,7 @@ Clear and the library's `+` touch the timeline, and each is one undo entry.
 ### The PresetList
 
 `src/renderer/presetlist.js`, opened with the toolbar's **Presets** button as a floating window
-(draggable, resizable; its position is remembered; Esc closes it). Presets are listed on the left and each preset's sections are tabs, so nothing needs scrolling to. It is the B2B short-form preset rack, numbered 01-03 in build
+(draggable, resizable; its position is remembered; Esc closes it). Presets are listed on the left and each preset's sections are tabs, so nothing needs scrolling to. It is the B2B short-form preset rack, numbered 01-09 in build
 order. It is **not** the text-card preset save/load: that stores one card's look, while a
 PresetList entry is a whole pass with its own parameters. Each entry works through the
 engines the app already has. Parameters are saved as `state.presetList` in the .scut. Like
@@ -1830,6 +1830,25 @@ Both tag what they add with `fx.preset` (`'push'` / `'split'`), so applying agai
 the last one instead of stacking, and **Remove** takes off only what the preset made. Each
 apply is one undo entry. Everything they add stays editable in the clip's Effects panel (text
 cards have no Effects panel, so a push on a card is managed from the PresetList).
+
+**04 Camera move** keys a `camera` effect on the selected clip: **Draw rectangle** puts a
+DOM overlay (`#camOverlay`) over the viewer, and each yellow rectangle dragged on it (locked
+to the frame's aspect) becomes a key at the playhead on `cx`/`cy`/`size`. The camera then
+moves from rectangle to rectangle, the curve on each key being the move to the next; any
+number of keys per clip, two identical ones hold. While drawing, the viewer shows the
+uncropped frame: `FX.setCameraEdit()` bypasses the camera, but only while
+`FX.setViewer(true)` is on, which `drawPreview()` sets around its own composite and nothing
+else does - a bake can never pick the bypass up.
+
+**05 Shine** (`shine`), **06 Glow in / out** (`glowanim`), **07 Strikethrough** (`strike`,
+text cards only - it reads the card's lines from `TextDraw.measure()`; rough pencil,
+transparent highlighter or clean line, wiped in line by line), **08 Emphasis** (`emphasis`:
+opacity and size from the in values to 100% at the start, to the out values at the end) and
+**09 Motion** (`motion`: an in push with rotation, a mid drift with a seeded wiggle, an out
+push; each phase can be switched off) are one effect each. Their panels are built from the
+effect's own schema plus a shutter, so a parameter added to the effect appears in the rack by
+itself; 07, 08 and 09 also have looks (`LOOKS` in `presetlist.js`) that only set the values
+they name. All are applied like 02: tagged, replacing the last apply, one undo entry.
 
 **Apply to captions** only writes the Captions settings. **Apply + generate** also runs
 `generateCaptions()`. The new card fields are all drawn in `TextDraw`, so the preview and
@@ -5017,7 +5036,8 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
 - Video clips, stills and graphics carry an ordered, keyframable effect stack: transform,
   rounded corners and shadow, crop/inset, blur, a grade, the three pointer effects, and the
   four framing treatments — device frame, background, spotlight and cutout — plus
-  `split` (split screen) and `edgefade` (**Fade**: one side fades to transparent, so the
+  `split` (split screen), `camera`, `shine`, `glowanim`, `strike` (text cards only),
+  `emphasis`, `motion` and `edgefade` (**Fade**: one side fades to transparent, so the
   clip blends into whatever is under it) — see "The effect stack". Text cards do not; they have their own richer animation model. There are
   still no speed changes.
 - The graphics engine ships nineteen object types and **one object per clip** — a row of

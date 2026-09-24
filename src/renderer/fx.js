@@ -825,6 +825,277 @@
       },
     },
 
+    // ------------------------------------------------------ animated presets (04-09)
+    //
+    // The PresetList's animated looks. Each is an ordinary effect - keyframable, with the
+    // shutter, preview = export - and the rack only fills in its parameters. Timing is in
+    // SECONDS INTO THE CLIP and the curves are `Anim.EASING_PRESETS` names.
+
+    /*
+     * CAMERA MOVE: the frame follows a rectangle. `cx`/`cy` are the rectangle's centre and
+     * `size` its width as a fraction of the frame (the height follows the frame's own
+     * aspect, so the picture is never stretched). Keyed, it is a camera move from one
+     * drawn rectangle to the next, the curve on each key being the move to the next one.
+     */
+    camera: {
+      label: 'Camera move',
+      params: { cx: 0.5, cy: 0.5, size: 1 },
+      schema: [
+        { path: 'params.cx', label: 'Centre X', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
+        { path: 'params.cy', label: 'Centre Y', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
+        { path: 'params.size', label: 'Rectangle size', type: 'range', min: 0.05, max: 2, step: 0.005, digits: 3 },
+      ],
+      geom(p, t, e, clip, W, H) {
+        // While a rectangle is being drawn the VIEWER shows the uncropped frame, so the
+        // author draws on the whole picture. Never in a bake: see `setViewer()`.
+        if (CAM_EDIT && IN_VIEWER) return { a: 1, m: [1, 0, 0, 1, 0, 0] };
+        const s = clamp(p.size, 0.02, 4);
+        const cx = clamp(p.cx, -1, 2) * W, cy = clamp(p.cy, -1, 2) * H;
+        return { a: 1, m: aboutAnchor(cx, cy, W / 2 - cx, H / 2 - cy, 0, 1 / s) };
+      },
+      draw(L, p, t, e, clip) {
+        applyGeom(L, DEFS.camera.geom(p, t, e, clip, L.W, L.H));
+      },
+    },
+
+    /*
+     * SHINE: a band of light sweeps across the picture, only where the picture is (it is
+     * masked by the layer's alpha, so it follows a PNG's or a card's letters).
+     */
+    shine: {
+      label: 'Shine',
+      timeVarying: true,
+      params: {
+        colour: '#ffffff', angle: 25, width: 0.12, softness: 0.7, intensity: 0.8,
+        start: 0.2, dur: 0.7, ease: 'easeInOut', repeat: 0, direction: 'forward',
+      },
+      schema: [
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.intensity', label: 'Intensity', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
+        { path: 'params.width', label: 'Band width', type: 'range', min: 0.01, max: 0.6, step: 0.005, digits: 3 },
+        { path: 'params.softness', label: 'Softness', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.angle', label: 'Angle', type: 'range', min: -90, max: 90, step: 1, unit: '°', digits: 0 },
+        { path: 'params.start', label: 'Starts at', type: 'range', min: 0, max: 10, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.dur', label: 'Sweep over', type: 'range', min: 0.05, max: 5, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.ease', label: 'Curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.repeat', label: 'Repeat every (0 = once)', type: 'range', min: 0, max: 10, step: 0.05, unit: 's', digits: 2 },
+        { path: 'params.direction', label: 'Direction', type: 'select',
+          options: [{ value: 'forward', label: 'Forward' }, { value: 'back', label: 'Backward' }] },
+      ],
+      draw(L, p, t) {
+        const W = L.W, H = L.H;
+        const dur = Math.max(0.01, Number(p.dur) || 0.01);
+        let local = t - (Number(p.start) || 0);
+        const rep = Math.max(0, Number(p.repeat) || 0);
+        if (rep > 0 && local > 0) local %= rep > dur ? rep : dur + 0.001;
+        if (!(local >= 0 && local <= dur)) return;
+        const amt = clamp(p.intensity, 0, 2);
+        if (!(amt > 0)) return;
+        let k = clamp(Anim.ease(Anim.EASING_PRESETS[p.ease] || Anim.EASING_PRESETS.linear, local / dur), -0.5, 1.5);
+        if (p.direction === 'back') k = 1 - k;
+        const a = (Number(p.angle) || 0) * Math.PI / 180;
+        const ux = Math.cos(a), uy = Math.sin(a);
+        const reach = 0.5 * (Math.abs(W * ux) + Math.abs(H * uy));
+        const bw = Math.max(1, clamp(p.width, 0, 1) * (W + H) / 2);
+        const c = -reach - bw + k * (2 * reach + 2 * bw);
+        const x0 = W / 2 + ux * (c - bw), y0 = H / 2 + uy * (c - bw);
+        const x1 = W / 2 + ux * (c + bw), y1 = H / 2 + uy * (c + bw);
+        const s = clamp(p.softness, 0, 1) * 0.5;
+        const S = clean(L.surface, 'fxShine', W, H);
+        const g = S.c.createLinearGradient(x0, y0, x1, y1);
+        const col = (al) => rgba(p.colour, clamp(al, 0, 1));
+        g.addColorStop(0, col(0));
+        g.addColorStop(Math.max(0.001, s), col(Math.min(1, amt)));
+        g.addColorStop(Math.min(0.999, 1 - s), col(Math.min(1, amt)));
+        g.addColorStop(1, col(0));
+        S.c.fillStyle = g;
+        S.c.fillRect(0, 0, W, H);
+        S.c.globalCompositeOperation = 'destination-in';
+        S.c.drawImage(L.cv, 0, 0);
+        L.c.save();
+        L.c.globalCompositeOperation = 'lighter';
+        L.c.drawImage(S.cv, 0, 0);
+        if (amt > 1) { L.c.globalAlpha = amt - 1; L.c.drawImage(S.cv, 0, 0); }
+        L.c.restore();
+        reset(L.c);
+      },
+    },
+
+    /*
+     * GLOW IN / OUT: the `glow` look with its strength animated - it blooms up over `inDur`
+     * from the clip start, holds (optionally breathing), and dies away over the last
+     * `outDur` of the clip. The size grows with it, so it opens up rather than just
+     * brightening.
+     */
+    glowanim: {
+      label: 'Glow in / out',
+      timeVarying: true,
+      params: {
+        colour: '#ffd166', size: 0.04, intensity: 2, over: 0.3,
+        inDur: 0.4, inEase: 'easeOut', outDur: 0.4, outEase: 'easeIn',
+        pulse: 0, pulseAmt: 0.3,
+      },
+      schema: [
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.size', label: 'Size', type: 'range', min: 0, max: 0.2, step: 0.001, digits: 3 },
+        { path: 'params.intensity', label: 'Intensity', type: 'range', min: 0, max: 5, step: 0.05, digits: 2 },
+        { path: 'params.over', label: 'Glow over picture', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.inDur', label: 'Glow in over (0 = none)', type: 'range', min: 0, max: 5, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.inEase', label: 'In curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.outDur', label: 'Glow out over (0 = none)', type: 'range', min: 0, max: 5, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.pulse', label: 'Pulse (per second, 0 = off)', type: 'range', min: 0, max: 6, step: 0.05, digits: 2 },
+        { path: 'params.pulseAmt', label: 'Pulse depth', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      draw(L, p, t, e, clip) {
+        const dur = clipDuration(clip);
+        const lvl = glowLevel(p, t, dur);
+        if (!(lvl > 0.001)) return;
+        DEFS.glow.draw(L, {
+          colour: p.colour,
+          size: (Number(p.size) || 0) * (0.35 + 0.65 * lvl),
+          intensity: (Number(p.intensity) || 0) * lvl,
+          over: (Number(p.over) || 0) * lvl,
+        });
+      },
+    },
+
+    /*
+     * STRIKETHROUGH, text cards only - the effect reads the card's own line layout. Each
+     * line is struck left to right over `dur`, the lines `stagger` apart. Three looks: a
+     * rough pencil (jittered strokes with a paper-grain texture knocked out of them), a
+     * transparent highlighter (a chisel band with streaks) and a clean line. The strokes
+     * are a pure function of the parameters and the seed, so they do not crawl.
+     */
+    strike: {
+      label: 'Strikethrough',
+      needs: 'text',
+      timeVarying: true,
+      params: {
+        style: 'pencil', colour: '#e8203a', thickness: 0.09, opacity: 1, height: 0.52,
+        tilt: -1.5, overhang: 0.05, rough: 0.5, behind: false,
+        start: 0.2, dur: 0.35, ease: 'easeOut', stagger: 0.15, seed: 1,
+      },
+      schema: [
+        { path: 'params.style', label: 'Look', type: 'select', options: [
+          { value: 'pencil', label: 'Rough pencil' },
+          { value: 'highlighter', label: 'Highlighter (transparent)' },
+          { value: 'line', label: 'Clean line' },
+        ] },
+        { path: 'params.colour', label: 'Colour', type: 'color' },
+        { path: 'params.thickness', label: 'Thickness (x line)', type: 'range', min: 0.01, max: 1.2, step: 0.005, digits: 3 },
+        { path: 'params.opacity', label: 'Opacity', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.height', label: 'Height in line', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.tilt', label: 'Tilt', type: 'range', min: -10, max: 10, step: 0.1, unit: '°', digits: 1 },
+        { path: 'params.overhang', label: 'Overhang', type: 'range', min: -0.2, max: 0.3, step: 0.005, digits: 3 },
+        { path: 'params.rough', label: 'Roughness', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.behind', label: 'Behind the text', type: 'check' },
+        { path: 'params.start', label: 'Starts at', type: 'range', min: 0, max: 10, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.dur', label: 'Strike over', type: 'range', min: 0.02, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.ease', label: 'Curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.stagger', label: 'Next line after', type: 'range', min: 0, max: 1, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.seed', label: 'Variation', type: 'range', min: 1, max: 99, step: 1, digits: 0 },
+      ],
+      draw(L, p, t, e, clip) {
+        if (!clip || clip.kind !== 'text' || !clip.card || typeof TextDraw === 'undefined') return;
+        drawStrike(L, p, t, clip);
+      },
+    },
+
+    /*
+     * EMPHASIS: in, the picture goes from `inOpacity`/`inScale` to 100% over `inDur`; out,
+     * it goes from 100% to `outOpacity`/`outScale` over the last `outDur` of the clip.
+     * Geometry, so it composes with a transform and takes the shutter.
+     */
+    emphasis: {
+      label: 'Emphasis',
+      timeVarying: true,
+      params: {
+        inOpacity: 0, inScale: 0, inDur: 0.3, inEase: 'softLand',
+        outOpacity: 0.5, outScale: 0.75, outDur: 0.4, outEase: 'easeInOut',
+        anchorX: 0.5, anchorY: 0.5,
+      },
+      schema: [
+        { path: 'params.inOpacity', label: 'In: opacity from', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.inScale', label: 'In: size from', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
+        { path: 'params.inDur', label: 'In over', type: 'range', min: 0, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.inEase', label: 'In curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.outOpacity', label: 'Out: opacity to', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.outScale', label: 'Out: size to', type: 'range', min: 0, max: 2, step: 0.01, digits: 2 },
+        { path: 'params.outDur', label: 'Out over', type: 'range', min: 0, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.anchorX', label: 'Anchor X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.anchorY', label: 'Anchor Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      geom(p, t, e, clip, W, H) {
+        const dur = clipDuration(clip);
+        const ki = phaseIn(t, p.inDur, p.inEase);
+        const ko = phaseOut(t, dur, p.outDur, p.outEase);
+        const lerp = (a, b, k) => a + (b - a) * k;
+        const a = lerp(clamp(p.inOpacity, 0, 1), 1, ki) * lerp(1, clamp(p.outOpacity, 0, 1), ko);
+        const s = lerp(Number(p.inScale) || 0, 1, ki) * lerp(1, Number(p.outScale) || 0, ko);
+        return {
+          a: clamp(a, 0, 1),
+          m: aboutAnchor(clamp(p.anchorX, -4, 5) * W, clamp(p.anchorY, -4, 5) * H, 0, 0, 0, Math.max(0.001, s)),
+        };
+      },
+      draw(L, p, t, e, clip) {
+        applyGeom(L, DEFS.emphasis.geom(p, t, e, clip, L.W, L.H));
+      },
+    },
+
+    /*
+     * MOTION: three phases. IN, the picture pushes from `inScale`/`inRotate` to rest;
+     * MID, it drifts from 1 to `midScale` and keeps wiggling (a smooth, seeded sum of
+     * sines on position, rotation and scale); OUT, it pushes to `outScale`/`outRotate`.
+     * Any phase can be switched off. The wiggle fades in and out with the phases around
+     * it, so nothing jumps where one phase hands over to the next.
+     */
+    motion: {
+      label: 'Motion',
+      timeVarying: true,
+      params: {
+        inOn: true, inDur: 0.5, inEase: 'softLand', inScale: 1.12, inRotate: -3,
+        midOn: true, midScale: 1.04, midEase: 'linear',
+        wiggle: 0.006, wiggleRot: 0.5, wiggleScale: 0.005, wiggleFreq: 0.5, seed: 1,
+        outOn: true, outDur: 0.4, outEase: 'easeIn', outScale: 1.14, outRotate: 3,
+        anchorX: 0.5, anchorY: 0.5,
+      },
+      schema: [
+        { path: 'params.inOn', label: 'In phase', type: 'check' },
+        { path: 'params.inDur', label: 'In over', type: 'range', min: 0.02, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.inEase', label: 'In curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.inScale', label: 'In: size from', type: 'range', min: 0.2, max: 2, step: 0.005, digits: 3 },
+        { path: 'params.inRotate', label: 'In: rotation from', type: 'range', min: -30, max: 30, step: 0.1, unit: '°', digits: 1 },
+        { path: 'params.midOn', label: 'Mid phase', type: 'check' },
+        { path: 'params.midScale', label: 'Mid: drift to size', type: 'range', min: 0.5, max: 1.5, step: 0.005, digits: 3 },
+        { path: 'params.midEase', label: 'Mid curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.wiggle', label: 'Wiggle: move', type: 'range', min: 0, max: 0.05, step: 0.0005, digits: 4 },
+        { path: 'params.wiggleRot', label: 'Wiggle: rotate', type: 'range', min: 0, max: 5, step: 0.05, unit: '°', digits: 2 },
+        { path: 'params.wiggleScale', label: 'Wiggle: size', type: 'range', min: 0, max: 0.05, step: 0.0005, digits: 4 },
+        { path: 'params.wiggleFreq', label: 'Wiggle speed (per second)', type: 'range', min: 0.05, max: 4, step: 0.05, digits: 2 },
+        { path: 'params.seed', label: 'Variation', type: 'range', min: 1, max: 99, step: 1, digits: 0 },
+        { path: 'params.outOn', label: 'Out phase', type: 'check' },
+        { path: 'params.outDur', label: 'Out over', type: 'range', min: 0.02, max: 3, step: 0.01, unit: 's', digits: 2 },
+        { path: 'params.outEase', label: 'Out curve', type: 'select', options: EASE_OPTIONS },
+        { path: 'params.outScale', label: 'Out: size to', type: 'range', min: 0.2, max: 2, step: 0.005, digits: 3 },
+        { path: 'params.outRotate', label: 'Out: rotation to', type: 'range', min: -30, max: 30, step: 0.1, unit: '°', digits: 1 },
+        { path: 'params.anchorX', label: 'Anchor X', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.anchorY', label: 'Anchor Y', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+      ],
+      geom(p, t, e, clip, W, H) {
+        const st = motionState(p, t, clipDuration(clip));
+        return {
+          a: 1,
+          m: aboutAnchor(clamp(p.anchorX, -4, 5) * W, clamp(p.anchorY, -4, 5) * H,
+            st.dx * W, st.dy * W, st.rot, Math.max(0.001, st.s)),
+        };
+      },
+      draw(L, p, t, e, clip) {
+        applyGeom(L, DEFS.motion.geom(p, t, e, clip, L.W, L.H));
+      },
+    },
+
     blur: {
       label: 'Blur',
       params: { radius: 0.01 },
@@ -2345,6 +2616,201 @@
     return { y, h: hB, sx: (W - sw) / 2, sy, sw, sh };
   }
 
+  // ------------------------------------------------ timing for the animated presets
+
+  const easeByName = (name) => Anim.EASING_PRESETS[name] || Anim.EASING_PRESETS.linear;
+
+  /** Eased progress through an IN phase that starts at the clip's first frame. 1 = done. */
+  function phaseIn(t, dur, ease) {
+    const d = Number(dur) || 0;
+    return d > 0 ? Anim.ease(easeByName(ease), clamp(t / d, 0, 1)) : 1;
+  }
+
+  /** Eased progress through an OUT phase that ends at the clip's last frame. 0 = not yet. */
+  function phaseOut(t, total, dur, ease) {
+    const d = Number(dur) || 0;
+    return d > 0 ? Anim.ease(easeByName(ease), clamp((t - (total - d)) / d, 0, 1)) : 0;
+  }
+
+  /** `glowanim`'s level at `t`, 0..1: in, hold (maybe breathing), out. */
+  function glowLevel(p, t, dur) {
+    let lvl = phaseIn(t, p.inDur, p.inEase) * (1 - phaseOut(t, dur, p.outDur, p.outEase));
+    const hz = Number(p.pulse) || 0;
+    if (hz > 0) lvl *= 1 - clamp(p.pulseAmt, 0, 1) * 0.5 * (1 - Math.cos(2 * Math.PI * hz * t));
+    return clamp(lvl, 0, 1);
+  }
+
+  /**
+   * `motion` at `t`: scale, rotation (degrees) and a move in fractions of the frame WIDTH
+   * on both axes, so a wiggle is the same number of pixels across as down.
+   */
+  function motionState(p, t, dur) {
+    const lerp = (a, b, k) => a + (b - a) * k;
+    const inOn = p.inOn !== false, midOn = p.midOn !== false, outOn = p.outOn !== false;
+    const inD = inOn ? Math.min(Math.max(0, Number(p.inDur) || 0), dur / 2) : 0;
+    const outD = outOn ? Math.min(Math.max(0, Number(p.outDur) || 0), dur / 2) : 0;
+    const ki = inOn ? phaseIn(t, inD, p.inEase) : 1;
+    const ko = outOn ? phaseOut(t, dur, outD, p.outEase) : 0;
+    const m0 = inD, m1 = dur - outD;
+    const km = midOn && m1 > m0 ? Anim.ease(easeByName(p.midEase), clamp((t - m0) / (m1 - m0), 0, 1)) : 0;
+    let s = (inOn ? lerp(Number(p.inScale) || 1, 1, ki) : 1) *
+      (midOn ? lerp(1, Number(p.midScale) || 1, km) : 1) *
+      (outOn ? lerp(1, Number(p.outScale) || 1, ko) : 1);
+    let rot = (inOn ? lerp(Number(p.inRotate) || 0, 0, ki) : 0) + (outOn ? lerp(0, Number(p.outRotate) || 0, ko) : 0);
+    let dx = 0, dy = 0;
+    // The wiggle belongs to the mid phase and fades in and out with the phases around it.
+    const w = midOn ? ki * (1 - ko) : 0;
+    if (w > 0) {
+      const f = clamp(p.wiggleFreq, 0.01, 20);
+      const rng = mulberry32(((Number(p.seed) || 1) | 0) * 7919 + 17);
+      const ph = [0, 1, 2, 3, 4, 5, 6, 7].map(() => rng() * Math.PI * 2);
+      const n = (c) => 0.6 * Math.sin(2 * Math.PI * f * t + ph[c * 2]) +
+        0.4 * Math.sin(2 * Math.PI * f * 1.73 * t + ph[c * 2 + 1]);
+      dx = w * (Number(p.wiggle) || 0) * n(0);
+      dy = w * (Number(p.wiggle) || 0) * n(1);
+      rot += w * (Number(p.wiggleRot) || 0) * n(2);
+      s *= 1 + w * (Number(p.wiggleScale) || 0) * n(3);
+    }
+    return { s, rot, dx, dy };
+  }
+
+  /**
+   * The strikethrough, drawn onto its own scratch and then over (or behind) the card.
+   * Lines come from `TextDraw.measure()` - the same layout the card is painted with - by
+   * grouping its items by baseline, so alignment, wrapping and blowups are all honoured.
+   */
+  function drawStrike(L, p, t, clip) {
+    const W = L.W, H = L.H;
+    const mc = L.surface('fxStrM', 4, 4).getContext('2d');
+    let m;
+    try { m = TextDraw.measure(mc, clip, W, H, t); } catch (err) { return; }
+    if (!m || !m.items || !m.items.length) return;
+    const rows = new Map();
+    for (const it of m.items) {
+      const cx = it.x + it.w / 2 + (it.dx || 0), cy = it.y + (it.dy || 0);
+      const hw = (it.w / 2) * (it.scale || 1);
+      const key = Math.round(it.y);
+      const r = rows.get(key);
+      if (!r) rows.set(key, { y: cy, x0: cx - hw, x1: cx + hw });
+      else { r.x0 = Math.min(r.x0, cx - hw); r.x1 = Math.max(r.x1, cx + hw); }
+    }
+    const lines = Array.from(rows.values()).sort((a, b) => a.y - b.y);
+    const lh = m.lineH;
+    const px = Math.max(1, Math.min(W, H) / 540);        // texture grain, resolution-free
+    const S = clean(L.surface, 'fxStr', W, H);
+    const c = S.c;
+    const dur = Math.max(0.01, Number(p.dur) || 0.01);
+    const slope = Math.tan((Number(p.tilt) || 0) * Math.PI / 180);
+    const rough = clamp(p.rough, 0, 1);
+    const style = String(p.style || 'pencil');
+    let any = false;
+    lines.forEach((ln, i) => {
+      const k = Anim.ease(easeByName(p.ease), clamp((t - (Number(p.start) || 0) - i * (Number(p.stagger) || 0)) / dur, 0, 1));
+      if (!(k > 0)) return;
+      any = true;
+      const lw = ln.x1 - ln.x0;
+      const ov = (Number(p.overhang) || 0) * lw;
+      const ax = ln.x0 - ov, bx = ln.x1 + ov;
+      const ay = ln.y - lh / 2 + clamp(p.height, 0, 1) * lh;
+      const th = Math.max(1, clamp(p.thickness, 0, 2) * lh);
+      const yAt = (x) => ay + slope * (x - ax);
+      const xk = ax + (bx - ax) * k;
+      const rng = mulberry32(((Number(p.seed) || 1) | 0) * 9973 + i * 131 + 7);
+      c.save();
+      if (m.tr && m.tr.rotate) {
+        const bcx = m.block.x + m.block.w / 2, bcy = m.block.y + m.block.h / 2;
+        c.translate(bcx, bcy);
+        c.rotate(m.tr.rotate * Math.PI / 180);
+        c.translate(-bcx, -bcy);
+      }
+      // The wipe: the whole stroke is built every frame from the seed and only the part
+      // left of `xk` is let through, so it grows rather than re-randomising as it goes.
+      c.beginPath();
+      c.rect(-W, -H, (xk + W), H * 3);
+      c.clip();
+      c.fillStyle = p.colour;
+      c.strokeStyle = p.colour;
+      c.lineCap = 'round';
+      c.lineJoin = 'round';
+      if (style === 'line') {
+        c.lineWidth = th;
+        c.beginPath();
+        c.moveTo(ax, yAt(ax));
+        c.lineTo(bx, yAt(bx));
+        c.stroke();
+      } else if (style === 'highlighter') {
+        // A chisel-tip band: slanted ends, edges that waver a little, then streaks where
+        // the felt ran dry.
+        const step = Math.max(4 * px, lh * 0.2);
+        const top = [], bot = [];
+        for (let x = ax; x <= bx + 0.01; x += step) {
+          const xx = Math.min(x, bx);
+          top.push([xx, yAt(xx) - th / 2 + (rng() - 0.5) * rough * th * 0.12]);
+          bot.push([xx, yAt(xx) + th / 2 + (rng() - 0.5) * rough * th * 0.12]);
+        }
+        const sl = th * 0.35;
+        c.beginPath();
+        c.moveTo(top[0][0] + sl, top[0][1]);
+        for (const q of top) c.lineTo(q[0], q[1]);
+        c.lineTo(bx + sl, bot[bot.length - 1][1]);
+        for (let j = bot.length - 1; j >= 0; j--) c.lineTo(bot[j][0] - (j === 0 ? sl : 0), bot[j][1]);
+        c.closePath();
+        c.fill();
+        c.globalCompositeOperation = 'destination-out';
+        const streaks = 4 + Math.round(th / (3 * px));
+        for (let j = 0; j < streaks; j++) {
+          const yy = (rng() - 0.5) * th * 0.9;
+          const x0 = ax + rng() * (bx - ax) * 0.4, x1 = bx - rng() * (bx - ax) * 0.4;
+          c.globalAlpha = 0.06 + rng() * 0.2 * (0.3 + rough);
+          c.lineWidth = px * (0.6 + rng() * 1.4);
+          c.beginPath();
+          c.moveTo(x0, yAt(x0) + yy);
+          c.lineTo(x1, yAt(x1) + yy);
+          c.stroke();
+        }
+      } else {
+        // Rough pencil: two or three passes, each a jittered polyline of its own width
+        // and pressure, then a paper grain knocked out of the graphite.
+        const passes = 2 + (rough > 0.4 ? 1 : 0);
+        const step = Math.max(3 * px, lh * 0.12);
+        for (let s = 0; s < passes; s++) {
+          c.globalAlpha = 0.7 + rng() * 0.3;
+          c.lineWidth = th * (0.45 + rng() * 0.35);
+          const y0 = (rng() - 0.5) * th * 0.6;
+          const start = ax + (rng() - 0.5) * th, end = bx + (rng() - 0.5) * th;
+          let drift = 0;
+          c.beginPath();
+          for (let x = start; x <= end + 0.01; x += step) {
+            const xx = Math.min(x, end);
+            drift = drift * 0.6 + (rng() - 0.5) * rough * th * 0.5;
+            const y = yAt(xx) + y0 + drift;
+            if (x === start) c.moveTo(xx, y); else c.lineTo(xx, y);
+          }
+          c.stroke();
+        }
+        c.globalAlpha = 1;
+        c.globalCompositeOperation = 'destination-out';
+        const area = (bx - ax + th * 2) * th * 2;
+        const grains = Math.min(6000, Math.round(area / (px * px) * 0.08 * (0.3 + rough)));
+        for (let j = 0; j < grains; j++) {
+          const x = ax - th + rng() * (bx - ax + th * 2);
+          const y = yAt(x) - th + rng() * th * 2;
+          c.globalAlpha = 0.25 + rng() * 0.6;
+          c.fillRect(x, y, px * (0.8 + rng() * 1.2), px * (0.6 + rng() * 0.8));
+        }
+      }
+      c.restore();
+      reset(c);
+    });
+    if (!any) return;
+    L.c.save();
+    L.c.globalAlpha = clamp(p.opacity, 0, 1);
+    L.c.globalCompositeOperation = p.behind ? 'destination-over' : 'source-over';
+    L.c.drawImage(S.cv, 0, 0);
+    L.c.restore();
+    reset(L.c);
+  }
+
   /** The spotlight's window in pixels. Its own function so the mask and a test agree. */
   function spotRect(p, W, H) {
     return {
@@ -3059,6 +3525,16 @@
 
   const MBLUR = { on: false, strength: 0.5, samples: 8 };
 
+  /*
+   * The camera move's drawing mode. While the author draws rectangles, the VIEWER shows
+   * the frame uncropped - but only the viewer: `IN_VIEWER` is set by `drawPreview()`
+   * around its own composite and nowhere else, so a bake can never pick the bypass up.
+   */
+  let CAM_EDIT = false, IN_VIEWER = false;
+  function setCameraEdit(on) { CAM_EDIT = !!on; }
+  function setViewer(on) { IN_VIEWER = !!on; }
+  function cameraEditing() { return CAM_EDIT; }
+
   /**
    * Does this effect paint differently at a slightly different time?
    *
@@ -3467,6 +3943,7 @@
     MASTER_TYPES, normalizeStack, masterActive, renderMaster, renderOver,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
     CHROME, chromeGeom, spotRect, cutoutRect, fitDraw, splitRect,
+    setCameraEdit, setViewer, cameraEditing, motionState, glowLevel, phaseIn, phaseOut,
     MASK_SHAPES, MASK_SHAPE_OPTIONS, fillMaskShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;

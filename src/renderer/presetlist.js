@@ -27,6 +27,12 @@ const PresetList = (() => {
     { id: '01', key: 'p01', name: 'Caption engine', family: 'CAP_' },
     { id: '02', key: 'p02', name: 'Push in / out', family: 'ZM_' },
     { id: '03', key: 'p03', name: 'Split screen', family: 'SPL_' },
+    { id: '04', key: 'p04', name: 'Camera move', family: 'CAM_' },
+    { id: '05', key: 'p05', name: 'Shine', family: 'SHN_' },
+    { id: '06', key: 'p06', name: 'Glow in / out', family: 'GLW_' },
+    { id: '07', key: 'p07', name: 'Strikethrough', family: 'STR_' },
+    { id: '08', key: 'p08', name: 'Emphasis', family: 'EMP_' },
+    { id: '09', key: 'p09', name: 'Motion', family: 'MOT_' },
   ];
 
   const F = (n) => n / 30;   // the rack's frame counts are at 30 fps
@@ -516,6 +522,382 @@ const PresetList = (() => {
     return clips.length;
   }
 
+  // ------------------------------------------------ 04-09: animated effects on clips
+  //
+  // 05-09 are one effect each, and their parameters ARE that effect's parameters plus a
+  // shutter: the panel is built from `FX.DEFS[type].schema`, so a parameter added to the
+  // effect turns up here with no second list to keep in step. Apply writes one tagged
+  // entry per clip, replacing the last one this preset made.
+
+  const FXP = {
+    p05: { type: 'shine', tag: 'shine', blur: 0 },
+    p06: { type: 'glowanim', tag: 'glow', blur: 0 },
+    p07: { type: 'strike', tag: 'strike', blur: 0, textOnly: true },
+    p08: { type: 'emphasis', tag: 'emphasis', blur: 0.6, geo: true },
+    p09: { type: 'motion', tag: 'motion', blur: 0.6, geo: true },
+  };
+  for (const [key, d] of Object.entries(FXP)) {
+    TABLES[key] = Object.assign({}, FX.DEFS[d.type].params, { blur: d.blur, samples: 8 });
+  }
+  /** 04's own settings: the curve a newly drawn rectangle's move gets, and the shutter. */
+  TABLES.p04 = { ease: 'easeInOut', blur: 0.6, samples: 8 };
+
+  /** The looks inside a preset: each one only sets the values it names. */
+  const LOOKS = {
+    p07: [
+      { name: 'Rough pencil', v: { style: 'pencil', colour: '#e8203a', thickness: 0.09, opacity: 1, height: 0.52, rough: 0.5, behind: false, tilt: -1.5 } },
+      { name: 'Highlighter', v: { style: 'highlighter', colour: '#ffe14d', thickness: 0.6, opacity: 0.45, height: 0.55, rough: 0.4, behind: true, tilt: -0.8 } },
+      { name: 'Clean line', v: { style: 'line', colour: '#ffffff', thickness: 0.07, opacity: 1, height: 0.5, rough: 0, behind: false, tilt: 0 } },
+    ],
+    p08: [
+      { name: 'Pop', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'softLand' } },
+      { name: 'Soft', v: { inOpacity: 0, inScale: 0.8, outOpacity: 0.7, outScale: 0.9, inEase: 'softLand' } },
+      { name: 'Overshoot', v: { inOpacity: 0, inScale: 0, outOpacity: 0.5, outScale: 0.75, inEase: 'backOut' } },
+      { name: 'Size only', v: { inOpacity: 1, inScale: 0, outOpacity: 1, outScale: 0.75 } },
+      { name: 'Fade only', v: { inOpacity: 0, inScale: 1, outOpacity: 0.5, outScale: 1 } },
+      { name: 'In only', v: { inOpacity: 0, inScale: 0, outOpacity: 1, outScale: 1 } },
+      { name: 'Vanish', v: { inOpacity: 0, inScale: 0.5, outOpacity: 0, outScale: 0 } },
+    ],
+    p09: [
+      { name: 'In + out', v: { inOn: true, midOn: false, outOn: true } },
+      { name: 'In + mid + out', v: { inOn: true, midOn: true, outOn: true } },
+      { name: 'Mid only', v: { inOn: false, midOn: true, outOn: false } },
+      { name: 'Push in', v: { inOn: true, midOn: true, outOn: true, inScale: 0.85, inRotate: -3, midScale: 1.05, outScale: 1.12, outRotate: 2 } },
+      { name: 'Push out', v: { inOn: true, midOn: true, outOn: true, inScale: 1.2, inRotate: 3, midScale: 0.97, outScale: 0.9, outRotate: -2 } },
+      { name: 'Handheld', v: { inOn: false, midOn: true, outOn: false, midScale: 1.02, wiggle: 0.012, wiggleRot: 1.2, wiggleScale: 0.01, wiggleFreq: 0.9 } },
+    ],
+  };
+
+  function fxTargets(d) {
+    const all = pictureTargets();
+    return d && d.textOnly ? all.filter((c) => c.kind === 'text') : all;
+  }
+
+  /** Put the rack's version of `key`'s effect on every target. One undo entry. */
+  function applyFx(key) {
+    const d = FXP[key];
+    const p = state.presetList[key];
+    const clips = fxTargets(d);
+    if (!clips.length) {
+      log(d.textOnly ? 'Select a text card first - a strikethrough follows the card\'s lines.'
+        : 'Select a clip, still, graphic, text card or adjustment layer first.');
+      return 0;
+    }
+    pushUndo();
+    for (const c of clips) {
+      const fx = (c.fx || []).filter((f) => f.preset !== d.tag);
+      const e = FX.create(d.type);
+      e.preset = d.tag;
+      for (const k of Object.keys(e.params)) if (p[k] !== undefined) e.params[k] = p[k];
+      if (Number(p.blur) > 0) e.mblur = { on: true, strength: Number(p.blur), samples: Math.round(p.samples) || 8 };
+      // A move goes before a split, so the band is placed after it; a look goes last.
+      let at = d.geo ? fx.findIndex((f) => f.type === 'split') : -1;
+      if (at < 0) at = fx.length;
+      fx.splice(at, 0, e);
+      c.fx = fx;
+      FX.normalizeClip(c);
+    }
+    markDirty();
+    renderAll();
+    log(FX.DEFS[d.type].label + ' on ' + clips.length + ' clip(s).');
+    return clips.length;
+  }
+
+  // ------------------------------------------------------------ 04 Camera move
+
+  /** Drawing mode - UI only, never saved. */
+  const cam = { drawing: false, drag: null };
+
+  function camClip() { return pictureTargets()[0] || null; }
+  function camEntry(clip) { return clip && (clip.fx || []).find((f) => f.preset === 'camera') || null; }
+  function camTimes(e) { return e && e.keys && e.keys.cx ? e.keys.cx.map((k) => k.t) : []; }
+  const CAM_PROPS = ['cx', 'cy', 'size'];
+
+  /** A rectangle at the playhead: a new key, or the one already there replaced. */
+  function addCamKey(clip, rect) {
+    const len = lenOf(clip);
+    const t = state.playhead - clip.start;
+    if (t < -1e-6 || t > len + 1e-6) { log('Move the playhead over the clip to key its camera.'); return false; }
+    const lt = Math.max(0, Math.min(len, t));
+    const p = state.presetList.p04;
+    pushUndo();
+    let e = camEntry(clip);
+    if (!e) {
+      e = FX.create('camera');
+      e.preset = 'camera';
+      const fx = clip.fx || [];
+      let at = fx.findIndex((f) => f.type === 'split');
+      if (at < 0) at = fx.length;
+      fx.splice(at, 0, e);
+      clip.fx = fx;
+    }
+    if (Number(p.blur) > 0) e.mblur = { on: true, strength: Number(p.blur), samples: Math.round(p.samples) || 8 };
+    e.keys = e.keys || {};
+    for (const k of CAM_PROPS) {
+      const tr = e.keys[k] = e.keys[k] || [];
+      const key = { t: lt, v: rect[k], ease: easeOf(p.ease) };
+      const i = tr.findIndex((q) => Math.abs(q.t - lt) < 1e-3);
+      if (i >= 0) { key.ease = tr[i].ease; tr[i] = key; } else tr.push(key);
+      Anim.sortKeys(tr);
+      e.params[k] = rect[k];
+    }
+    FX.normalizeClip(clip);
+    markDirty();
+    renderAll();
+    return true;
+  }
+
+  function camEdit(fn) {
+    const clip = camClip(), e = camEntry(clip);
+    if (!e) return;
+    pushUndo();
+    fn(e, clip);
+    FX.normalizeClip(clip);
+    markDirty();
+    renderAll();
+  }
+
+  function deleteCamKey(t) {
+    camEdit((e, clip) => {
+      for (const k of CAM_PROPS) if (e.keys && e.keys[k]) e.keys[k] = e.keys[k].filter((q) => Math.abs(q.t - t) >= 1e-3);
+      if (!camTimes(e).length) clip.fx = clip.fx.filter((f) => f !== e);
+    });
+  }
+
+  function setCamEase(t, name) {
+    camEdit((e) => {
+      for (const k of CAM_PROPS) {
+        for (const q of (e.keys && e.keys[k]) || []) if (Math.abs(q.t - t) < 1e-3) q.ease = easeOf(name);
+      }
+    });
+  }
+
+  function setDrawing(on) {
+    on = !!on;
+    if (cam.drawing === on) return;
+    cam.drawing = on;
+    cam.drag = null;
+    FX.setCameraEdit(on);
+    syncCamOverlay();
+    try { drawPreview(); } catch (e) { /* before the viewer exists */ }
+  }
+
+  /** The overlay: every key's rectangle, the one under the playhead bright. DOM only. */
+  function syncCamOverlay() {
+    const ov = document.getElementById('camOverlay');
+    if (!ov) return;
+    if (!cam.drawing || typeof canvas === 'undefined') { ov.hidden = true; return; }
+    ov.hidden = false;
+    const CW = canvas.offsetWidth, CH = canvas.offsetHeight;
+    ov.style.left = canvas.offsetLeft + 'px';
+    ov.style.top = canvas.offsetTop + 'px';
+    ov.style.width = CW + 'px';
+    ov.style.height = CH + 'px';
+    const dpr = window.devicePixelRatio || 1;
+    if (ov.width !== Math.round(CW * dpr) || ov.height !== Math.round(CH * dpr)) {
+      ov.width = Math.round(CW * dpr); ov.height = Math.round(CH * dpr);
+    }
+    const c = ov.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, CW, CH);
+    const box = (r) => {
+      const w = r.size * CW, h = r.size * CH;
+      return [r.cx * CW - w / 2, r.cy * CH - h / 2, w, h];
+    };
+    const clip = camClip(), e = camEntry(clip);
+    const here = clip ? state.playhead - clip.start : -1;
+    if (e) {
+      for (const t of camTimes(e)) {
+        const r = FX.paramsAt(e, t);
+        const on = Math.abs(t - here) < 1e-3;
+        c.setLineDash(on ? [] : [6, 4]);
+        c.lineWidth = on ? 3 : 1.5;
+        c.strokeStyle = on ? '#ffd400' : 'rgba(255,212,0,0.55)';
+        c.strokeRect(...box(r));
+        const b = box(r);
+        c.fillStyle = on ? '#ffd400' : 'rgba(255,212,0,0.7)';
+        c.font = '11px Segoe UI, sans-serif';
+        c.fillText(t.toFixed(2) + 's', b[0] + 4, b[1] + 13);
+      }
+      if (here >= 0 && !camTimes(e).some((t) => Math.abs(t - here) < 1e-3)) {
+        // Where the camera is between keys, so the next rectangle can be drawn against it.
+        c.setLineDash([2, 3]);
+        c.lineWidth = 1.5;
+        c.strokeStyle = '#ffffff';
+        c.strokeRect(...box(FX.paramsAt(e, here)));
+      }
+    }
+    if (cam.drag && cam.drag.rect) {
+      c.setLineDash([]);
+      c.lineWidth = 3;
+      c.strokeStyle = '#ffd400';
+      c.fillStyle = 'rgba(255,212,0,0.12)';
+      const b = box(cam.drag.rect);
+      c.fillRect(...b);
+      c.strokeRect(...b);
+    }
+  }
+
+  /** Drag out a rectangle locked to the frame's aspect, from the corner pressed. */
+  function wireCamOverlay() {
+    const ov = document.getElementById('camOverlay');
+    if (!ov) return;
+    const at = (ev) => {
+      const r = ov.getBoundingClientRect();
+      return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height };
+    };
+    ov.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      if (!camClip()) { log('Select the clip to key first.'); return; }
+      ov.setPointerCapture(ev.pointerId);
+      cam.drag = { a: at(ev), rect: null };
+    });
+    ov.addEventListener('pointermove', (ev) => {
+      if (!cam.drag) return;
+      const a = cam.drag.a, b = at(ev);
+      // One size for both axes, as fractions of the frame: the rectangle keeps the frame's
+      // shape, so filling the frame with it never stretches the picture.
+      const size = Math.min(2, Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y)));
+      const sx = b.x >= a.x ? 1 : -1, sy = b.y >= a.y ? 1 : -1;
+      cam.drag.rect = { cx: a.x + sx * size / 2, cy: a.y + sy * size / 2, size };
+      syncCamOverlay();
+    });
+    ov.addEventListener('pointerup', (ev) => {
+      ev.stopPropagation();
+      const d = cam.drag;
+      cam.drag = null;
+      const clip = camClip();
+      if (d && d.rect && d.rect.size > 0.03 && clip && addCamKey(clip, d.rect)) {
+        log('Camera key at ' + (state.playhead - clip.start).toFixed(2) + 's into the clip.');
+      }
+      syncCamOverlay();
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireCamOverlay);
+  else wireCamOverlay();
+
+  function p04Body(box) {
+    const el = TextUI.el;
+    const p = state.presetList.p04;
+    const clip = camClip(), e = camEntry(clip);
+    const C = (spec) => TextUI.control(spec, p, TABLES.p04, settingHooks());
+    const top = box.querySelector('.pl-top');
+    top.appendChild(el('div', 'tc-hint cap-status', !clip ? 'Select a clip on the timeline.'
+      : (e ? camTimes(e).length + ' camera key(s) on ' : 'No camera keys yet on ') + (clip.name || 'this clip') + '.'));
+    const bar = el('div', 'tc-btns cap-bar');
+    const drawBtn = el('button', 'mini' + (cam.drawing ? ' on' : ' primary'), cam.drawing ? 'Done drawing' : 'Draw rectangle');
+    drawBtn.title = 'Drag a yellow rectangle on the viewer: that part of the picture fills the ' +
+      'frame at the playhead. Move the playhead and draw another - the camera moves between them.';
+    drawBtn.disabled = !clip;
+    drawBtn.addEventListener('click', () => { setDrawing(!cam.drawing); renderPanel(); });
+    const fullBtn = el('button', 'mini', 'Full frame here');
+    fullBtn.title = 'A key at the playhead showing the whole frame - to start from, or come back to.';
+    fullBtn.disabled = !clip;
+    fullBtn.addEventListener('click', () => { if (clip) addCamKey(clip, { cx: 0.5, cy: 0.5, size: 1 }); });
+    const holdBtn = el('button', 'mini', 'Hold here');
+    holdBtn.title = 'A key at the playhead that keeps the camera where it is right now - holds between two moves.';
+    holdBtn.disabled = !e;
+    holdBtn.addEventListener('click', () => { if (e) addCamKey(clip, FX.paramsAt(e, state.playhead - clip.start)); });
+    const rmBtn = el('button', 'mini', 'Remove camera');
+    rmBtn.disabled = !e;
+    rmBtn.addEventListener('click', () => removeTagged(['camera'], 'camera move'));
+    for (const b of [drawBtn, fullBtn, holdBtn, rmBtn]) bar.appendChild(b);
+    top.appendChild(bar);
+
+    const body = el('div', 'pl-body');
+    box.appendChild(body);
+    body.appendChild(el('div', 'tc-hint', 'CAM_rect - draw a rectangle at one moment, another ' +
+      'at a later one, and the camera travels from the first to the second along the curve. ' +
+      'Add as many as you like on one clip: every pair is its own move, and two keys with the ' +
+      'same rectangle hold. While drawing, the viewer shows the whole frame; press Done to see the move.'));
+    body.appendChild(C({ path: 'ease', label: 'Curve for new keys', type: 'select', options: Anim.EASING_MENU }));
+    body.appendChild(C({ path: 'blur', label: 'Motion blur', type: 'range', min: 0, max: 4, step: 0.05, digits: 2 }));
+    body.appendChild(C({ path: 'samples', label: 'Blur samples', type: 'range', min: 2, max: 32, step: 1, digits: 0 }));
+    if (!e) return;
+    body.appendChild(el('div', 'tc-hint', 'Keys - the curve on a key is the move to the NEXT one.'));
+    const times = camTimes(e);
+    times.forEach((t, i) => {
+      const row = el('div', 'tc-row');
+      const r = FX.paramsAt(e, t);
+      row.appendChild(el('label', 'tc-label', t.toFixed(2) + 's  ·  ' + Math.round(100 / r.size) + '%'));
+      const go = el('button', 'mini', 'Go');
+      go.title = 'Put the playhead on this key';
+      go.addEventListener('click', () => { seek(clip.start + t); renderPanel(); });
+      row.appendChild(go);
+      const sel = el('select');
+      for (const o of Anim.EASING_MENU) {
+        const op = el('option'); op.value = o.value; op.textContent = o.label; sel.appendChild(op);
+      }
+      const k = e.keys.cx.find((q) => Math.abs(q.t - t) < 1e-3);
+      sel.value = Anim.easingName(k && k.ease) || 'linear';
+      sel.disabled = i === times.length - 1;
+      sel.title = sel.disabled ? 'The last key has no move after it' : 'The curve of the move to the next key';
+      sel.addEventListener('change', () => setCamEase(t, sel.value));
+      row.appendChild(sel);
+      const del = el('button', 'mini', 'Delete');
+      del.addEventListener('click', () => deleteCamKey(t));
+      row.appendChild(del);
+      body.appendChild(row);
+    });
+  }
+
+  /** 05-09: the effect's own schema, the looks, the shutter. */
+  function fxBody(box, key) {
+    const el = TextUI.el;
+    const d = FXP[key];
+    const p = state.presetList[key];
+    const n = fxTargets(d).length;
+    const top = box.querySelector('.pl-top');
+    top.appendChild(el('div', 'tc-hint cap-status', n ? n + ' clip(s) selected.'
+      : d.textOnly ? 'Select a text card on the timeline.'
+        : 'Select a clip, still, graphic, text card or adjustment layer on the timeline.'));
+    const bar = el('div', 'tc-btns cap-bar');
+    const apply = el('button', 'mini primary', 'Apply');
+    apply.title = 'Put this on the selected clips - one undo entry. Applying again replaces it.';
+    apply.disabled = !n;
+    apply.addEventListener('click', () => applyFx(key));
+    const rm = el('button', 'mini', 'Remove');
+    rm.disabled = !n;
+    rm.addEventListener('click', () => removeTagged([d.tag], FX.DEFS[d.type].label));
+    bar.appendChild(apply); bar.appendChild(rm);
+    top.appendChild(bar);
+
+    if (LOOKS[key]) {
+      const looks = el('div', 'pl-tabs');
+      for (const lk of LOOKS[key]) {
+        const on = Object.keys(lk.v).every((k) => p[k] === lk.v[k]);
+        const b = el('button', 'mini' + (on ? ' on' : ''), lk.name);
+        b.title = 'Load these values - then Apply';
+        b.addEventListener('click', () => { Object.assign(p, lk.v); renderPanel(); });
+        looks.appendChild(b);
+      }
+      box.appendChild(looks);
+    }
+    const body = el('div', 'pl-body');
+    box.appendChild(body);
+    body.appendChild(el('div', 'tc-hint', HINTS[key]));
+    const hooks = settingHooks();
+    for (const spec of FX.DEFS[d.type].schema) {
+      const s = Object.assign({}, spec, { path: spec.path.replace(/^params\./, '') });
+      body.appendChild(TextUI.control(s, p, TABLES[key], hooks));
+    }
+    body.appendChild(TextUI.control({ path: 'blur', label: 'Motion blur', type: 'range', min: 0, max: 4, step: 0.05, digits: 2 }, p, TABLES[key], hooks));
+    body.appendChild(TextUI.control({ path: 'samples', label: 'Blur samples', type: 'range', min: 2, max: 32, step: 1, digits: 0 }, p, TABLES[key], hooks));
+    body.appendChild(el('div', 'tc-hint', 'What lands on the clip is its ' + FX.DEFS[d.type].label +
+      ' effect - every value stays editable, and keyframable, in the clip\'s Effects (text cards: from here).'));
+  }
+
+  const HINTS = {
+    p05: 'SHN_sweep - a band of light crosses the picture, only where the picture is: it follows ' +
+      'a logo\'s or a card\'s letters. Repeat it for a product-shot gleam.',
+    p06: 'GLW_in-out - a glow blooms up at the start, holds (optionally breathing) and dies away at the end.',
+    p07: 'STR_through - strikes the card\'s lines left to right, one after another. Text cards only.',
+    p08: 'EMP_pop - opacity and size come up from the in values at the start, and settle to the ' +
+      'out values at the end. The looks above only vary those four numbers and the curve.',
+    p09: 'MOT_live - a push with a little rotation in, a slow drift that keeps wiggling in the ' +
+      'middle, and a push out. Switch any phase off, or pick a look above.',
+  };
+
   // ------------------------------------------------------------------ panel
 
   /** Which of 01's six sections is showing. UI only - not saved, not undone. */
@@ -843,7 +1225,11 @@ const PresetList = (() => {
       b.appendChild(el('span', 'pl-num', it.id));
       b.appendChild(el('span', null, it.name));
       if (it.family) b.appendChild(el('span', 'tc-hint', it.family));
-      b.addEventListener('click', () => { state.presetList.open = it.id; renderPanel(); });
+      b.addEventListener('click', () => {
+        state.presetList.open = it.id;
+        if (it.id !== '04') setDrawing(false);
+        renderPanel();
+      });
       list.appendChild(b);
     }
     host.appendChild(list);
@@ -854,8 +1240,11 @@ const PresetList = (() => {
     main.appendChild(top);
     if (cur.id === '01') p01Body(main);
     else if (cur.id === '02') p02Body(main);
-    else p03Body(main);
+    else if (cur.id === '03') p03Body(main);
+    else if (cur.id === '04') p04Body(main);
+    else fxBody(main, cur.key);
     host.appendChild(main);
+    syncCamOverlay();
   }
 
   // ----------------------------------------------------------------- window
@@ -883,6 +1272,7 @@ const PresetList = (() => {
     const d = document.getElementById('presetDrawer');
     const hide = show == null ? !d.hidden : !show;
     d.hidden = hide;
+    if (hide) setDrawing(false);
     document.getElementById('btnPresetListCollapse').classList.toggle('on', !hide);
     if (!hide) {
       let pos = null;
@@ -939,6 +1329,7 @@ const PresetList = (() => {
     LIST, P01, P02, P03, defaults, normalize, captionSettings,
     applyP01, generateP01, roleCard, addRoleTag,
     pushEntry, applyPush, splitEntries, applySplit, removeTagged,
+    applyFx, addCamKey, deleteCamKey, setDrawing, syncCamOverlay, LOOKS, FXP,
     renderPanel, renderGuides, toggle,
   };
 })();

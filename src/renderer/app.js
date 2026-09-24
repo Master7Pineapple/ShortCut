@@ -2111,6 +2111,7 @@ function renderRangeOverlay() {
 function renderPlayhead() {
   $('#playhead').style.left = (state.playhead * state.pxPerSec) + 'px';
   $('#timecode').textContent = fmtTc(state.playhead) + ' / ' + fmtTc(projectDuration());
+  PresetList.syncCamOverlay();
   // Only when something is animated: the framing panel is otherwise a constant, and this
   // runs every frame of playback.
   try {
@@ -3780,9 +3781,10 @@ function clipFxPanel(clip) {
     o.value = type;
     const need = FX.DEFS[type].needs;
     o.disabled = (need === 'mouse' && !clipHasTake(clip)) ||
-      (need === 'mask' && !Matte.hasMasks(fxMaskClip(clip)));
+      (need === 'mask' && !Matte.hasMasks(fxMaskClip(clip))) ||
+      (need === 'text' && clip.kind !== 'text');
     o.textContent = FX.DEFS[type].label +
-      (o.disabled ? (need === 'mask'
+      (o.disabled ? (need === 'text' ? '  - text cards only (Presets 07)' : need === 'mask'
         ? (isAdjustClip(clip) ? '  - needs a matte on a clip below' : '  - needs an imported matte')
         : '  - needs a mouse take') : '');
     add.appendChild(o);
@@ -6038,8 +6040,16 @@ function drawPreview() {
   }
 
   const cctx = cache.getContext('2d');
-  const painted = compositeLayers(cctx, P.w, P.h, layers, state.playhead,
-    (c) => layerFor(c, P), 1 / state.out.fps);
+  // The viewer, and only the viewer: the camera move's drawing mode shows the uncropped
+  // frame here and nowhere else - see `FX.setViewer()`.
+  FX.setViewer(true);
+  let painted;
+  try {
+    painted = compositeLayers(cctx, P.w, P.h, layers, state.playhead,
+      (c) => layerFor(c, P), 1 / state.out.fps);
+  } finally {
+    FX.setViewer(false);
+  }
 
   // Nothing in the whole stack has a frame yet (every element mid-seek, on the very first
   // paint after an import). Leave the canvas exactly as it was rather than flash black.
