@@ -6,12 +6,14 @@
  * Those store ONE card's look. A PresetList entry is a whole pass - a family of related
  * moves with its own parameters - and it produces its result through the engines the
  * app already has: captions through `Captions.phraseCard()` and `generateCaptions()`,
- * cards through `TextDraw`. Nothing here draws a pixel of its own, so preview and export
- * agree for the same reason they always do.
+ * cards through `TextDraw`, pushes and split screens as ordinary `FX` entries on the
+ * selected clips. Nothing here draws a pixel of its own, so preview and export agree for
+ * the same reason they always do.
  *
  * Parameters live on `state.presetList.p01` (etc.) and go in the .scut. They are
  * SETTINGS, like the Captions panel's: moving one snapshots no undo entry and dirties
- * nothing. Only Generate and Add role tag touch the timeline, and each is one undo entry.
+ * nothing. Only the buttons that touch the timeline (Generate, Add role tag, a push, a
+ * split, and their Remove) take an undo entry, one each.
  *
  * Loaded before app.js (its state initialiser calls `PresetList.defaults()`), so every
  * app.js global used below is looked up at call time, never at load time.
@@ -20,22 +22,11 @@ const PresetList = (() => {
 
   // ------------------------------------------------------------------ the list
 
-  /** The rack, in build order. Only entries with `ready` have been built. */
+  /** The rack, in build order. */
   const LIST = [
-    { id: '01', key: 'p01', name: 'Caption engine', family: 'CAP_', ready: true },
-    { id: '02', name: 'Cards & titles', family: 'TTL_' },
-    { id: '03', name: 'Annotation', family: 'CALL_' },
-    { id: '04', name: 'Scale & zoom', family: 'ZM_' },
-    { id: '05', name: 'Transitions', family: 'TRN_' },
-    { id: '06', name: 'Depth & masks', family: 'MSK_' },
-    { id: '07', name: 'Screen kit', family: 'SCR_' },
-    { id: '08', name: 'Proof graphics', family: 'DAT_' },
-    { id: '09', name: 'Color', family: 'CLR_' },
-    { id: '10', name: 'Sound', family: 'SFX_' },
-    { id: '11', name: 'Furniture', family: 'FUR_' },
-    { id: '12', name: 'Pacing grid', family: '' },
-    { id: '13', name: 'Type & palette', family: '' },
-    { id: '14', name: 'Format packs', family: '' },
+    { id: '01', key: 'p01', name: 'Caption engine', family: 'CAP_' },
+    { id: '02', key: 'p02', name: 'Push in / out', family: 'ZM_' },
+    { id: '03', key: 'p03', name: 'Split screen', family: 'SPL_' },
   ];
 
   const F = (n) => n / 30;   // the rack's frame counts are at 30 fps
@@ -113,8 +104,50 @@ const PresetList = (() => {
     guideOpacity: 0.25,
   };
 
+  // --------------------------------------------------------- 02 Push in / out
+
+  /**
+   * Preset 02's parameters. Three speeds, each with its own amount, length, curve and
+   * shutter; the focus point and where the move starts are shared. `amount` is how much
+   * bigger the picture ends up (0.15 = 115%). Slow has no length: it runs the whole clip.
+   */
+  const P02 = {
+    speed: 'fast',
+    fastAmount: 0.18,
+    fastDur: F(6),
+    fastEase: 'easeOutExpo',
+    fastBlur: 1.2,            // shutter strength - the whip is what sells a fast punch
+    fastSamples: 12,
+    medAmount: 0.12,
+    medDur: F(18),
+    medEase: 'easeInOut',
+    medBlur: 0.6,
+    medSamples: 8,
+    slowAmount: 0.1,
+    slowEase: 'linear',
+    anchorX: 0.5,             // the point the picture grows about, fractions of the frame
+    anchorY: 0.5,
+    at: 'start',              // 'start' | 'playhead' | 'end' - where a fast/medium move sits
+  };
+
+  // --------------------------------------------------------- 03 Split screen
+
+  /** Preset 03's parameters - the `split` effect's, plus an optional soft seam. */
+  const P03 = {
+    side: 'top',
+    size: 0.5,
+    focus: 0.5,
+    zoom: 1,
+    distance: 0,
+    seam: 0,                  // > 0 adds a `edgefade` on the band's inner edge
+  };
+
+  const TABLES = { p01: P01, p02: P02, p03: P03 };
+
   function defaults() {
-    return { open: '01', p01: Object.assign({}, P01) };
+    const out = { open: '01' };
+    for (const k of Object.keys(TABLES)) out[k] = Object.assign({}, TABLES[k]);
+    return out;
   }
 
   /** A saved PresetList, filled in and trimmed to what this build knows. */
@@ -122,9 +155,10 @@ const PresetList = (() => {
     const out = defaults();
     if (!d || typeof d !== 'object') return out;
     if (typeof d.open === 'string' && LIST.some((x) => x.id === d.open)) out.open = d.open;
-    if (d.p01 && typeof d.p01 === 'object') {
-      for (const k of Object.keys(P01)) {
-        if (d.p01[k] !== undefined && typeof d.p01[k] === typeof P01[k]) out.p01[k] = d.p01[k];
+    for (const [key, T] of Object.entries(TABLES)) {
+      if (!d[key] || typeof d[key] !== 'object') continue;
+      for (const k of Object.keys(T)) {
+        if (d[key][k] !== undefined && typeof d[key][k] === typeof T[k]) out[key][k] = d[key][k];
       }
     }
     return out;
@@ -331,6 +365,138 @@ const PresetList = (() => {
     rail.style.bottom = pc(p.guideBottom);
   }
 
+  // ------------------------------------------------------ 02 / 03 on the timeline
+  //
+  // Both write ORDINARY effects onto the selected clips - a keyed `transform` for a push, a
+  // `split` (and optionally an `edgefade`) for a split screen - so everything they make is
+  // then editable in the clip's own Effects panel: the keys, the curve on each key, the
+  // shutter. Each entry is tagged with `preset` so applying again REPLACES what the last
+  // apply made instead of stacking a second push on top of the first.
+
+  /** Clips a picture preset can go on: anything that paints, and adjustment layers. */
+  const PICTURE_KINDS = new Set(['video', 'image', 'graphic', 'adjust', 'text']);
+
+  function pictureTargets() {
+    return selectedClips().map((x) => x.clip).filter((c) => PICTURE_KINDS.has(c.kind));
+  }
+
+  function lenOf(c) {
+    try { return Math.max(0.001, clipLen(c)); } catch (e) { return Math.max(0.001, c.out - c.in); }
+  }
+
+  const easeOf = (name) => JSON.parse(JSON.stringify(
+    Anim.EASING_PRESETS[name] || Anim.EASING_PRESETS.linear));
+
+  /**
+   * The push as a `transform` entry for one clip. Pure: builds the entry, touches nothing.
+   * `dir` is 'in' (1 -> 1 + amount) or 'out' (1 + amount -> 1); the curve is on the first
+   * key, because easing belongs to the key on the LEFT of a span.
+   */
+  function pushEntry(p, clip, dir, speed, playhead) {
+    const len = lenOf(clip);
+    const pre = speed === 'fast' ? 'fast' : speed === 'medium' ? 'med' : 'slow';
+    const amount = Math.max(0, Number(p[pre + 'Amount']) || 0);
+    let t0 = 0, dur = len;
+    if (speed !== 'slow') {
+      dur = Math.min(len, Math.max(F(1), Number(p[pre + 'Dur']) || F(6)));
+      if (p.at === 'end') t0 = len - dur;
+      else if (p.at === 'playhead') t0 = Math.max(0, Math.min(len - dur, playhead - clip.start));
+    }
+    const a = dir === 'out' ? 1 + amount : 1, b = dir === 'out' ? 1 : 1 + amount;
+    const e = FX.create('transform');
+    e.preset = 'push';
+    e.params.anchorX = p.anchorX;
+    e.params.anchorY = p.anchorY;
+    e.params.scale = a;
+    e.keys = { scale: [
+      { t: t0, v: a, ease: easeOf(p[pre + 'Ease']) },
+      { t: t0 + dur, v: b, ease: easeOf('linear') },
+    ] };
+    if (speed !== 'slow' && Number(p[pre + 'Blur']) > 0) {
+      e.mblur = { on: true, strength: Number(p[pre + 'Blur']), samples: Math.round(p[pre + 'Samples']) || 8 };
+    }
+    return e;
+  }
+
+  const isTagged = (tag) => (f) => f && f.preset === tag;
+
+  /** Push in or out on every selected picture clip. One undo entry. */
+  function applyPush(dir, speed) {
+    const p = state.presetList.p02;
+    speed = speed || p.speed;
+    const clips = pictureTargets();
+    if (!clips.length) { log('Select a clip, still, text card or adjustment layer first.'); return 0; }
+    pushUndo();
+    for (const c of clips) {
+      const fx = (c.fx || []).filter((f) => !isTagged('push')(f));
+      // Before a split: the push zooms the picture, then the split places it in its band.
+      let at = fx.findIndex((f) => f.type === 'split');
+      if (at < 0) at = fx.length;
+      fx.splice(at, 0, pushEntry(p, c, dir, speed, state.playhead));
+      c.fx = fx;
+      FX.normalizeClip(c);
+    }
+    markDirty();
+    renderAll();
+    log((speed === 'medium' ? 'Medium' : speed === 'slow' ? 'Slow' : 'Fast') + ' push ' + dir +
+      ' on ' + clips.length + ' clip(s).');
+    return clips.length;
+  }
+
+  /** Take off whatever a preset tagged `tag` put on the selection. One undo entry. */
+  function removeTagged(tags, what) {
+    const clips = pictureTargets().filter((c) => (c.fx || []).some((f) => tags.includes(f.preset)));
+    if (!clips.length) { log('Nothing to remove - no ' + what + ' on the selection.'); return 0; }
+    pushUndo();
+    for (const c of clips) {
+      c.fx = c.fx.filter((f) => !tags.includes(f.preset));
+      FX.normalizeClip(c);
+    }
+    markDirty();
+    renderAll();
+    log('Removed the ' + what + ' from ' + clips.length + ' clip(s).');
+    return clips.length;
+  }
+
+  /** The split's entries for one set of parameters: the band, and the seam if asked for. */
+  function splitEntries(p, side) {
+    const s = FX.create('split');
+    s.preset = 'split';
+    Object.assign(s.params, {
+      side, size: p.size, focus: p.focus, zoom: p.zoom, distance: p.distance,
+    });
+    const out = [s];
+    if (p.seam > 0) {
+      // The band's inner edge, measured from the frame edge the fade is named after.
+      const f = FX.create('edgefade');
+      f.preset = 'split';
+      const inner = 0.5 + p.distance;
+      Object.assign(f.params, {
+        side: side === 'top' ? 'bottom' : 'top',
+        start: Math.max(0, Math.min(1, inner)), length: p.seam, amount: 1, ease: 'easeInOut',
+      });
+      out.push(f);
+    }
+    return out;
+  }
+
+  /** Move every selected picture clip into the top or bottom half. One undo entry. */
+  function applySplit(side) {
+    const p = state.presetList.p03;
+    side = side || p.side;
+    const clips = pictureTargets();
+    if (!clips.length) { log('Select a clip or still first.'); return 0; }
+    pushUndo();
+    for (const c of clips) {
+      c.fx = (c.fx || []).filter((f) => !isTagged('split')(f)).concat(splitEntries(p, side));
+      FX.normalizeClip(c);
+    }
+    markDirty();
+    renderAll();
+    log('Split screen: ' + clips.length + ' clip(s) moved to the ' + side + ' half.');
+    return clips.length;
+  }
+
   // ------------------------------------------------------------------ panel
 
   /** Which of 01's six sections is showing. UI only - not saved, not undone. */
@@ -507,6 +673,126 @@ const PresetList = (() => {
     paint();
   }
 
+  /** The shared head of 02 and 03: what is selected, and the action buttons. */
+  function actionBar(box, buttons) {
+    const el = TextUI.el;
+    const status = el('div', 'tc-hint cap-status');
+    const n = pictureTargets().length;
+    status.textContent = n ? n + ' clip(s) selected.'
+      : 'Select a clip, still, text card or adjustment layer on the timeline.';
+    const bar = el('div', 'tc-btns cap-bar');
+    for (const b of buttons) {
+      const btn = el('button', 'mini' + (b.primary ? ' primary' : ''), b.label);
+      btn.title = b.title;
+      btn.disabled = !n;
+      btn.addEventListener('click', b.run);
+      bar.appendChild(btn);
+    }
+    const top = box.querySelector('.pl-top');
+    top.appendChild(status);
+    top.appendChild(bar);
+  }
+
+  /** Settings hooks: a preset parameter is a setting - no undo entry, nothing dirtied. */
+  const settingHooks = () => ({
+    onEdit: () => {}, onEditEnd: () => {}, onChanged: () => {}, rebuild: () => renderPanel(),
+  });
+
+  function p02Body(box) {
+    const el = TextUI.el;
+    const p = state.presetList.p02;
+    const C = (spec) => TextUI.control(spec, p, P02, settingHooks());
+    const R = (path, label, min, max, step, digits, unit) =>
+      C({ path, label, type: 'range', min, max, step, digits, unit });
+    const NAME = { fast: 'Fast', medium: 'Medium', slow: 'Slow' };
+    actionBar(box, [
+      { label: NAME[p.speed] + ' push in', primary: true, run: () => applyPush('in'),
+        title: 'Zoom the selected clips in - one undo entry. Applying again replaces the last push.' },
+      { label: NAME[p.speed] + ' push out', run: () => applyPush('out'),
+        title: 'The same move reversed: starts pushed in and pulls back to the full frame.' },
+      { label: 'Remove push', run: () => removeTagged(['push'], 'push'),
+        title: 'Take the push off the selected clips - one undo entry.' },
+    ]);
+
+    const tabs = el('div', 'pl-tabs');
+    const body = el('div', 'pl-body');
+    box.appendChild(tabs);
+    box.appendChild(body);
+    for (const k of ['fast', 'medium', 'slow']) {
+      const b = el('button', 'mini' + (p.speed === k ? ' on' : ''), NAME[k]);
+      b.addEventListener('click', () => { p.speed = k; renderPanel(); });
+      tabs.appendChild(b);
+    }
+    const curves = Anim.EASING_MENU;
+    if (p.speed === 'fast') {
+      body.appendChild(el('div', 'tc-hint', 'ZM_punch-fast - a whip into the subject in a ' +
+        'handful of frames, smeared by the shutter. Lands on a beat, a word, a click.'));
+      body.appendChild(R('fastAmount', 'Amount', 0.02, 1, 0.01, 2));
+      body.appendChild(R('fastDur', 'Over', F(2), F(20), F(1) / 2, 3, 's'));
+      body.appendChild(C({ path: 'fastEase', label: 'Curve', type: 'select', options: curves }));
+      body.appendChild(R('fastBlur', 'Motion blur', 0, 4, 0.05, 2));
+      body.appendChild(R('fastSamples', 'Blur samples', 2, 32, 1, 0));
+    } else if (p.speed === 'medium') {
+      body.appendChild(el('div', 'tc-hint', 'ZM_push-medium - a deliberate push over about ' +
+        'half a second, with a lighter shutter. Emphasis without the jolt.'));
+      body.appendChild(R('medAmount', 'Amount', 0.02, 1, 0.01, 2));
+      body.appendChild(R('medDur', 'Over', F(6), F(60), F(1) / 2, 3, 's'));
+      body.appendChild(C({ path: 'medEase', label: 'Curve', type: 'select', options: curves }));
+      body.appendChild(R('medBlur', 'Motion blur', 0, 4, 0.05, 2));
+      body.appendChild(R('medSamples', 'Blur samples', 2, 32, 1, 0));
+    } else {
+      body.appendChild(el('div', 'tc-hint', 'ZM_creep-slow - the picture creeps in from the ' +
+        'first frame of the clip to the last. Keeps a static shot alive. No shutter: it ' +
+        'moves too slowly to smear.'));
+      body.appendChild(R('slowAmount', 'Amount', 0.01, 0.6, 0.01, 2));
+      body.appendChild(C({ path: 'slowEase', label: 'Curve', type: 'select', options: curves }));
+    }
+    body.appendChild(el('div', 'tc-hint', 'Shared by all three'));
+    body.appendChild(R('anchorX', 'Focus X', 0, 1, 0.01, 2));
+    body.appendChild(R('anchorY', 'Focus Y', 0, 1, 0.01, 2));
+    if (p.speed !== 'slow') {
+      body.appendChild(C({
+        path: 'at', label: 'Move sits at', type: 'buttons', options: [
+          { value: 'start', label: 'Clip start' },
+          { value: 'playhead', label: 'Playhead' },
+          { value: 'end', label: 'Clip end' },
+        ],
+      }));
+    }
+    body.appendChild(el('div', 'tc-hint', 'What lands on each clip is an ordinary Transform ' +
+      'effect with two Scale keys - open it in the clip\'s Effects to move the keys or change ' +
+      'the curve per key. On a text card it is managed from here.'));
+  }
+
+  function p03Body(box) {
+    const el = TextUI.el;
+    const p = state.presetList.p03;
+    const C = (spec) => TextUI.control(spec, p, P03, settingHooks());
+    const R = (path, label, min, max, step, digits, unit) =>
+      C({ path, label, type: 'range', min, max, step, digits, unit });
+    actionBar(box, [
+      { label: 'Move to top', primary: true, run: () => applySplit('top'),
+        title: 'Put the selected clips in the top half - one undo entry.' },
+      { label: 'Move to bottom', run: () => applySplit('bottom'),
+        title: 'Put the selected clips in the bottom half - one undo entry.' },
+      { label: 'Remove split', run: () => removeTagged(['split'], 'split screen'),
+        title: 'Back to the full frame - one undo entry.' },
+    ]);
+    const body = el('div', 'pl-body');
+    box.appendChild(body);
+    body.appendChild(el('div', 'tc-hint', 'SPL_half - moves the selected clip into one half ' +
+      'of the frame and leaves the other half empty (black). Fill it by putting a clip or ' +
+      'still on a track BELOW this one and moving that to the other half. Applying again ' +
+      'replaces the last split; every value stays editable as the clip\'s Split screen effect.'));
+    body.appendChild(R('size', 'Band height', 0.1, 1, 0.005, 3));
+    body.appendChild(R('focus', 'Crop centre', 0, 1, 0.005, 3));
+    body.appendChild(R('zoom', 'Zoom in band', 0.5, 4, 0.01, 2));
+    body.appendChild(R('distance', 'Distance from centre', -0.5, 0.5, 0.002, 3));
+    body.appendChild(R('seam', 'Soft seam', 0, 0.3, 0.002, 3));
+    body.appendChild(el('div', 'tc-hint', 'Soft seam adds a Fade on the inner edge, so the ' +
+      'two halves blend instead of meeting on a hard line.'));
+  }
+
   function renderPanel() {
     const host = document.getElementById('presetListPanel');
     if (!host) return;
@@ -524,7 +810,6 @@ const PresetList = (() => {
       b.appendChild(el('span', 'pl-num', it.id));
       b.appendChild(el('span', null, it.name));
       if (it.family) b.appendChild(el('span', 'tc-hint', it.family));
-      if (!it.ready) { b.disabled = true; b.title = 'Not built yet'; }
       b.addEventListener('click', () => { state.presetList.open = it.id; renderPanel(); });
       list.appendChild(b);
     }
@@ -535,7 +820,8 @@ const PresetList = (() => {
     top.appendChild(el('h3', null, cur.id + '  ' + cur.name));
     main.appendChild(top);
     if (cur.id === '01') p01Body(main);
-    else main.appendChild(el('div', 'pl-empty', 'Not built yet.'));
+    else if (cur.id === '02') p02Body(main);
+    else p03Body(main);
     host.appendChild(main);
   }
 
@@ -617,8 +903,9 @@ const PresetList = (() => {
   else wireWindow();
 
   return {
-    LIST, P01, defaults, normalize, captionSettings,
+    LIST, P01, P02, P03, defaults, normalize, captionSettings,
     applyP01, generateP01, roleCard, addRoleTag,
+    pushEntry, applyPush, splitEntries, applySplit, removeTagged,
     renderPanel, renderGuides, toggle,
   };
 })();

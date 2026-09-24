@@ -702,6 +702,97 @@
       },
     },
 
+    /*
+     * SPLIT SCREEN: the picture moved into one half of the frame, the other half left
+     * transparent for whatever the tracks below it hold (black over a gap).
+     *
+     * A horizontal strip of the picture is cut out - `focus` says which part of it, as the
+     * strip's centre in frame fractions - and drawn into a band `size` of the frame tall,
+     * sitting against the centre line and pushed `distance` away from it towards its own
+     * edge. `zoom` scales the picture inside the band about the strip's centre, so a
+     * tighter crop does not need the clip's framing touched. Everything is a fraction of
+     * the frame (the unit rule), and outside the band the layer is CLEARED, not painted
+     * black: the second half of a split is the track underneath, which is the point.
+     */
+    split: {
+      label: 'Split screen',
+      params: { side: 'top', size: 0.5, focus: 0.5, zoom: 1, distance: 0 },
+      schema: [
+        { path: 'params.side', label: 'Picture goes', type: 'select',
+          options: [{ value: 'top', label: 'Top half' }, { value: 'bottom', label: 'Bottom half' }] },
+        { path: 'params.size', label: 'Band height', type: 'range', min: 0.1, max: 1, step: 0.005, digits: 3 },
+        { path: 'params.focus', label: 'Crop centre', type: 'range', min: 0, max: 1, step: 0.005, digits: 3 },
+        { path: 'params.zoom', label: 'Zoom in band', type: 'range', min: 0.5, max: 4, step: 0.01, digits: 2 },
+        { path: 'params.distance', label: 'Distance from centre', type: 'range', min: -0.5, max: 0.5, step: 0.002, digits: 3 },
+      ],
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const r = splitRect(p, W, H);
+        const src = take(L, 'fxA');
+        if (!(r.h > 0.5)) return;
+        L.c.save();
+        L.c.beginPath();
+        L.c.rect(0, r.y, W, r.h);
+        L.c.clip();
+        L.c.drawImage(src, r.sx, r.sy, r.sw, r.sh, 0, r.y, W, r.h);
+        L.c.restore();
+      },
+    },
+
+    /*
+     * FADE: one side of the picture fades to transparent, so whatever is underneath - the
+     * background, or a clip it overlaps - shows through and the two fuse.
+     *
+     * `start` is how far in from that edge the picture is fully faded (as a fraction of the
+     * frame along that axis), `length` how long the ramp back to fully opaque is, and
+     * `amount` how transparent the faded part gets. The ramp follows an easing curve, so a
+     * seam can be linear, or eased so there is no visible line where the fade starts.
+     * It multiplies the layer's alpha (`destination-in`), so it hugs whatever the stack
+     * above has already cut - a split band, a rounded card - rather than the frame.
+     */
+    edgefade: {
+      label: 'Fade',
+      params: { side: 'bottom', start: 0, length: 0.25, amount: 1, ease: 'easeInOut' },
+      schema: [
+        { path: 'params.side', label: 'Fade out the', type: 'select', options: [
+          { value: 'bottom', label: 'Bottom' }, { value: 'top', label: 'Top' },
+          { value: 'left', label: 'Left' }, { value: 'right', label: 'Right' },
+        ] },
+        { path: 'params.start', label: 'Fully faded to', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
+        { path: 'params.length', label: 'Fade length', type: 'range', min: 0, max: 1, step: 0.002, digits: 3 },
+        { path: 'params.amount', label: 'Amount', type: 'range', min: 0, max: 1, step: 0.01, digits: 2 },
+        { path: 'params.ease', label: 'Curve', type: 'select', options: EASE_OPTIONS },
+      ],
+      draw(L, p) {
+        const W = L.W, H = L.H;
+        const amount = clamp(p.amount, 0, 1);
+        if (!(amount > 0)) return;
+        const side = String(p.side || 'bottom');
+        const across = side === 'left' || side === 'right';
+        const span = across ? W : H;
+        const s = clamp(p.start, 0, 1) * span;
+        const len = Math.max(0.5, clamp(p.length, 0, 1) * span);
+        // The gradient runs FROM the faded edge inwards.
+        let g;
+        if (side === 'top') g = L.c.createLinearGradient(0, s, 0, s + len);
+        else if (side === 'bottom') g = L.c.createLinearGradient(0, H - s, 0, H - s - len);
+        else if (side === 'left') g = L.c.createLinearGradient(s, 0, s + len, 0);
+        else g = L.c.createLinearGradient(W - s, 0, W - s - len, 0);
+        const curve = Anim.EASING_PRESETS[p.ease] || Anim.EASING_PRESETS.linear;
+        const N = 16;
+        for (let i = 0; i <= N; i++) {
+          const k = clamp(Anim.ease(curve, i / N), 0, 1);
+          g.addColorStop(i / N, 'rgba(0,0,0,' + (1 - amount * (1 - k)).toFixed(4) + ')');
+        }
+        L.c.save();
+        L.c.globalCompositeOperation = 'destination-in';
+        L.c.fillStyle = g;
+        L.c.fillRect(0, 0, W, H);
+        L.c.restore();
+        reset(L.c);
+      },
+    },
+
     blur: {
       label: 'Blur',
       params: { radius: 0.01 },
@@ -2205,6 +2296,23 @@
     c.drawImage(src, (SW - cw) / 2, (SH - ch) / 2, cw, ch, dst.x, dst.y, dst.w, dst.h);
   }
 
+  /**
+   * The split screen's band and the strip of the picture drawn into it, in pixels. Its
+   * own function so the draw and a test agree on where the picture went.
+   */
+  function splitRect(p, W, H) {
+    const hB = clamp(p.size, 0, 1) * H;
+    const off = clamp(p.distance, -1, 1) * H;
+    const y = String(p.side) === 'bottom' ? H / 2 + off : H / 2 - hB - off;
+    const z = clamp(p.zoom, 0.05, 64);
+    const sw = W / z, sh = hB / z;
+    let sy = clamp(p.focus, 0, 1) * H - sh / 2;
+    // Keep the strip on the picture while it fits - a crop centre near an edge slides the
+    // strip rather than dragging transparency into the band.
+    if (sh <= H) sy = Math.max(0, Math.min(H - sh, sy));
+    return { y, h: hB, sx: (W - sw) / 2, sy, sw, sh };
+  }
+
   /** The spotlight's window in pixels. Its own function so the mask and a test agree. */
   function spotRect(p, W, H) {
     return {
@@ -3326,7 +3434,7 @@
     lumaStats, matchGrade,
     MASTER_TYPES, normalizeStack, masterActive, renderMaster, renderOver,
     roundRectPath, roundRectSub, pxMin, rgba, padBlur,
-    CHROME, chromeGeom, spotRect, cutoutRect, fitDraw,
+    CHROME, chromeGeom, spotRect, cutoutRect, fitDraw, splitRect,
     MASK_SHAPES, MASK_SHAPE_OPTIONS, fillMaskShape,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;

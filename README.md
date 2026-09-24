@@ -1793,7 +1793,7 @@ Clear and the library's `+` touch the timeline, and each is one undo entry.
 ### The PresetList
 
 `src/renderer/presetlist.js`, opened with the toolbar's **Presets** button as a floating window
-(draggable, resizable; its position is remembered; Esc closes it). Presets are listed on the left and each preset's sections are tabs, so nothing needs scrolling to. It is the B2B short-form preset rack, numbered 01-14 in build
+(draggable, resizable; its position is remembered; Esc closes it). Presets are listed on the left and each preset's sections are tabs, so nothing needs scrolling to. It is the B2B short-form preset rack, numbered 01-03 in build
 order. It is **not** the text-card preset save/load: that stores one card's look, while a
 PresetList entry is a whole pass with its own parameters. Each entry works through the
 engines the app already has. Parameters are saved as `state.presetList` in the .scut. Like
@@ -1809,6 +1809,23 @@ the Captions settings, editing them adds no undo entry.
 | `CAP_metric-chip` | `Captions.metricChips()` / `chipCard()`: a mono pill (`bg.padX`, `bg.border`) rising out of `card.mask.in`, on a `chips: true` CHIP track, made in the same undo entry as the captions |
 | `CAP_role` | **Add role tag**: `card.eyebrow` over a name, left-aligned, exiting on `card.mask.out`, on a `roleTags: true` TAG track |
 | `CAP_guides` | `#rackGuides`: a DOM overlay (top, bottom and right-rail masks) that is never exported |
+
+**02 Push in / out** puts a push on every selected clip, still, graphic, text card or
+adjustment layer: an ordinary `transform` effect with two `scale` keys (1 -> 1 + amount for
+in, reversed for out), the chosen curve on the first key. **Fast** and **medium** run over
+their own length at the clip start, the playhead or the clip end, and carry the effect's
+motion-blur shutter; **slow** runs from the clip's first frame to its last with no shutter.
+Focus X/Y is the transform's anchor.
+
+**03 Split screen** moves every selected clip into the top or bottom half with a `split`
+effect (band height, crop centre, zoom in band, distance from the centre line); the other half
+is left transparent, so a clip on a track below shows through, or black over a gap. **Soft
+seam** adds an `edgefade` on the band's inner edge.
+
+Both tag what they add with `fx.preset` (`'push'` / `'split'`), so applying again REPLACES
+the last one instead of stacking, and **Remove** takes off only what the preset made. Each
+apply is one undo entry. Everything they add stays editable in the clip's Effects panel (text
+cards have no Effects panel, so a push on a card is managed from the PresetList).
 
 **Apply to captions** only writes the Captions settings. **Apply + generate** also runs
 `generateCaptions()`. The new card fields are all drawn in `TextDraw`, so the preview and
@@ -4995,8 +5012,9 @@ and total; don't put non-serialisable values on clips, tracks or the master stac
   left entirely alone — see "Tighten".
 - Video clips, stills and graphics carry an ordered, keyframable effect stack: transform,
   rounded corners and shadow, crop/inset, blur, a grade, the three pointer effects, and the
-  four framing treatments — device frame, background, spotlight and cutout — see "The
-  effect stack". Text cards do not; they have their own richer animation model. There are
+  four framing treatments — device frame, background, spotlight and cutout — plus
+  `split` (split screen) and `edgefade` (**Fade**: one side fades to transparent, so the
+  clip blends into whatever is under it) — see "The effect stack". Text cards do not; they have their own richer animation model. There are
   still no speed changes.
 - The graphics engine ships nineteen object types and **one object per clip** — a row of
   three stat cards is three clips, not one. It has no grouping, no shared brand palette
